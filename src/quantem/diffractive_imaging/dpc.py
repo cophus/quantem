@@ -13,7 +13,7 @@ from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 
 class DPC(AutoSerialize):
     """
-    DPC reconstruciton class
+    DPC reconstruction class
     """
 
 
