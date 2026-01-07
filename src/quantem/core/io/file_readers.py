@@ -110,30 +110,128 @@ def read_2d(
 
     Returns
     --------
-    Dataset
+    Dataset2d
     """
-    if file_type is None:
-        file_type = Path(file_path).suffix.lower().lstrip(".")
+    path = Path(file_path)
 
-    file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader  # type: ignore
-    imported_data = file_reader(file_path)[0]
+    if file_type is None:
+        file_type = path.suffix.lower().lstrip(".")
+    file_type_norm = str(file_type).lower().lstrip(".")
+
+    ext_to_rsciio_module = {
+        "dm3": "digitalmicrograph",
+        "dm4": "digitalmicrograph",
+        "tif": "image",
+        "tiff": "image",
+        "png": "image",
+        "jpg": "image",
+        "jpeg": "image",
+        "bmp": "image",
+        "gif": "image",
+    }
+
+    module_name = ext_to_rsciio_module.get(file_type_norm, file_type_norm)
+
+    try:
+        module = importlib.import_module(f"rsciio.{module_name}")
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            f"Could not import RosettaSciIO reader 'rsciio.{module_name}' "
+            f"(inferred from file_type='{file_type_norm}')."
+        ) from e
+
+    file_reader = getattr(module, "file_reader", None)
+    if file_reader is None:
+        raise AttributeError(f"RosettaSciIO module 'rsciio.{module_name}' has no 'file_reader'.")
+
+    imported = file_reader(path)
+    imported_list = [imported] if isinstance(imported, dict) else list(imported)
+    if not imported_list:
+        raise ValueError(f"RosettaSciIO reader 'rsciio.{module_name}' returned no datasets for {path}.")
+
+    selected = None
+    for item in imported_list:
+        data = item.get("data", None) if isinstance(item, dict) else None
+        if data is not None and getattr(data, "ndim", None) == 2:
+            selected = item
+            break
+    if selected is None:
+        selected = imported_list[0]
+
+    if not isinstance(selected, dict) or "data" not in selected:
+        raise ValueError(f"Unexpected RosettaSciIO return structure for {path} using 'rsciio.{module_name}'.")
+
+    axes = selected.get("axes", [])
+    if not isinstance(axes, list):
+        axes = []
+
+    def _axis_get(i: int, key: str, default: object) -> object:
+        if i < len(axes) and isinstance(axes[i], dict):
+            return axes[i].get(key, default)
+        return default
+
+    def _to_float(x: object, default: float) -> float:
+        try:
+            return float(x)  # type: ignore[arg-type]
+        except Exception:
+            return float(default)
+
+    def _to_unit_str(u: object) -> str:
+        if isinstance(u, (list, tuple)):
+            u = u[0] if len(u) > 0 else ""
+        if u is None:
+            return "pixels"
+        s = str(u).strip()
+        return s if s else "pixels"
+
+    sampling = [
+        _to_float(_axis_get(0, "scale", 1.0), 1.0),
+        _to_float(_axis_get(1, "scale", 1.0), 1.0),
+    ]
+    origin = [
+        _to_float(_axis_get(0, "offset", 0.0), 0.0),
+        _to_float(_axis_get(1, "offset", 0.0), 0.0),
+    ]
+    units = [
+        _to_unit_str(_axis_get(0, "units", "pixels")),
+        _to_unit_str(_axis_get(1, "units", "pixels")),
+    ]
+
+    metadata = selected.get("metadata", {})
+    name = path.stem
+    signal_units = "arb. units"
+
+    if isinstance(metadata, dict):
+        general = metadata.get("General", {})
+        if isinstance(general, dict):
+            title = general.get("title", None)
+            if isinstance(title, str) and title.strip():
+                name = title.strip()
+
+        signal = metadata.get("Signal", {})
+        if isinstance(signal, dict):
+            q = signal.get("quantity", None)
+            if isinstance(q, str) and q.strip():
+                signal_units = q.strip()
 
     dataset = Dataset2d.from_array(
-        array=imported_data["data"],
-        sampling=[
-            imported_data["axes"][0]["scale"],
-            imported_data["axes"][1]["scale"],
-        ],
-        origin=[
-            imported_data["axes"][0]["offset"],
-            imported_data["axes"][1]["offset"],
-        ],
-        units=[
-            imported_data["axes"][0]["units"],
-            imported_data["axes"][1]["units"],
-        ],
+        array=selected["data"],
+        name=name,
+        sampling=sampling,
+        origin=origin,
+        units=units,
+        signal_units=signal_units,
     )
-    dataset.file_path = file_path
+    dataset.file_path = str(path)
+
+    try:
+        dataset.metadata.setdefault("rsciio", {})
+        dataset.metadata["rsciio"]["module"] = module_name
+        dataset.metadata["rsciio"]["file_type"] = file_type_norm
+        dataset.metadata["rsciio"]["metadata"] = selected.get("metadata", {})
+        dataset.metadata["rsciio"]["original_metadata"] = selected.get("original_metadata", {})
+    except Exception:
+        pass
 
     return dataset
 
