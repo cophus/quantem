@@ -10,5 +10,6 @@ from quantem.core import visualization as visualization
 
 from quantem import imaging as imaging
 from quantem import diffractive_imaging as diffractive_imaging
+from quantem import tomography as tomography
 
 __version__ = version("quantem")
