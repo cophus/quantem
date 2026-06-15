@@ -57,6 +57,8 @@ class Show3DAtoms(anywidget.AnyWidget):
     vmin_pct = traitlets.Float(0.0).tag(sync=True)
     vmax_pct = traitlets.Float(100.0).tag(sync=True)
     marker_scale = traitlets.Float(1.0).tag(sync=True)
+    marker_linewidth = traitlets.Float(1.0).tag(sync=True)
+    marker_filled = traitlets.Bool(True).tag(sync=True)
     show_sites = traitlets.Bool(True).tag(sync=True)
     show_slice = traitlets.Bool(True).tag(sync=True)
     canvas_size = traitlets.Int(520).tag(sync=True)

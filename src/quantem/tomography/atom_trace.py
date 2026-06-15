@@ -74,6 +74,7 @@ __all__ = [
     "render_background",
     "gaussian_blur3d",
     "seed_peaks",
+    "estimate_nn_spacing",
 ]
 
 
@@ -261,7 +262,7 @@ def seed_peaks(
     volume: Tensor,
     blur_sigmas: tuple[float, float] | float = (1.0, 2.0),
     threshold: float | None = None,
-    threshold_pct: float = 99.0,
+    threshold_fraction: float = 0.99,
     min_distance: float = 0.0,
     max_peaks: int | None = None,
     progress: bool = False,
@@ -281,10 +282,15 @@ def seed_peaks(
         Two sigmas -> difference-of-Gaussians (bandpass).  One sigma -> single
         matched-filter blur.  In voxels.
     threshold : float or None
-        Absolute threshold on the filtered response.  Overrides ``threshold_pct``.
-    threshold_pct : float
-        Percentile (0-100) of the filtered response used as the threshold when
-        ``threshold`` is None.  Robust to outliers and to data scale; default 99.0.
+        Absolute cutoff on the filtered (difference-of-Gaussians) response: a voxel
+        is a candidate peak only if its response exceeds this.  Overrides
+        ``threshold_fraction``.
+    threshold_fraction : float
+        Detection threshold as a quantile (0-1) of the filtered response, used when
+        ``threshold`` is None.  Only voxels above this quantile are kept, so
+        ``0.99`` keeps the brightest ~1% of the response (more, weaker sites) and
+        ``0.999`` the brightest ~0.1% (fewer, stronger sites).  Robust to outliers
+        and to the absolute data scale.
     min_distance : float
         Minimum spacing between seeds in voxels; closer (dimmer) peaks are
         dropped.  0 disables.
@@ -312,7 +318,7 @@ def seed_peaks(
     else:
         resp = gaussian_blur3d(volume, float(blur_sigmas))
     if threshold is None:
-        threshold = float(np.percentile(resp.numpy(), threshold_pct))
+        threshold = float(np.quantile(resp.numpy(), threshold_fraction))
     bar.set_postfix_str("DoG bandpass")
     bar.update(1)
 
@@ -381,6 +387,72 @@ def seed_peaks(
         positions, intensities = positions[:max_peaks], intensities[:max_peaks]
 
     return positions, intensities
+
+
+def estimate_nn_spacing(
+    volume: Tensor,
+    r_min: float = 2.0,
+    r_max: float | None = None,
+    return_profile: bool = False,
+) -> float | tuple[float, np.ndarray, np.ndarray]:
+    """Estimate the nearest-neighbor spacing (in voxels) from the volume autocorrelation.
+
+    The autocorrelation ``IFFT(|FFT(v)|^2)`` is radially averaged; the radius of
+    its first peak beyond the central self-peak is the first coordination shell,
+    i.e. the typical nearest-neighbor spacing.  Using ``~0.75 *`` this value as the
+    seeding ``min_distance`` strongly suppresses duplicate/false-positive sites.
+
+    Parameters
+    ----------
+    volume : Tensor or ndarray
+        3D volume.
+    r_min : float
+        Ignore peaks closer than this radius (excludes the central self-peak).
+    r_max : float or None
+        Largest radius to consider.  Default ``min(shape) // 2``.
+    return_profile : bool
+        If True, also return the radial-autocorrelation profile (normalized so the
+        zero-lag value is 1) for plotting/inspection.
+
+    Returns
+    -------
+    float or tuple
+        The nearest-neighbor spacing in voxels; or, if ``return_profile``,
+        ``(spacing, radii, radial)`` with ``radii``/``radial`` as 1D arrays.
+
+    Raises
+    ------
+    RuntimeError
+        If no autocorrelation shell peak is found.
+    """
+    from scipy.signal import find_peaks
+
+    vt = torch.as_tensor(volume).detach().to(device="cpu", dtype=torch.float32)
+    vt = vt - vt.mean()
+    power = torch.fft.fftn(vt).abs() ** 2
+    ac = torch.fft.fftshift(torch.fft.ifftn(power).real).numpy()
+    shape = ac.shape
+    center = [s // 2 for s in shape]
+    sq = [((np.arange(s) - c) ** 2).astype(np.float32) for s, c in zip(shape, center)]
+    radius = np.sqrt(sq[0][:, None, None] + sq[1][None, :, None] + sq[2][None, None, :])
+    r_int = np.rint(radius).astype(np.int64).ravel()
+    counts = np.bincount(r_int)
+    radial = np.bincount(r_int, weights=ac.ravel().astype(np.float64)) / np.maximum(counts, 1)
+    cutoff = int(r_max) if r_max is not None else min(shape) // 2
+    radial = radial[:cutoff]
+    if radial[0] > 0:
+        radial = radial / radial[0]  # normalize so the zero-lag value is 1
+    peaks, _ = find_peaks(radial)
+    shell = [int(p) for p in peaks if p >= max(1, int(round(r_min)))]
+    if not shell:
+        raise RuntimeError(
+            "Could not estimate NN spacing from the autocorrelation; "
+            "pass min_distance to find_initial() explicitly."
+        )
+    spacing = float(shell[0])
+    if return_profile:
+        return spacing, np.arange(len(radial), dtype=float), radial
+    return spacing
 
 
 def _inverse_softplus(y: Tensor) -> Tensor:
@@ -561,33 +633,129 @@ class Atoms(AutoSerialize):
     # ------------------------------------------------------------------ #
     # Seeding
     # ------------------------------------------------------------------ #
+    def estimate_spacing(
+        self,
+        r_min: float = 2.0,
+        recompute: bool = False,
+        plot: bool = False,
+        returnfig: bool = False,
+    ) -> float | tuple:
+        """Estimate (and cache) the nearest-neighbor atomic spacing, in voxels.
+
+        Uses the volume autocorrelation (:func:`estimate_nn_spacing`).  The result
+        seeds the default ``min_distance`` for :meth:`find_initial`, which strongly
+        suppresses duplicate / false-positive sites (especially around weak ones).
+
+        Parameters
+        ----------
+        r_min : float, default 2.0
+            Ignore autocorrelation peaks closer than this radius (excludes the
+            central self-peak).
+        recompute : bool, default False
+            Recompute even if a cached value exists.
+        plot : bool, default False
+            Plot the radial autocorrelation profile with the detected first-shell
+            peak (= the spacing) and the resulting ``min_distance`` marked, to help
+            you judge whether the estimate is sensible.
+        returnfig : bool, default False
+            If True, return ``(spacing, fig, ax)`` instead of just the spacing.
+
+        Returns
+        -------
+        float or tuple
+            The spacing in voxels, or ``(spacing, fig, ax)`` if ``returnfig``.
+        """
+        if recompute or getattr(self, "_nn_spacing", None) is None:
+            self._nn_spacing, radii, radial = estimate_nn_spacing(
+                self._volume, r_min=r_min, return_profile=True
+            )
+            self._nn_profile = (radii, radial)
+
+        if not plot:
+            return self._nn_spacing
+
+        import matplotlib.pyplot as plt
+
+        radii, radial = self._nn_profile
+        spacing = self._nn_spacing
+        # Show the shell structure beyond the central self-peak.
+        r_hi = min(len(radial) - 1, max(int(round(4 * spacing)), 12))
+        fig, ax = plt.subplots(figsize=(6, 3.2))
+        ax.plot(radii[1 : r_hi + 1], radial[1 : r_hi + 1], color="0.2", lw=1.2)
+        ax.axvline(spacing, color="tab:red", ls="--", label=f"NN spacing = {spacing:.1f} voxels")
+        ax.axvline(
+            0.75 * spacing, color="tab:blue", ls=":",
+            label=f"min_distance = {0.75 * spacing:.2f} voxels",
+        )
+        ax.set_xlabel("radius (voxels)")
+        ax.set_ylabel("radial autocorrelation")
+        ax.set_title("volume autocorrelation")
+        ax.legend(fontsize=9)
+        fig.tight_layout()
+        return (self._nn_spacing, fig, ax) if returnfig else self._nn_spacing
+
     def find_initial(
         self,
         blur_sigmas: tuple[float, float] | float | None = None,
         threshold: float | None = None,
-        threshold_pct: float = 99.0,
+        threshold_fraction: float = 0.99,
         min_distance: float | None = None,
+        spacing_factor: float = 0.75,
         max_peaks: int | None = None,
         progress: bool = True,
     ) -> "Atoms":
-        """Find an initial set of sites by difference-of-Gaussians peak detection.
+        """Find an initial set of atomic sites by difference-of-Gaussians detection.
 
-        This is the first step of tracing (the seed for later refinement and
-        densification).  Defaults derive from ``sigma_init``: the DoG bandpass
-        brackets it, the threshold is the ``threshold_pct`` percentile of the
-        response, and ``min_distance`` is ``2 * sigma_init``.  Pass an absolute
-        ``threshold`` to override.  Set ``progress=False`` to silence the bar.
-        See :func:`seed_peaks` for the detector.
+        Band-pass filters the volume to enhance atom-sized blobs, keeps the local
+        maxima above a threshold as candidate sites, refines each to sub-voxel
+        accuracy, and drops duplicates closer than ``min_distance``.  This is the
+        first step of tracing and seeds :meth:`refine`.
+
+        Parameters
+        ----------
+        blur_sigmas : tuple[float, float] or float or None
+            Difference-of-Gaussians widths in voxels, ``(small, large)``; the
+            band-pass highlights features at the atom scale.  Default brackets
+            ``sigma_init`` as ``(0.75, 1.5) * sigma_init``.
+        threshold : float or None
+            Absolute cutoff on the filtered response (a voxel is a candidate only
+            if its response exceeds this).  Overrides ``threshold_fraction``.
+        threshold_fraction : float, default 0.99
+            Detection threshold as a quantile (0-1) of the filtered response: only
+            voxels whose response is above this quantile are kept.  ``0.99`` keeps
+            the brightest ~1% of the response (more sites, including weaker ones);
+            ``0.999`` keeps the brightest ~0.1% (fewer, stronger sites).  Being a
+            quantile, it is robust to outliers and to the absolute data scale.
+        min_distance : float or None
+            Minimum spacing between sites in voxels; of two sites closer than this,
+            the dimmer is removed.  Defaults to ``spacing_factor`` times the
+            nearest-neighbor spacing from :meth:`estimate_spacing` -- the main lever
+            against duplicate / false-positive sites.
+        spacing_factor : float, default 0.75
+            Fraction of the estimated nearest-neighbor spacing used for the default
+            ``min_distance`` (ignored when ``min_distance`` is given).
+        max_peaks : int or None
+            If set, keep only the brightest ``max_peaks`` sites.
+        progress : bool, default True
+            Show a tqdm progress bar.
+
+        Returns
+        -------
+        Atoms
+            ``self``, with ``sites`` populated.
         """
         if blur_sigmas is None:
             blur_sigmas = (0.75 * self._sigma_init, 1.5 * self._sigma_init)
         if min_distance is None:
-            min_distance = 2.0 * self._sigma_init
+            try:
+                min_distance = spacing_factor * self.estimate_spacing()
+            except RuntimeError:
+                min_distance = 2.0 * self._sigma_init
         pos, inten = seed_peaks(
             self._volume,
             blur_sigmas=blur_sigmas,
             threshold=threshold,
-            threshold_pct=threshold_pct,
+            threshold_fraction=threshold_fraction,
             min_distance=min_distance,
             max_peaks=max_peaks,
             progress=progress,
@@ -614,6 +782,9 @@ class Atoms(AutoSerialize):
         add: bool = True,
         remove: bool = True,
         merge: bool = True,
+        add_threshold_fraction: float = 0.98,
+        min_neighbors: int = 2,
+        isolation_radius: float | None = None,
         update_every: int = 25,
         min_distance: float | None = None,
         progress: bool = True,
@@ -641,8 +812,22 @@ class Atoms(AutoSerialize):
             Sites dimmer than this are removed.  Default 10% of the median site
             intensity.
         add, remove, merge : bool
-            Enable adding sites at residual peaks / removing weak sites / merging
-            close sites during refinement.
+            Enable adding sites at residual peaks / removing weak (low-intensity)
+            sites / merging close sites during refinement.
+        add_threshold_fraction : float, default 0.98
+            Detection quantile (0-1) for ``add``: lower values recover weaker atoms
+            from the residual (raise toward 1 to add only obvious ones).  Pair with
+            ``min_neighbors`` to reject the extra noise this admits.
+        min_neighbors : int, default 2
+            Remove sites with fewer than this many neighbors within
+            ``isolation_radius`` -- atoms do not float alone, so isolated detections
+            are almost always false positives.  This is what makes a low
+            ``add_threshold_fraction`` usable for finding weak atoms (real weak
+            atoms sit on the lattice and are kept; isolated noise is dropped).  Set
+            0 to disable.
+        isolation_radius : float or None
+            Neighbor-search radius (voxels) for ``min_neighbors``.  Default
+            ``1.5 *`` the estimated nearest-neighbor spacing.
         update_every : int
             Apply the add/remove/merge maintenance every this many iterations.
         min_distance : float or None
@@ -657,7 +842,10 @@ class Atoms(AutoSerialize):
             raise ValueError("loss must be 'huber' or 'mse'.")
         sig_lo, sig_hi = sigma_bounds or (0.5 * self._sigma_init, 2.0 * self._sigma_init)
         if min_distance is None:
-            min_distance = 2.0 * self._sigma_init
+            try:
+                min_distance = 0.75 * self.estimate_spacing()
+            except RuntimeError:
+                min_distance = 2.0 * self._sigma_init
         self._intensity_scale = float(self._intensity.detach().median().clamp(min=1e-3))
         if intensity_min is None:
             intensity_min = 0.1 * self._intensity_scale
@@ -686,12 +874,16 @@ class Atoms(AutoSerialize):
             if update_every and (it + 1) % update_every == 0 and it + 1 < num_iterations:
                 changed = False
                 with torch.no_grad():
-                    if remove:
-                        changed |= self.remove_sites(intensity_min, sigma_bounds=(sig_lo, sig_hi))
+                    if add:
+                        changed |= self.add_sites(
+                            min_distance=min_distance, threshold_fraction=add_threshold_fraction
+                        )
                     if merge:
                         changed |= self.merge_sites(min_distance)
-                    if add:
-                        changed |= self.add_sites(min_distance=min_distance)
+                    if min_neighbors > 0:
+                        changed |= self.remove_isolated(isolation_radius, min_neighbors)
+                    if remove:
+                        changed |= self.remove_sites(intensity_min, sigma_bounds=(sig_lo, sig_hi))
                 if changed:
                     self._enable_grad()
                     opt = self._build_optimizer(learning_rate)
@@ -767,17 +959,78 @@ class Atoms(AutoSerialize):
         self._raw_sigma = self._raw_sigma.detach()[keep]
         return True
 
-    def add_sites(self, min_distance: float, threshold_pct: float = 99.9, max_add=None) -> bool:
-        """Add sites at peaks of the positive residual not already covered.
+    def remove_isolated(self, radius: float | None = None, min_neighbors: int = 3) -> bool:
+        """Remove isolated sites (fewer than ``min_neighbors`` neighbors within ``radius``).
 
-        Returns True if any site was added.
+        Counts how many other sites lie within ``radius`` voxels of each site and
+        drops those below ``min_neighbors``.  Physically, atoms do not float alone
+        in vacuum, so isolated detections are almost always false positives.  This
+        is also what makes detecting *weak* atoms practical: lower the
+        ``find_initial`` / ``add`` threshold to admit weak sites (and noise), then
+        remove the noise here -- real weak atoms sit on the lattice with many
+        neighbors and are kept, while spurious peaks are isolated and removed.
+
+        Parameters
+        ----------
+        radius : float or None
+            Neighbor-search radius in voxels.  Default ``1.5 *`` the estimated
+            nearest-neighbor spacing (:meth:`estimate_spacing`).
+        min_neighbors : int, default 3
+            Minimum neighbors within ``radius`` required to keep a site.
+
+        Returns
+        -------
+        bool
+            True if any site was removed.
+        """
+        if self.num_sites < 2:
+            return False
+        if radius is None:
+            radius = 1.5 * self.estimate_spacing()
+        from scipy.spatial import cKDTree
+
+        pts = self._positions.detach().cpu().numpy()
+        counts = cKDTree(pts).query_ball_point(pts, r=float(radius), return_length=True)
+        keep = (counts - 1) >= min_neighbors  # subtract the site's own match
+        if bool(keep.all()):
+            return False
+        keep_t = torch.as_tensor(np.nonzero(keep)[0], device=self.device)
+        self._positions = self._positions.detach()[keep_t]
+        self._raw_intensity = self._raw_intensity.detach()[keep_t]
+        self._raw_sigma = self._raw_sigma.detach()[keep_t]
+        return True
+
+    def add_sites(
+        self, min_distance: float, threshold_fraction: float = 0.999, max_add: int | None = None
+    ) -> bool:
+        """Add new sites at peaks of the positive residual (densification).
+
+        Detects peaks in ``volume - model`` (clamped to >= 0) that lie at least
+        ``min_distance`` voxels from existing sites, and appends them.  Used during
+        :meth:`refine` to recover atoms the current model is missing.
+
+        Parameters
+        ----------
+        min_distance : float
+            Minimum spacing in voxels, both among new sites and from existing ones.
+        threshold_fraction : float, default 0.999
+            Detection quantile (0-1) on the residual response (see
+            :func:`seed_peaks`); high by default so only clear, missed atoms are
+            added.
+        max_add : int or None
+            If set, cap the number of sites added in this call.
+
+        Returns
+        -------
+        bool
+            True if any site was added.
         """
         residual = (self._volume - self.render()).detach().clamp(min=0.0)
         blur = (0.75 * self._sigma_init, 1.5 * self._sigma_init)
         new_pos, new_int = seed_peaks(
             residual,
             blur_sigmas=blur,
-            threshold_pct=threshold_pct,
+            threshold_fraction=threshold_fraction,
             min_distance=min_distance,
             progress=False,
         )
