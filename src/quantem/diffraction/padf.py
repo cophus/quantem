@@ -51,7 +51,7 @@ class PairAngleDistributionFunction(AutoSerialize):
         self.ang_corr = ang_corr if ang_corr is not None else self.compute_avg_angular_correlation(self.polar_rescaled, dtype=torch.float64)
         self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr)
         self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1])
-        self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], self.ds.shape[0] * self.ds.shape[1])
+        self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20) # TODO: determine atoms in beam
     
     def rescale_intensity(self,
                           data: Polar4dstem | Dataset4dstem | None = None,
@@ -172,10 +172,11 @@ class PairAngleDistributionFunction(AutoSerialize):
         - Sum Pl(cos theta) times B_l() over all l
         - Multiply by n_alpha * 2 pi
 
-        NOTE: Theta will go from 0 to 180
+        NOTE: Theta will go from 0 to pi
+        EDIT: Na should be number of atoms not number of dps
         """
         padf = torch.zeros((real_Bl.shape[1], real_Bl.shape[2], 180))
-        theta = np.linspace(0, 179, 180)
+        theta = np.linspace(0, np.pi, 180)
         cos_theta = np.cos(theta)
         chosen_l_values = l_values[1:]
 
@@ -184,7 +185,7 @@ class PairAngleDistributionFunction(AutoSerialize):
             coeffs = np.zeros(chosen_l_values[-1] + 1)
             coeffs[chosen_l_values[l]] = 1
             Pl = torch.tensor(legval(cos_theta, coeffs))
-            Bl = real_Bl[l]
+            Bl = real_Bl[l + 1] # skipping l = 0
             padf += Bl[:, :, np.newaxis] * Pl[np.newaxis, np.newaxis, :]
 
         padf *= 2 * torch.pi * Na
