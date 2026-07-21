@@ -48,10 +48,10 @@ class PairAngleDistributionFunction(AutoSerialize):
         # TODO: we get rho and fq from sample identity, so either the user provides them, we find them in the dataset, or we look them up based on sample identity
         self.polar_rescaled = self.rescale_intensity(self.polar, rho=1, fq=1)
 
-        self.ang_corr = ang_corr if ang_corr is not None else self.compute_avg_angular_correlation(self.polar_rescaled, dtype=torch.float64)
-        self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr)
-        self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1])
-        self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20) # TODO: determine atoms in beam
+        self.ang_corr = ang_corr if ang_corr is not None else self.compute_avg_angular_correlation(self.polar_rescaled)
+        # self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr)
+        # self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1])
+        # self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20) # TODO: determine atoms in beam
     
     def rescale_intensity(self,
                           data: Polar4dstem | Dataset4dstem | None = None,
@@ -76,10 +76,9 @@ class PairAngleDistributionFunction(AutoSerialize):
         pass
         
 
-    def compute_avg_angular_correlation(self, data, dtype=torch.float64):
+    def compute_avg_angular_correlation(self, data):
         """
-        Equation 8: angular cross correlation function
-        WARNING this part is computationally expensive, takes 20 seconds on my laptop
+        Equation 8: angular cross correlation implemented via Fourier correlation theorem
         """
 
         scan_row, scan_col, phi, r = data.shape
@@ -88,13 +87,9 @@ class PairAngleDistributionFunction(AutoSerialize):
 
         dphi = 2.0 * torch.pi / phi # A small change in angle
 
-        C_sum = torch.zeros(phi, r, r)
-
-        for a in range(N_alpha):
-            g = g_all[a]
-            for d in range(phi):
-                shifted = torch.roll(g, shifts=-d, dims=0) # shift by d pixels UP
-                C_sum[d] += g.T @ shifted
+        G = torch.fft.rfft(g_all, dim=1) # Fourier transform along phi axis
+        P = torch.einsum('afi,afj->fij', G.conj(), G) # Outer product of r between G and its conjugate, summed over all N_alpha
+        C_sum = torch.fft.irfft(P, n=phi, dim=0)
 
         C_avg = (C_sum / N_alpha) * dphi
         return C_avg
@@ -113,6 +108,7 @@ class PairAngleDistributionFunction(AutoSerialize):
         B_l = torch.zeros((Nl, Nq, Nqp))
         cos_dphi = np.cos(dphi)
 
+        # TODO: Vectorize
         for iq in range(Nq):
             for iqp in range(Nqp): # Handled for each q, qp pair by for loops
 
@@ -161,7 +157,7 @@ class PairAngleDistributionFunction(AutoSerialize):
             # Representing DSBT (eq 12) as a transformation matrix "sbessel"
             sbessel = 4 * torch.pi * jl * (q**2) * dq
             # Applying it twice (once along each axis)
-            real_Bl[l] = sbessel @ Bl @ sbessel.T * (-1) ** l_values[l]
+            real_Bl[l] = sbessel @ Bl @ sbessel.T * (-1)**l_values[l]
         
         return real_Bl
 

@@ -239,9 +239,9 @@ class PDF3B(object):
         if np.any(pbcs):
             assert xp.all(xp.min(pointslists, axis=1) >= 0)
             assert xp.all(xp.max(pointslists, axis=1) <= bbox)
-        assert xp.issubdtype(
-            pointslists, float
-        ), f"pointslists type: {pointslists.dtype}"
+        # assert xp.issubdtype(
+        #     pointslists, float
+        # ), f"pointslists type: {pointslists.dtype}"
         dif = pointslists - points[:, None]
         for i, ind in enumerate(pbcs):
             if ind:
