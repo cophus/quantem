@@ -45,7 +45,7 @@ class PairAngleDistributionFunction(AutoSerialize):
         self.polar_rescaled = self.rescale_intensity(self.polar, rho=1, fq=1)
 
         self.ang_corr = ang_corr if ang_corr is not None else self.compute_avg_angular_correlation(self.polar_rescaled)
-        # self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr)
+        self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr)
         # self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1])
         # self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20) # TODO: determine atoms in beam
     
@@ -100,18 +100,18 @@ class PairAngleDistributionFunction(AutoSerialize):
         # Ignore odd l-terms, Friedel symmetry?
         # 5% SVD cutoff
         Nphi, Nq, Nqp = C_avg.shape
-        dphi = np.linspace(0, 2 * np.pi, Nphi + 1)[:-1] # Include every dphi using torch.linspace array rather than loop to faciiltate legval
-        l_values = list(range(0, l_max, 2)) # This is for the even-only case.
+        dphi = torch.linspace(0, 2 * torch.pi, Nphi + 1, dtype=torch.float64)[:-1] # Ranges from [0, 2pi)
+        l_values = torch.arange(0, l_max, 2) # Even only
         Nl = len(l_values)
         B_l = torch.zeros((Nl, Nq, Nqp))
-        cos_dphi = np.cos(dphi)
+        cos_dphi = torch.cos(dphi)
 
         C_flat = C_avg.reshape(Nphi, Nq * Nqp)
 
         # Build matrix
-        l_values = l_values.reshape(1, Nl)
-        cos_dphi = cos_dphi.reshape(Nphi, 1)
-        leg_matrix = eval_legendre(l_values, cos_dphi) # Shape due to broadcasting (Nphi, Nl)
+        L = l_values.reshape(1, Nl)
+        X = cos_dphi.reshape(Nphi, 1)
+        leg_matrix = eval_legendre(L, X) # Shape due to broadcasting (Nphi, Nl)
 
         U, S, Vh = torch.linalg.svd(leg_matrix, full_matrices=False)
         S_max = S.max()
@@ -123,7 +123,6 @@ class PairAngleDistributionFunction(AutoSerialize):
 
         return B_flat.reshape(Nl, Nq, Nqp), l_values
 
-        # TODO: It is mentioned in the paper that a 5% cutoff for SVD is necessary because of "conditioning." When you make a notebook/visuals, demonstrate the need for this by playing with the cutoff.
         # TODO: Compare each function to the martin code to see the difference/similarity or understand the repo better
 
     def transform_to_real_space(self, Bl_mats, l_values, dq=0.01):
