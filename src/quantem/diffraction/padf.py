@@ -2,27 +2,23 @@ import matplotlib.pyplot as plt
 import torch
 import numpy as np
 from numpy.typing import NDArray
-from numpy.polynomial.legendre import legval
-from scipy.special import spherical_jn
+from scipy.special import eval_legendre, spherical_jn
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.datastructures.polar4dstem import Polar4dstem
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.io.serialize import load
 from quantem.diffraction.polar_transform import (
-    find_origin_angular_descent,
     find_origin_angular_grid,
     polar_transform,
 )
-
-from quantem.core.io.serialize import load
-from pathlib import Path
 
 class PairAngleDistributionFunction(AutoSerialize):
     """
     Compute pair-angle distribution function for a given 4D-STEM dataset.
 
     Run the following pipeline:
-    pad = PairAngleDistributionFunction(ds)
+    padf = PairAngleDistributionFunction(ds)
     1. find_origin_angular_grid(ds)
     2. polar_transform(ds, origin_array=self.origin)
     3. rescale_intensity(self.polar, rho=1, fq=1)
@@ -65,9 +61,11 @@ class PairAngleDistributionFunction(AutoSerialize):
         - phi_0 (dependent on experimental parameters)
 
         Most likely we will need to fit phi_0 * N_a term via another function
+
+        Handles dtype conversion to float64
         """
         # TODO: Look at the Martin code to see how he calculated atoms in beam and phi_0
-        intensity = data.tensor
+        intensity = data.tensor.to(dtype=torch.float64)
         rescaled_intensity = intensity / (rho * fq**2) # / still need to include atoms in beam and phi
         return rescaled_intensity
     
@@ -108,29 +106,22 @@ class PairAngleDistributionFunction(AutoSerialize):
         B_l = torch.zeros((Nl, Nq, Nqp))
         cos_dphi = np.cos(dphi)
 
-        # TODO: Vectorize
-        for iq in range(Nq):
-            for iqp in range(Nqp): # Handled for each q, qp pair by for loops
+        C_flat = C_avg.reshape(Nphi, Nq * Nqp)
 
-                # data vector
-                c = C_avg[:, iq, iqp].to(torch.float64)
+        # Build matrix
+        l_values = l_values.reshape(1, Nl)
+        cos_dphi = cos_dphi.reshape(Nphi, 1)
+        leg_matrix = eval_legendre(l_values, cos_dphi) # Shape due to broadcasting (Nphi, Nl)
 
-                # build matrix (including 4pi term here)
-                leg_matrix = np.zeros((Nphi, Nl)) # Ndphi by Nl
-                for i in range(Nl):
-                    coeffs = np.zeros(Nl)
-                    coeffs[i] = 1.0
-                    leg_matrix[:, i] = legval(cos_dphi, coeffs) / (4 * np.pi)
-                leg_matrix = torch.as_tensor(leg_matrix, dtype=torch.float64)
+        U, S, Vh = torch.linalg.svd(leg_matrix, full_matrices=False)
+        S_max = S.max()
+        S_inv = torch.where(S > sv_cutoff * S_max, 1.0 / S, torch.zeros_like(S))
 
-                # SVD solve (from Claude)
-                U, S, Vh = torch.linalg.svd(leg_matrix, full_matrices=False)
-                S_max = S.max()
-                S_inv = torch.where(S > sv_cutoff * S_max, 1.0 / S, torch.zeros_like(S))
-                b = Vh.T @ (S_inv * (U.T @ c))
+        tmp = U.T @ C_flat
+        tmp = S_inv.unsqueeze(1) * tmp
+        B_flat = Vh.T @ tmp
 
-                B_l[:, iq, iqp] = b
-        return B_l, l_values
+        return B_flat.reshape(Nl, Nq, Nqp), l_values
 
         # TODO: It is mentioned in the paper that a 5% cutoff for SVD is necessary because of "conditioning." When you make a notebook/visuals, demonstrate the need for this by playing with the cutoff.
         # TODO: Compare each function to the martin code to see the difference/similarity or understand the repo better
