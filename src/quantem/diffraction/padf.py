@@ -3,6 +3,7 @@ import torch
 import numpy as np
 from numpy.typing import NDArray
 from scipy.special import eval_legendre, spherical_jn
+from numpy.polynomial.legendre import legval
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.datastructures.polar4dstem import Polar4dstem
@@ -46,8 +47,8 @@ class PairAngleDistributionFunction(AutoSerialize):
 
         self.ang_corr = ang_corr if ang_corr is not None else self.compute_avg_angular_correlation(self.polar_rescaled)
         self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr)
-        # self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1])
-        # self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20) # TODO: determine atoms in beam
+        self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1])
+        self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20) # TODO: determine atoms in beam
     
     def rescale_intensity(self,
                           data: Polar4dstem | Dataset4dstem | None = None,
@@ -133,11 +134,14 @@ class PairAngleDistributionFunction(AutoSerialize):
         # Equation 12, 13
         # apply bessel transform twice for each l
         # → shape = (l, r, r')
-        
+        r_min = 0.0
+        r_max = 20.0
+        r_step = 0.02
+                
         # Step one is to define q
         q = torch.arange(0, Bl_mats.shape[1]) * dq
-        r = torch.reciprocal(q)
-        real_Bl = torch.zeros(Bl_mats.shape)
+        r = torch.arange(r_min, r_max, r_step) # Line 797 in polar.py implements this well. Use the same meshgrid in 798
+        real_Bl = torch.zeros((Bl_mats.shape[0], r.shape[0], r.shape[0]))
 
         for l in range(len(l_values)):
             Bl = Bl_mats[l].to(dtype=torch.float64) # The corresponding q x q' matrix
