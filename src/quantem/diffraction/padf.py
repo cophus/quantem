@@ -182,23 +182,27 @@ class PairAngleDistributionFunction(AutoSerialize):
         return padf
 
     def simple_plot(self):
-        """
-        Plot the r = r' diagonal of the PADF as a 2D map over (r, theta).
+            """
+            Plot the r = r' diagonal of the PADF as a 2D map with
+            r = r' on the x-axis and theta on the y-axis.
 
-        Uses self.padf, which should be a (Nr, Nr, Ntheta) ndarray
-        (from reconstruct_PAD()) defined in __init__.
-        """
-        # Take padf[i, i, k] for every distance i and angle k -> (Nr, Ntheta)
-        diag = np.einsum("iik->ik", self.padf)
+            Uses self.padf, which should be a (Nr, Nr, Ntheta) ndarray
+            (from reconstruct_PAD()) defined in __init__.
+            """
+            # Take padf[i, i, k] for every distance i and angle k -> (Nr, Ntheta)
+            diag = np.einsum("iik->ik", self.padf)
 
-        fig, ax = plt.subplots(figsize=(7, 5))
-        im = ax.pcolormesh(diag, shading="auto")
-        fig.colorbar(im, ax=ax, label=r"$\Theta(r, r, \theta)$")
+            # Transpose so rows = theta, columns = r  -> (Ntheta, Nr)
+            diag = diag.T
 
-        ax.set_xlabel(r"$\theta$ index")
-        ax.set_ylabel("r = r' index")
-        ax.set_title("PADF diagonal")
-        fig.tight_layout()
+            fig, ax = plt.subplots(figsize=(7, 5))
+            im = ax.pcolormesh(diag, shading="auto")
+            fig.colorbar(im, ax=ax, label=r"$\Theta(r, r, \theta)$")
 
-        return ax
+            ax.set_xlabel("r = r' index")
+            ax.set_ylabel(r"$\theta$ index")
+            ax.set_title("PADF diagonal")
+            fig.tight_layout()
+
+            return ax
 
