@@ -46,7 +46,9 @@ class PairAngleDistributionFunction(AutoSerialize):
         self.polar_rescaled = self.rescale_intensity(self.polar, rho=1, fq=1)
 
         self.ang_corr = ang_corr if ang_corr is not None else self.compute_avg_angular_correlation(self.polar_rescaled)
-        self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr)
+        print(type(self.ang_corr))
+        self.ang_corr_filtered = self.apply_centrosymmetric_filter(self.ang_corr)
+        self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr_filtered)
         self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1])
         self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20) # TODO: determine atoms in beam
     
@@ -65,7 +67,6 @@ class PairAngleDistributionFunction(AutoSerialize):
 
         Handles dtype conversion to float64
         """
-        
         # TODO: Look at the Martin code to see how he calculated atoms in beam and phi_0
         intensity = data.tensor.to(dtype=torch.float64)
         rescaled_intensity = intensity / (rho * fq**2) # / still need to include atoms in beam and phi
@@ -93,6 +94,34 @@ class PairAngleDistributionFunction(AutoSerialize):
 
         C_avg = (C_sum / N_alpha) * dphi
         return C_avg
+
+    def apply_centrosymmetric_filter(self, C_avg, half_width_deg: float = 5.0) -> torch.Tensor:
+        """
+        Remove the shot-noise self-correlation spike near Delta-phi = 0 by
+        replacing those angular bins with the corresponding bins near
+        Delta-phi = pi, exploiting the centrosymmetry of the true signal
+        (Theta(r, r', pi - theta) = Theta(r, r', theta)).
+
+        C_avg : tensor of shape (Nphi, Nq, Nqp), angular axis first, with
+            Delta-phi sampled uniformly over [0, 2*pi).
+        half_width_deg : angular half-width around 0 (and, by periodicity,
+            around 2*pi) to replace. Should be a few times the angular bin
+            width; too narrow leaves noise, too wide throws away real signal.
+        """
+        Nphi = C_avg.shape[0]
+        dphi_deg = 360.0 / Nphi
+        half_width_bins = max(1, round(half_width_deg / dphi_deg))
+
+        # Bin indices within +/- half_width_bins of Delta-phi = 0, wrapped.
+        bad_idx = torch.arange(-half_width_bins, half_width_bins + 1) % Nphi
+
+        # The mirror bins sit exactly half a turn away (Delta-phi = pi + same offset).
+        shift = Nphi // 2
+        mirror_idx = (bad_idx + shift) % Nphi
+
+        filtered = C_avg.clone()
+        filtered[bad_idx] = C_avg[mirror_idx]
+        return filtered
 
     def extract_Bl_matrices(self, C_avg, l_max=40, sv_cutoff=0.05):
         # Equation 9, 10, 11

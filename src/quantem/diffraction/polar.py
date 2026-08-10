@@ -781,6 +781,9 @@ class PairDistributionFunction(AutoSerialize):
         Fk_win = Fk * wk
 
         r = torch.arange(r_min, r_max, r_step, device=self.device, dtype=torch.float32)
+        print(k.shape)
+        print(r.shape)
+
         ka, ra = torch.meshgrid(k, r, indexing="ij")
         # compute reduced PDF using discrete sine transform
         reduced_pdf = (
@@ -793,7 +796,9 @@ class PairDistributionFunction(AutoSerialize):
                 dim=0,
             )
         )
+        print(reduced_pdf.shape)
         reduced_pdf[0] = 0  # physically must be at 0 when r = 0
+        
 
         self.Ik = Ik
         self.bg = bg

@@ -46,6 +46,7 @@ class PairAngleDistributionFunction(AutoSerialize):
         self.polar_rescaled = self.rescale_intensity(self.polar, rho=1, fq=1)
 
         self.ang_corr = ang_corr if ang_corr is not None else self.compute_avg_angular_correlation(self.polar_rescaled)
+        self.ang_corr = self.centrosymmetric_filter(self.ang_corr)
         self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr)
         self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1])
         self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20) # TODO: determine atoms in beam
@@ -93,6 +94,27 @@ class PairAngleDistributionFunction(AutoSerialize):
 
         C_avg = (C_sum / N_alpha) * dphi
         return C_avg
+
+    def centrosymmetric_filter(self, C_avg: torch.Tensor, width: int = 10) -> torch.Tensor:
+        """
+        Replace correlation values near theta=0 (and its wrap-around at theta=2pi)
+        with values from theta=180 deg, removing the shot-noise self-correlation
+        peak at theta=0, q=q' (Martin 2017 IUCrJ, Appendix B / Fig. 4).
+
+        C_avg has shape (Nphi, Nq, Nqp) as produced by compute_avg_angular_correlation.
+        """
+        Nphi = C_avg.shape[0]
+        mask = torch.ones(Nphi, dtype=C_avg.dtype, device=C_avg.device)
+        mask[:width] = 0.0
+        mask[Nphi - width:] = 0.0
+        mask = mask.view(Nphi, 1, 1)
+
+        shifted_mask = torch.roll(mask, Nphi // 2, dims=0)
+        shifted_C = torch.roll(C_avg * mask, Nphi // 2, dims=0)
+
+        numer = C_avg * mask + shifted_C
+        denom = mask + shifted_mask
+        return numer / denom
 
     def extract_Bl_matrices(self, C_avg, l_max=40, sv_cutoff=0.05):
         # Equation 9, 10, 11
