@@ -138,10 +138,11 @@ class PairAngleDistributionFunction(AutoSerialize):
         r_min = 0.0
         r_max = 20.0
         r_step = 0.02
-                
+
         # Step one is to define q
         q = torch.arange(0, Bl_mats.shape[1]) * dq
         r = torch.arange(r_min, r_max, r_step) # Line 797 in polar.py implements this well. Use the same meshgrid in 798
+        self.r = r.numpy()
         real_Bl = torch.zeros((Bl_mats.shape[0], r.shape[0], r.shape[0]))
 
         for l in range(len(l_values)):
@@ -168,6 +169,8 @@ class PairAngleDistributionFunction(AutoSerialize):
         """
         padf = torch.zeros((real_Bl.shape[1], real_Bl.shape[2], 180))
         theta = np.linspace(0, np.pi, 180)
+        self.theta = theta
+        self.theta_deg = np.degrees(theta)
         cos_theta = np.cos(theta)
         chosen_l_values = l_values[1:]
 
