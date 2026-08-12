@@ -38,7 +38,9 @@ class PairAngleDistributionFunction(AutoSerialize):
                  origin: NDArray | None = None,
                  polar_ds: Polar4dstem | None = None,
                  ang_corr: torch.Tensor | None = None,
-                 Bl_mats = None
+                 Bl_mats = None,
+                 rho: float = 1.0,
+                 fq: NDArray | torch.Tensor | float | None = None,
                  ):
         super().__init__()
 
@@ -47,8 +49,8 @@ class PairAngleDistributionFunction(AutoSerialize):
         self.origin = origin if origin is not None else find_origin_angular_grid(ds)
         self.polar = polar_ds if polar_ds is not None else polar_transform(ds, origin_array=self.origin)
 
-        # TODO: we get rho and fq from sample identity, so either the user provides them, we find them in the dataset, or we look them up based on sample identity
-        self.polar_rescaled = self.rescale_intensity(self.polar, rho=1, fq=1)
+        # TODO: look up rho and fq from sample identity when not provided
+        self.polar_rescaled = self.rescale_intensity(self.polar, rho=rho, fq=fq)
 
         self.ang_corr = ang_corr if ang_corr is not None else self.compute_avg_angular_correlation(self.polar_rescaled)
         self.ang_corr_corrected = self.correct_angular_correlation(self.ang_corr)
@@ -61,8 +63,8 @@ class PairAngleDistributionFunction(AutoSerialize):
     
     def rescale_intensity(self,
                           data: Polar4dstem | Dataset4dstem | None = None,
-                          rho: float | int | None = None,
-                          fq: float | int | None = None):
+                          rho: float | int = 1.0,
+                          fq: NDArray | torch.Tensor | float | int | None = None):
         """
         Equation 7: Take the raw intensity and divide by the following factors
         - Mean number density (rho)
@@ -70,14 +72,37 @@ class PairAngleDistributionFunction(AutoSerialize):
         - Number of atoms in the beam (N_a)
         - phi_0 (dependent on experimental parameters)
 
-        Most likely we will need to fit phi_0 * N_a term via another function
+        fq may be a scalar or a per-radial-bin array f(q) of length Nq
+        (broadcast along the last axis of the polar data). Dividing by
+        f(q)^2 removes the atom-shape damping of the diffraction rings;
+        leaving it in biases the real-space peak positions of the PADF.
+        Floor small f(q) values before passing to avoid amplifying the
+        high-q noise floor.
+
+        Finally the intensity is normalized to unit mean. This is the
+        analogue of pypadf's scalar 1/beamnorm^2 correlation scaling: it
+        absorbs the unmeasurable overall factors (phi_0, N_a, detector
+        gain) so the PADF magnitude is independent of the raw intensity
+        scale.
 
         Handles dtype conversion to float64
         """
-        
-        # TODO: Look at the Martin code to see how he calculated atoms in beam and phi_0
+
         intensity = data.tensor.to(dtype=torch.float64)
-        rescaled_intensity = intensity / (rho * fq**2) # / still need to include atoms in beam and phi
+        if fq is None:
+            fq2 = 1.0
+        elif isinstance(fq, (int, float)):
+            fq2 = float(fq) ** 2
+        else:
+            fq_t = torch.as_tensor(np.asarray(fq), dtype=torch.float64)
+            if fq_t.shape[-1] != intensity.shape[-1]:
+                raise ValueError(
+                    f"fq has length {fq_t.shape[-1]} but the polar data has "
+                    f"{intensity.shape[-1]} radial bins."
+                )
+            fq2 = fq_t ** 2  # broadcasts along the radial (last) axis
+        rescaled_intensity = intensity / (rho * fq2)
+        rescaled_intensity /= rescaled_intensity.mean()
         return rescaled_intensity
     
     # phi_0 is not measureable, make a function to fit. (edit: Maybe not necessary)
@@ -168,6 +193,12 @@ class PairAngleDistributionFunction(AutoSerialize):
         q_min : q value of the first radial bin (nonzero if the polar
             transform used radial_min > 0).
         r_min, r_max, r_step : real-space grid, in the reciprocal units of q.
+
+        The transform kernel is nondimensionalized by q_max (the quadrature
+        uses (q / q_max)^2 d(q / q_max) per axis), so the output B_l(r, r')
+        is dimensionless rather than carrying units of q^6. Combined with
+        the unit-mean intensity normalization in rescale_intensity, this
+        keeps PADF values of order 1.
         """
         # Equation 12, 13
         # apply bessel transform twice for each l
@@ -175,6 +206,7 @@ class PairAngleDistributionFunction(AutoSerialize):
 
         # Step one is to define q
         q = q_min + torch.arange(0, Bl_mats.shape[1], dtype=torch.float64) * dq
+        q_max = float(q[-1])
         r = torch.arange(r_min, r_max, r_step, dtype=torch.float64)
         self.r = r.numpy()
         real_Bl = torch.zeros((Bl_mats.shape[0], r.shape[0], r.shape[0]), dtype=torch.float64)
@@ -184,8 +216,9 @@ class PairAngleDistributionFunction(AutoSerialize):
             arg = 2 * torch.pi * torch.outer(r, q) # Shape len(r) x len(q)
             jl = torch.from_numpy(spherical_jn(l_values[l], arg)).to(dtype=torch.float64)
 
-            # Representing DSBT (eq 12) as a transformation matrix "sbessel"
-            sbessel = 4 * torch.pi * jl * (q**2) * dq
+            # Representing DSBT (eq 12) as a transformation matrix "sbessel",
+            # with q scaled by q_max so the quadrature is dimensionless
+            sbessel = 4 * torch.pi * jl * (q**2) * dq / q_max**3
             # Applying it twice (once along each axis)
             real_Bl[l] = sbessel @ Bl @ sbessel.T * (-1)**l_values[l]
         
@@ -218,6 +251,169 @@ class PairAngleDistributionFunction(AutoSerialize):
 
         padf *= 2 * torch.pi * Na
         return padf
+
+    def plot_g2_g3(
+        self,
+        r_min: float | None = None,
+        r_max: float | None = None,
+        r_display_power: int = 1,
+        r_max_display: float | None = None,
+        r_search_min: float = 0.5,
+        r_marks=None,
+        markers=None,
+        title: str | None = None,
+        figsize: tuple[float, float] = (4.8, 4.4),
+        returnfig: bool = False,
+    ):
+        """
+        Stacked 2-body / 3-body correlation summary of the PADF, after
+        atomode's G3 explorer. The two panels share the radial axis.
+
+        Top panel: 3-body correlation map - Theta(r, r', theta) integrated
+        over r in [r_min, r_max] (symmetrized over both radial axes),
+        plotted as angle theta vs r'.
+
+        Bottom panel: 2-body correlation profile - the |sin(theta)|-weighted
+        RMS of the r = r' diagonal over the interior angular range
+        (15-165 deg),
+            sqrt( sum_theta Theta(r, r, theta)^2 sin(theta)
+                  / sum_theta sin(theta) ).
+        This stands in for the isotropic pair correlation (whose true l = 0
+        component is removed by the correlation mean subtraction; a plain
+        sin-weighted integral of Theta cancels to ~zero by Legendre
+        orthogonality). It peaks at the radial shells where the PADF has
+        angular structure and is used to choose the near-neighbor shell;
+        the integration shell [r_min, r_max] is shaded.
+
+        Both panels are weighted by r^(2 * r_display_power) for display, and
+        the map's color limits are taken from the interior angular range
+        (15-165 deg) so the collinear theta = 0 / 180 bands saturate rather
+        than compressing the color scale.
+
+        Parameters
+        ----------
+        r_min, r_max : float or None
+            Integration shell bounds in the r units of the PADF (Angstroms
+            for calibrated data). If None, the first peak of g2 is selected
+            automatically: from the last point below 5% of the peak height
+            up to the first local minimum past the peak (atomode's default
+            shell heuristic).
+        r_display_power : int
+            Display weighting exponent; each panel is multiplied by
+            r^(2 * r_display_power). 0 plots the raw values.
+        r_max_display : float or None
+            Upper limit of the radial axes; defaults to min(8 A, r.max()).
+        r_search_min : float
+            Ignore r below this value when auto-locating the g2 peak
+            (excludes the r ~ 0 reconstruction artifacts).
+        r_marks : sequence of float or None
+            Radii (e.g. the 1st/2nd/3rd neighbor shell distances) marked
+            with dotted vertical lines on both panels.
+        markers : sequence of (r, theta_deg) or None
+            Expected 3-body maxima overlaid on the map as open circles -
+            e.g. the (shell distance, arm-arm angle) targets from a known
+            structure. A third element per tuple, if present, scales the
+            marker size (relative multiplicity).
+        title : str or None
+            Figure title; a shell summary is used if None.
+        returnfig : bool
+            Return (fig, (ax_g2, ax_g3)) instead of calling plt.show().
+        """
+        r = np.asarray(self.r)
+        theta = np.asarray(self.theta)  # radians
+        theta_deg = np.asarray(self.theta_deg)
+        arr = self.padf.numpy() if hasattr(self.padf, "numpy") else np.asarray(self.padf)
+
+        # pair profile: sin(theta)-weighted RMS of the diagonal over the
+        # interior angles (a plain integral cancels by Legendre orthogonality
+        # since the l = 0 term is removed by the mean subtraction)
+        diag = np.einsum("iik->ik", arr)
+        interior_t = (theta_deg > 15) & (theta_deg < 165)
+        w_t = np.abs(np.sin(theta[interior_t]))
+        g2 = np.sqrt((diag[:, interior_t] ** 2 * w_t[None, :]).sum(axis=1) / w_t.sum())
+
+        # auto-select the first g2 peak if no shell was given
+        if r_min is None or r_max is None:
+            kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0])
+            kernel /= kernel.sum()
+            smooth = np.convolve(np.where(r < r_search_min, 0.0, g2), kernel, mode="same")
+            i_pk = None
+            for idx in range(1, smooth.size - 1):
+                if smooth[idx] > 0 and smooth[idx] >= smooth[idx - 1] and smooth[idx] > smooth[idx + 1]:
+                    i_pk = idx
+                    break
+            if i_pk is None:
+                i_pk = int(np.argmax(smooth))
+            below = np.flatnonzero(smooth[:i_pk] < 0.05 * smooth[i_pk])
+            i_lo = int(below[-1]) if below.size else int(np.searchsorted(r, r_search_min))
+            i_hi = min(smooth.size - 1, 2 * i_pk - i_lo)
+            for idx in range(i_pk + 1, smooth.size - 1):
+                if smooth[idx] <= smooth[idx - 1] and smooth[idx] <= smooth[idx + 1]:
+                    i_hi = idx
+                    break
+            if r_min is None:
+                r_min = float(r[i_lo])
+            if r_max is None:
+                r_max = float(r[i_hi])
+
+        shell = (r >= r_min) & (r <= r_max)
+        if not np.any(shell):
+            shell[int(np.argmin(np.abs(r - 0.5 * (r_min + r_max))))] = True
+
+        # g3 map: integrate over the shell, symmetrized over both r axes
+        g3_map = 0.5 * (arr[shell].sum(axis=0) + arr[:, shell].sum(axis=1))  # (Nr', Ntheta)
+
+        # display weighting and color limits
+        if r_max_display is None:
+            r_max_display = float(min(8.0, r[-1]))
+        weight = r ** (2 * r_display_power)
+        g2_disp = g2 * weight
+        g3_disp = (g3_map * weight[:, None]).T  # (Ntheta, Nr')
+        rs = r <= r_max_display
+        interior = (theta_deg > 15) & (theta_deg < 165)
+        vmax = np.quantile(np.abs(g3_disp[np.ix_(interior, rs)]), 0.999)
+
+        fig, (ax_g3, ax_g2) = plt.subplots(
+            2, 1, sharex=True, figsize=figsize,
+            gridspec_kw={"height_ratios": [2, 1]},
+            constrained_layout=True,
+        )
+        im = ax_g3.pcolormesh(
+            r[rs], theta_deg, g3_disp[:, rs],
+            cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto",
+        )
+        ax_g3.set_ylabel("$\\theta$ (deg)")
+        ax_g3.set_yticks(np.arange(0, 181, 45))
+        fig.colorbar(im, ax=[ax_g3, ax_g2], label="3-body correlation", pad=0.02)
+
+        if markers is not None:
+            for mk in markers:
+                r_mk, t_mk = mk[0], mk[1]
+                size = 12.0 * (mk[2] ** 0.5) if len(mk) > 2 else 10.0
+                if r_mk <= r_max_display:
+                    ax_g3.plot(r_mk, t_mk, "o", ms=max(size, 5.0), mfc="none",
+                               mec="k", mew=1.0)
+
+        ax_g2.plot(r[rs], g2_disp[rs], "k-", lw=1)
+        ax_g2.axvspan(r_min, r_max, color="C1", alpha=0.25)
+        ax_g2.axhline(0, color="0.85", lw=0.8, zorder=0)
+
+        if r_marks is not None:
+            for r_mk in r_marks:
+                for ax in (ax_g3, ax_g2):
+                    ax.axvline(r_mk, color="k", ls=":", lw=0.8)
+        ax_g2.set_ylabel("2-body corr.")
+        ax_g2.set_xlabel("r, r' (Å)")
+
+        ax_g3.set_title(
+            title if title is not None
+            else f"shell r = {r_min:.2f} - {r_max:.2f}",
+            fontsize=10,
+        )
+
+        if returnfig:
+            return fig, (ax_g3, ax_g2)
+        plt.show()
 
     def simple_plot(self):
             """
