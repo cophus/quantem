@@ -10,27 +10,31 @@ from quantem.core.datastructures.polar4dstem import Polar4dstem
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.io.serialize import load
 from quantem.diffraction.polar_transform import (
+    as_dataset4dstem,
     find_origin_angular_grid,
     polar_transform,
 )
 
 class PairAngleDistributionFunction(AutoSerialize):
     """
-    Compute pair-angle distribution function for a given 4D-STEM dataset.
+    Compute the pair-angle distribution function from diffraction data:
+    a single 2D pattern (Dataset2d), a 3D stack of patterns, or a 4D-STEM
+    dataset. Non-4D inputs are wrapped as (1, 1, H, W) / (N, 1, H, W).
 
     Run the following pipeline:
     padf = PairAngleDistributionFunction(ds)
     1. find_origin_angular_grid(ds)
     2. polar_transform(ds, origin_array=self.origin)
     3. rescale_intensity(self.polar, rho=1, fq=1)
-    4. compute_avg_angular_correlation(self.polar_rescaled, dtype=torch.float64)
-    5. extract_Bl_matrices(self.ang_corr)
-    6. transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1])
-    7. reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], self.ds.shape[0] * self.ds.shape[1])
+    4. compute_avg_angular_correlation(self.polar_rescaled)
+    5. correct_angular_correlation(self.ang_corr)  # theta-mean subtraction + |sin(theta)| factor
+    6. extract_Bl_matrices(self.ang_corr_corrected)
+    7. transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1])
+    8. reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], self.ds.shape[0] * self.ds.shape[1])
 
     """
     def __init__(self,
-                 ds: Dataset4dstem = None,
+                 ds=None,
                  origin: NDArray | None = None,
                  polar_ds: Polar4dstem | None = None,
                  ang_corr: torch.Tensor | None = None,
@@ -38,7 +42,8 @@ class PairAngleDistributionFunction(AutoSerialize):
                  ):
         super().__init__()
 
-        self.ds = ds
+        # accept a single 2D pattern, a 3D stack, or a 4D-STEM dataset
+        self.ds = as_dataset4dstem(ds) if ds is not None else None
         self.origin = origin if origin is not None else find_origin_angular_grid(ds)
         self.polar = polar_ds if polar_ds is not None else polar_transform(ds, origin_array=self.origin)
 
@@ -46,8 +51,12 @@ class PairAngleDistributionFunction(AutoSerialize):
         self.polar_rescaled = self.rescale_intensity(self.polar, rho=1, fq=1)
 
         self.ang_corr = ang_corr if ang_corr is not None else self.compute_avg_angular_correlation(self.polar_rescaled)
-        self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr)
-        self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1])
+        self.ang_corr_corrected = self.correct_angular_correlation(self.ang_corr)
+        self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr_corrected)
+        # radial q calibration of the polar dataset: bin i sits at q_min + i * dq
+        dq = float(np.asarray(self.polar.sampling)[3])
+        q_min = float(np.asarray(self.polar.origin)[3])
+        self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1], dq=dq, q_min=q_min)
         self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20) # TODO: determine atoms in beam
     
     def rescale_intensity(self,
@@ -94,6 +103,29 @@ class PairAngleDistributionFunction(AutoSerialize):
         C_avg = (C_sum / N_alpha) * dphi
         return C_avg
 
+    def correct_angular_correlation(self,
+                                    C_avg: torch.Tensor,
+                                    subtract_mean: bool = True,
+                                    sintheta: bool = True):
+        """
+        Corrections applied to the angular correlation before B_l extraction,
+        matching the pypadf maskcorr.py defaults:
+
+        - subtract_mean: subtract the theta-average from each (q, q') ring,
+          removing the dominant isotropic (uncorrelated) background.
+        - sintheta: multiply by |sin(theta)| (evaluated at bin centers).
+          This is the conversion factor between the correlation function and
+          the PADF (eq 11), applied in q-space as in the pypadf workflow.
+        """
+        C = C_avg.clone()
+        Nphi = C.shape[0]
+        if subtract_mean:
+            C -= C.mean(dim=0, keepdim=True)
+        if sintheta:
+            theta = 2.0 * torch.pi * (torch.arange(Nphi, dtype=C.dtype) + 0.5) / Nphi
+            C *= torch.abs(torch.sin(theta))[:, None, None]
+        return C
+
     def extract_Bl_matrices(self, C_avg, l_max=40, sv_cutoff=0.05):
         # Equation 9, 10, 11
         # for each l:
@@ -105,7 +137,6 @@ class PairAngleDistributionFunction(AutoSerialize):
         dphi = torch.linspace(0, 2 * torch.pi, Nphi + 1, dtype=torch.float64)[:-1] # Ranges from [0, 2pi)
         l_values = torch.arange(0, l_max, 2) # Even only
         Nl = len(l_values)
-        B_l = torch.zeros((Nl, Nq, Nqp))
         cos_dphi = torch.cos(dphi)
 
         C_flat = C_avg.reshape(Nphi, Nq * Nqp)
@@ -127,23 +158,26 @@ class PairAngleDistributionFunction(AutoSerialize):
 
         # TODO: Compare each function to the martin code to see the difference/similarity or understand the repo better
 
-    def transform_to_real_space(self, Bl_mats, l_values, dq=0.01):
+    def transform_to_real_space(self, Bl_mats, l_values, dq=0.01, q_min=0.0,
+                                r_min=0.0, r_max=20.0, r_step=0.02):
         """
-        IN PROGRESS
-        dq should be the size of an individual pixel. Default conversion for now is 0.01 angstrom^-1/pixel.
+        Transform B_l(q, q') to B_l(r, r') by applying the spherical Bessel
+        transform (eq 8) along each q axis via direct quadrature.
+
+        dq : radial q step of the polar dataset (e.g. angstrom^-1 / bin).
+        q_min : q value of the first radial bin (nonzero if the polar
+            transform used radial_min > 0).
+        r_min, r_max, r_step : real-space grid, in the reciprocal units of q.
         """
         # Equation 12, 13
         # apply bessel transform twice for each l
         # → shape = (l, r, r')
-        r_min = 0.0
-        r_max = 20.0
-        r_step = 0.02
 
         # Step one is to define q
-        q = torch.arange(0, Bl_mats.shape[1]) * dq
-        r = torch.arange(r_min, r_max, r_step) # Line 797 in polar.py implements this well. Use the same meshgrid in 798
+        q = q_min + torch.arange(0, Bl_mats.shape[1], dtype=torch.float64) * dq
+        r = torch.arange(r_min, r_max, r_step, dtype=torch.float64)
         self.r = r.numpy()
-        real_Bl = torch.zeros((Bl_mats.shape[0], r.shape[0], r.shape[0]))
+        real_Bl = torch.zeros((Bl_mats.shape[0], r.shape[0], r.shape[0]), dtype=torch.float64)
 
         for l in range(len(l_values)):
             Bl = Bl_mats[l].to(dtype=torch.float64) # The corresponding q x q' matrix
@@ -167,7 +201,7 @@ class PairAngleDistributionFunction(AutoSerialize):
         NOTE: Theta will go from 0 to pi
         EDIT: Na should be number of atoms not number of dps
         """
-        padf = torch.zeros((real_Bl.shape[1], real_Bl.shape[2], 180))
+        padf = torch.zeros((real_Bl.shape[1], real_Bl.shape[2], 180), dtype=torch.float64)
         theta = np.linspace(0, np.pi, 180)
         self.theta = theta
         self.theta_deg = np.degrees(theta)
