@@ -54,6 +54,16 @@ class PairAngleDistributionFunction2D:
         q of the first radial bin (from the polar dataset when available).
     r_min, r_max, r_step : float
         Real-space grid, in the reciprocal units of q.
+    fq : scalar or (N_q,) array or None
+        Atomic form factor f(q) per radial bin; the intensity is divided by
+        f(q)^2 (same eq-7 rescaling as the 3D pipeline). Leaving the atom-
+        shape damping in shrinks the effective q range and makes the
+        real-space maps broad and oscillatory. Floor small values before
+        passing to avoid amplifying the high-q noise floor.
+    q_taper : float
+        Fraction of the radial range cosine-tapered to zero at q_max
+        (default 0.25). Softens the hard-cutoff ringing of the Hankel
+        transform; 0 disables.
     normalize_mean : bool
         Normalize the intensity to unit mean (magnitude convention shared
         with the 3D PADF pipeline).
@@ -64,6 +74,7 @@ class PairAngleDistributionFunction2D:
     def __init__(self, polar, n_max: int = 60, dq: float | None = None,
                  q_min: float | None = None, r_min: float = 0.0,
                  r_max: float = 20.0, r_step: float = 0.02,
+                 fq=None, q_taper: float = 0.25,
                  normalize_mean: bool = True, batch_size: int = 4096):
         if dq is None and hasattr(polar, "sampling"):
             dq = float(np.asarray(polar.sampling)[3])
@@ -82,6 +93,15 @@ class PairAngleDistributionFunction2D:
         self.q = q_min + np.arange(n_q) * self.dq
 
         data = tensor.reshape(-1, n_phi, n_q)
+        if fq is not None:
+            fq_t = torch.as_tensor(np.broadcast_to(np.asarray(fq, dtype=np.float64), (n_q,)).copy())
+            data = data / fq_t[None, None, :] ** 2
+        if q_taper > 0:
+            taper = torch.ones(n_q, dtype=torch.float64)
+            i0 = int((1.0 - q_taper) * n_q)
+            ramp = np.arange(n_q - i0) / max(n_q - i0, 1)
+            taper[i0:] = torch.from_numpy(0.5 * (1 + np.cos(np.pi * ramp)))
+            data = data * taper[None, None, :]
         if normalize_mean:
             data = data / data.mean()
         n_patterns = data.shape[0]
@@ -138,19 +158,22 @@ class PairAngleDistributionFunction2D:
                       returnfig: bool = False):
         """
         Map of the r = r' diagonal vs relative angle, weighted by
-        r^(2 * r_display_power), zero-centered RdBu_r. theta_max = 180
-        shows the folded view (sufficient for Friedel-symmetric data);
-        360 shows the full relative angle available when odd harmonics
-        are present.
+        r^r_display_power (r^1 by default), zero-centered RdBu_r.
+        theta_max = 180 shows the folded view (sufficient for
+        Friedel-symmetric data); 360 shows the full relative angle
+        available when odd harmonics are present. Color limits are set
+        from interior angles and r <= 0.92 * r_max_display, so edge
+        artifacts do not compress the scale.
         """
         theta_deg, padf = self.reconstruct(n_theta=n_theta)
         r = self.r
         rs = r <= r_max_display
         ts = theta_deg <= theta_max + 1e-9
         diag = np.einsum("iik->ik", padf)[rs][:, ts]
-        disp = (diag * (r[rs] ** (2 * r_display_power))[:, None]).T
+        disp = (diag * (r[rs] ** r_display_power)[:, None]).T
         interior = (theta_deg[ts] % 180 > 15) & (theta_deg[ts] % 180 < 165)
-        vmax = np.quantile(np.abs(disp[interior]), 0.999)
+        r_inner = r[rs] <= 0.92 * r_max_display
+        vmax = np.quantile(np.abs(disp[np.ix_(interior, r_inner)]), 0.999)
 
         fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
         im = ax.pcolormesh(r[rs], theta_deg[ts], disp, cmap="RdBu_r",
@@ -158,7 +181,7 @@ class PairAngleDistributionFunction2D:
         ax.set_xlabel("r = r' (Å)")
         ax.set_ylabel("$\\Delta\\theta$ (deg)")
         ax.set_yticks(np.arange(0, theta_max + 1, 45))
-        fig.colorbar(im, ax=ax, label=f"$\\Theta_{{2D}} \\cdot r^{{{2 * r_display_power}}}$")
+        fig.colorbar(im, ax=ax, label=f"$\\Theta_{{2D}} \\cdot r^{{{r_display_power}}}$")
         if title is not None:
             ax.set_title(title, fontsize=10)
         if returnfig:
