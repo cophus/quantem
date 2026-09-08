@@ -27,6 +27,13 @@ import torch
 from tqdm import tqdm
 
 from quantem.core.io.serialize import AutoSerialize
+from quantem.diffraction.defaults import (
+    MIN_NUMBER_PEAKS,
+    MIN_SIM_INTENSITY_REL,
+    PAIR_DISTANCE,
+    POWER_INTENSITY,
+    resolve,
+)
 from quantem.diffraction.orientation import OrientationMap
 
 
@@ -58,6 +65,8 @@ class PhaseMap(AutoSerialize):
             for m in range(om.quats.shape[2]):
                 self.candidates.append((i, m))
 
+        # hyperparameters inherited from the maps and recorded per stage
+        self.metadata: dict = {"orientation_maps": [dict(om.metadata) for om in orientation_maps]}
         self.phase_weights: torch.Tensor | None = None
         self.costs_single: torch.Tensor | None = None
         self.cost_best: torch.Tensor | None = None
@@ -77,26 +86,32 @@ class PhaseMap(AutoSerialize):
 
     def fit(
         self,
-        pair_distance: float = 0.05,
-        power_intensity: float = 0.25,
+        pair_distance: float | None = None,
+        power_intensity: float | None = None,
         max_patterns: int = 2,
         complexity_penalty: float = 0.02,
         weight_unmatched_sim: float = 0.5,
         weight_overprediction: float = 1.0,
-        min_sim_intensity_rel: float = 0.02,
+        min_sim_intensity_rel: float | None = None,
         k_max: float | None = None,
-        min_number_peaks: int = 3,
+        min_number_peaks: int | None = None,
         progress_bar: bool = True,
     ) -> "PhaseMap":
         """Score all candidate subsets at every probe position.
 
+        Parameters left as None inherit the values the orientation
+        matching used (its plan kernel, intensity power and peak minimum),
+        so the phase decision compares the same peaks the same way; the
+        resolved values are recorded in `metadata['fit']`.
+
         Parameters
         ----------
-        pair_distance : float, default=0.05
+        pair_distance : float | None
             Pairing distance delta (1/Angstroms) between simulated and
-            measured peaks.
-        power_intensity : float, default=0.25
-            Intensities are raised to this power before comparison.
+            measured peaks; inherits the plan's correlation kernel.
+        power_intensity : float | None
+            Intensities are raised to this power before comparison;
+            inherits the plan's value.
         max_patterns : int, default=2
             Maximum number of candidate patterns fit simultaneously.
         complexity_penalty : float, default=0.02
@@ -123,6 +138,29 @@ class PhaseMap(AutoSerialize):
         from scipy.optimize import nnls
 
         oms = self.orientation_maps
+        plan_md = oms[0].metadata.get("plan")
+        match_md = oms[0].metadata.get("match")
+        pair_distance = resolve(pair_distance, "pair_distance", plan_md, default=PAIR_DISTANCE)
+        power_intensity = resolve(
+            power_intensity, "power_intensity", plan_md, default=POWER_INTENSITY
+        )
+        min_sim_intensity_rel = resolve(
+            min_sim_intensity_rel, "min_sim_intensity_rel", default=MIN_SIM_INTENSITY_REL
+        )
+        min_number_peaks = resolve(
+            min_number_peaks, "min_number_peaks", match_md, default=MIN_NUMBER_PEAKS
+        )
+        self.metadata["fit"] = dict(
+            pair_distance=float(pair_distance),
+            power_intensity=float(power_intensity),
+            max_patterns=int(max_patterns),
+            complexity_penalty=float(complexity_penalty),
+            weight_unmatched_sim=float(weight_unmatched_sim),
+            weight_overprediction=float(weight_overprediction),
+            min_sim_intensity_rel=float(min_sim_intensity_rel),
+            k_max=k_max,
+            min_number_peaks=int(min_number_peaks),
+        )
         peaks = oms[0].peaks
         R, C = peaks.shape[0], peaks.shape[1]
         cands = self.candidates
@@ -196,9 +234,9 @@ class PhaseMap(AutoSerialize):
                 model = B @ w
                 under = np.maximum(im_np - model, 0).sum()  # unexplained measured
                 over = np.maximum(model - im_np, 0).sum()  # overpredicted paired
-                cost = (
-                    under + weight_overprediction * over + (w * unpaired_sim[cols]).sum()
-                ) / (int_total + 1e-12) + complexity_penalty * (len(cols) - 1)
+                cost = (under + weight_overprediction * over + (w * unpaired_sim[cols]).sum()) / (
+                    int_total + 1e-12
+                ) + complexity_penalty * (len(cols) - 1)
                 results.append((cost, s, cols, w))
             if not results:
                 continue
@@ -217,11 +255,7 @@ class PhaseMap(AutoSerialize):
             # near-duplicates, e.g. after residual re-matching)
             f_dom = cols_best[int(np.argmax(w_best))]
             i_dom = cands[f_dom][0]
-            others = [
-                c
-                for c, s, _, _ in results
-                if all(cands[f][0] != i_dom for f in s)
-            ]
+            others = [c for c, s, _, _ in results if all(cands[f][0] != i_dom for f in s)]
             reliability[rx, ry] = (min(others) - c_best) if others else torch.nan
 
         self.costs_single = costs_single
@@ -237,6 +271,41 @@ class PhaseMap(AutoSerialize):
             w_phase[..., i_om] += weights_out[..., f]
         self.phase_index = w_phase.argmax(dim=-1)
         self.phase_fractions = w_phase / w_phase.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        return self
+
+    def apply_dynamical(self, result: dict) -> "PhaseMap":
+        """Take the phase decision from a dynamical refinement.
+
+        A phase map can be built from the orientation maps at any stage:
+        after matching, after refine_orientations, or after
+        bloch.refine_dynamical, whose per-candidate intensity costs decide
+        the phase here. The reliability becomes the cost gap between the
+        best candidates of the winning crystal and of the runner-up
+        crystal, and the kinematical result is kept under
+        `metadata['kinematical']`.
+        """
+        cost = torch.nan_to_num(result["cost"], nan=torch.inf)
+        n_maps = len(self.orientation_maps)
+        R, C = cost.shape[:2]
+        cost_phase = torch.full((R, C, n_maps), torch.inf, dtype=cost.dtype)
+        for f, (i_om, _) in enumerate(self.candidates):
+            cost_phase[..., i_om] = torch.minimum(cost_phase[..., i_om], cost[..., f])
+        order = cost_phase.sort(dim=-1).values
+        reliability = torch.where(
+            torch.isfinite(order[..., 0]),
+            (order[..., 1] - order[..., 0]).clamp_min(0)
+            if n_maps > 1
+            else torch.zeros_like(order[..., 0]),
+            torch.full_like(order[..., 0], torch.nan),
+        )
+        self.metadata["kinematical"] = {
+            "phase_index": self.phase_index,
+            "reliability": self.reliability,
+        }
+        self.phase_index = result["phase_index"]
+        self.reliability = reliability
+        self.cost_best = order[..., 0]
+        self.metadata["dynamical_applied"] = dict(result.get("metadata", {}))
         return self
 
     def plot_phase(
@@ -301,13 +370,9 @@ class PhaseMap(AutoSerialize):
 
         n_ph = len(phase_colors)
         for k, color in enumerate(phase_colors):
-            cmap_k = LinearSegmentedColormap.from_list(
-                f"rel{k}", [(0, 0, 0), tuple(color)]
-            )
+            cmap_k = LinearSegmentedColormap.from_list(f"rel{k}", [(0, 0, 0), tuple(color)])
             cax = ax.inset_axes([1.02 + 0.025 * k, 0.05, 0.025, 0.9])
-            cb = fig.colorbar(
-                ScalarMappable(norm=Normalize(lo, hi), cmap=cmap_k), cax=cax
-            )
+            cb = fig.colorbar(ScalarMappable(norm=Normalize(lo, hi), cmap=cmap_k), cax=cax)
             if k < n_ph - 1:
                 cb.set_ticks([])
             else:

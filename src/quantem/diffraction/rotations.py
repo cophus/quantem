@@ -185,9 +185,7 @@ def quat_from_zone_axis(
         torch.as_tensor(in_plane_deg, dtype=v.dtype, device=v.device)
     ).broadcast_to(v.shape[:-1])
     z3 = torch.zeros_like(in_plane)
-    q_spin = torch.stack(
-        (torch.cos(in_plane / 2), z3, z3, torch.sin(in_plane / 2)), dim=-1
-    )
+    q_spin = torch.stack((torch.cos(in_plane / 2), z3, z3, torch.sin(in_plane / 2)), dim=-1)
     return qnormalize(qmult(q_spin, q_tilt))
 
 
@@ -239,9 +237,7 @@ def misorientation_axis_angle(
     if sym_ops is not None:
         dq_sym = qmult(dq[..., None, :], sym_ops)  # (..., S, 4)
         best = dq_sym[..., 0].abs().argmax(dim=-1)
-        dq = torch.gather(
-            dq_sym, -2, best[..., None, None].expand(*best.shape, 1, 4)
-        ).squeeze(-2)
+        dq = torch.gather(dq_sym, -2, best[..., None, None].expand(*best.shape, 1, 4)).squeeze(-2)
     dq = qnormalize(dq)
     axis, angle = quat_to_axis_angle(dq)
     return axis, torch.rad2deg(angle)
@@ -264,7 +260,13 @@ def sample_zone_axes(
     corners: torch.Tensor,
     step_deg: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Triangular SLERP grid of unit zone-axis vectors inside a spherical triangle.
+    """Isotropic SLERP grid of unit zone-axis vectors inside a spherical triangle.
+
+    Rows run from corner 0 toward the opposite edge; the number of points
+    in each row follows the row's own arc length, so the spacing is close
+    to `step_deg` in every direction whatever the apex angle of the wedge
+    (a 30 degree hexagonal wedge and a 120 degree trigonal wedge get the
+    same density).
 
     Parameters
     ----------
@@ -272,7 +274,7 @@ def sample_zone_axes(
         (3, 3) rows are the Cartesian corner directions of the fundamental
         zone-axis wedge, e.g. [001], [011], [111] for m-3m.
     step_deg : float
-        Approximate angular step between neighboring zone axes, degrees.
+        Angular step between neighboring zone axes, degrees.
 
     Returns
     -------
@@ -296,12 +298,141 @@ def sample_zone_axes(
             vecs.append(pv[None])
             inds.append(torch.tensor([[0, 0]]))
             continue
-        s = torch.linspace(0, 1, i + 1, dtype=c.dtype, device=c.device)
-        row = slerp(pv.expand(i + 1, 3), pw.expand(i + 1, 3), s)
+        arc = torch.rad2deg(torch.acos((pv * pw).sum().clamp(-1, 1)))
+        n_i = max(1, int(torch.ceil(arc / step_deg).item()))
+        s = torch.linspace(0, 1, n_i + 1, dtype=c.dtype, device=c.device)
+        row = slerp(pv.expand(n_i + 1, 3), pw.expand(n_i + 1, 3), s)
         row = row / torch.linalg.norm(row, dim=-1, keepdim=True)
         vecs.append(row)
-        inds.append(torch.stack((torch.full((i + 1,), i), torch.arange(i + 1)), dim=-1))
+        inds.append(torch.stack((torch.full((n_i + 1,), i), torch.arange(n_i + 1)), dim=-1))
     return torch.cat(vecs), torch.cat(inds).to(torch.long)
+
+
+def symmetry_axes(sym_quats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Distinct rotation axes of a proper point group and their orders.
+
+    Returns (axes (A, 3) unit vectors, orders (A,) long): each axis once,
+    with the highest rotation order about it (a 4-fold axis is listed as
+    order 4, not also as 2).
+    """
+    axis, angle = quat_to_axis_angle(sym_quats)
+    keep = angle > 1e-6
+    axis, angle = axis[keep], angle[keep]
+    order = torch.round(2 * np.pi / angle).to(torch.long)
+    # orient each axis to a canonical hemisphere so +-axis merge
+    sign = torch.sign(axis[:, 2] + 1e-3 * axis[:, 1] + 1e-6 * axis[:, 0])
+    sign[sign == 0] = 1
+    axis = axis * sign[:, None]
+    out_axes, out_orders = [], []
+    for a, n in zip(axis, order):
+        for k, b in enumerate(out_axes):
+            if float(torch.abs(a @ b)) > 1 - 1e-6:
+                out_orders[k] = max(out_orders[k], int(n))
+                break
+        else:
+            out_axes.append(a)
+            out_orders.append(int(n))
+    if not out_axes:
+        return torch.zeros((0, 3), dtype=torch.float64), torch.zeros(0, dtype=torch.long)
+    return torch.stack(out_axes), torch.tensor(out_orders, dtype=torch.long)
+
+
+def _rotate_about(v: torch.Tensor, axis: torch.Tensor, angle_rad: float) -> torch.Tensor:
+    q = quat_from_axis_angle(axis, torch.tensor(angle_rad, dtype=v.dtype))
+    return qrotate(q, v)
+
+
+def _closest(cands: torch.Tensor, prefer: torch.Tensor) -> torch.Tensor:
+    """The candidate (sign chosen freely) closest to the preferred direction,
+    with deterministic tie-breaking toward +z, then +y, then +x."""
+    signed = torch.cat([cands, -cands])
+    key = signed @ prefer + 1e-3 * signed[:, 2] + 1e-6 * signed[:, 1] + 1e-9 * signed[:, 0]
+    return signed[int(torch.argmax(key))]
+
+
+def fundamental_zone_axis_wedge(sym_quats: torch.Tensor) -> torch.Tensor | None:
+    """Fundamental zone-axis wedge of a Laue group from its proper rotations.
+
+    Zone axes are directions modulo inversion (Friedel), so the wedge is a
+    fundamental domain of the Laue group on the projective hemisphere,
+    built from the actual symmetry axes in the crystal's Cartesian frame
+    rather than from a table keyed on the Laue class. This makes it correct
+    for every setting: for -3m the wedge is bounded by the mirror planes
+    (perpendicular to the in-plane 2-fold axes), which is 30 degrees away
+    from a wedge bounded by the 2-fold axes themselves; for a cell in a
+    non-standard Cartesian setting the corners follow the axes wherever
+    they point.
+
+    Returns (3, 3) corner directions, or None for Laue classes -1 and 2/m
+    whose fundamental domain is not a spherical triangle (sample the
+    hemisphere instead).
+    """
+    axes, orders = symmetry_axes(sym_quats)
+    n_ops = sym_quats.shape[0]
+    x, y, z = (torch.eye(3, dtype=torch.float64)[i] for i in range(3))
+    if n_ops <= 2:
+        return None
+
+    three = axes[orders == 3]
+    if three.shape[0] >= 4:  # cubic
+        four = axes[orders == 4]
+        two = axes[orders == 2]
+        if four.shape[0] > 0:  # m-3m: 4-fold, <110> 2-fold, 3-fold
+            c0 = _closest(four, z)
+            c2 = _closest(three, c0)
+            c1 = _closest(two, c0 + c2)
+        else:  # m-3: two cubic 2-fold axes and the 3-fold between them
+            c0 = _closest(two, z)
+            rest = two[torch.abs(two @ c0) < 0.5]
+            c1 = _closest(rest, x)
+            c2 = _closest(three, c0 + c1)
+        return torch.stack([c0, c1, c2])
+
+    n_max = int(orders.max())
+    if n_max in (3, 4, 6):  # uniaxial classes
+        c0 = _closest(axes[orders == n_max], z)
+        in_plane = axes[(orders == 2) & (torch.abs(axes @ c0) < 1e-6)]
+        # a direction perpendicular to the axis, nearest +x
+        ref = x - (x @ c0) * c0
+        if torch.linalg.norm(ref) < 1e-6:
+            ref = y - (y @ c0) * c0
+        ref = ref / torch.linalg.norm(ref)
+        if in_plane.shape[0] == 0:  # 6/m, 4/m, -3: any 360/n sector
+            c2 = ref
+            c1 = _rotate_about(c2, c0, 2 * np.pi / n_max)
+        elif n_max == 3:  # -3m: the sector between adjacent mirror planes,
+            # which are perpendicular to the in-plane 2-fold axes
+            a = _closest(in_plane, ref)
+            c2 = _rotate_about(a, c0, np.pi / 2)
+            c1 = _rotate_about(a, c0, 5 * np.pi / 6)
+        else:  # 6/mmm, 4/mmm: between adjacent in-plane 2-fold axes
+            c2 = _closest(in_plane, ref)
+            c1 = _rotate_about(c2, c0, np.pi / n_max)
+        return torch.stack([c0, c1, c2])
+
+    if n_max == 2 and axes.shape[0] == 3:  # mmm: the three 2-fold axes
+        c0 = _closest(axes, z)
+        rest = axes[torch.abs(axes @ c0) < 0.5]
+        c1 = _closest(rest, x)
+        c2 = _closest(rest[torch.abs(rest @ c1) < 0.5], y)
+        return torch.stack([c0, c1, c2])
+    return None
+
+
+def symmetry_reduced_zone_angles(
+    zone_axes: torch.Tensor, sym_quats: torch.Tensor, chunk: int = 8
+) -> torch.Tensor:
+    """(Z, Z) angular distances between zone axes, minimized over the
+    symmetry operations and the inversion (zone axes are directions modulo
+    sign). Symmetry-equivalent zones are at distance zero, so an exclusion
+    ball around a match also excludes its symmetry copies."""
+    Rs = quat_to_matrix(sym_quats).to(zone_axes.dtype)
+    best = torch.full((zone_axes.shape[0],) * 2, -1.0, dtype=zone_axes.dtype)
+    for s0 in range(0, Rs.shape[0], chunk):
+        imgs = torch.einsum("sij,zj->szi", Rs[s0 : s0 + chunk], zone_axes)
+        dots = torch.einsum("szi,wi->szw", imgs, zone_axes).abs().amax(dim=0)
+        best = torch.maximum(best, dots)
+    return torch.rad2deg(torch.acos(best.clamp(-1, 1)))
 
 
 def symmetry_quaternions(
@@ -328,7 +459,12 @@ def symmetry_quaternions(
     W = torch.as_tensor(np.array(rotations), dtype=torch.float64)
     R_cart = A @ W @ torch.linalg.inv(A)
     proper = torch.linalg.det(R_cart) > 0
-    q = quat_from_matrix(R_cart[proper])
+    # for a pseudo-symmetry group the lattice is slightly distorted from the
+    # ideal one, so A W A^-1 is only approximately orthogonal: take the
+    # nearest rotation (polar decomposition) so the operators are exact
+    # rotations and the wedge and misorientation math stay consistent
+    U, _, Vh = torch.linalg.svd(R_cart[proper])
+    q = quat_from_matrix(U @ Vh)
     # deduplicate (q and -q are the same rotation; qnormalize fixed the sign)
     q_unique = torch.unique(torch.round(q / 1e-6) * 1e-6, dim=0)
     return qnormalize(q_unique)

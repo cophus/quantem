@@ -20,7 +20,20 @@ DEFAULT_PHASE_COLORS = np.array(
 )
 ORIGIN_COLOR = "#2ca02c"
 MEASURED_COLOR = "0.15"
-IPF_GAMMA = 0.4  # <1 expands the white / mixed-color regions of the wedge
+IPF_GAMMA = 0.4
+# cluster / grain label colors (tab10 cycle)
+CLUSTER_COLORS = [
+    (0.122, 0.467, 0.706),
+    (1.0, 0.498, 0.055),
+    (0.173, 0.627, 0.173),
+    (0.839, 0.153, 0.157),
+    (0.580, 0.404, 0.741),
+    (0.549, 0.337, 0.294),
+    (0.890, 0.467, 0.761),
+    (0.498, 0.498, 0.498),
+    (0.737, 0.741, 0.133),
+    (0.090, 0.745, 0.812),
+]  # <1 expands the white / mixed-color regions of the wedge
 # additive corner colors: full red, green capped to avoid the fluorescent
 # look, blue lifted off pure dark blue; pairwise sums give near-max-chroma
 # yellow / cyan / violet and the three together give white
@@ -76,7 +89,7 @@ def _reduce_to_wedge(vectors: torch.Tensor, crystal: Crystal) -> torch.Tensor:
         v = vectors.clone()
         v[v[..., 2] < 0] *= -1
         return v
-    Rs = quat_to_matrix(crystal.sym_quats)  # (S, 3, 3)
+    Rs = quat_to_matrix(crystal.sym_quats_matching)  # (S, 3, 3)
     v = vectors.reshape(-1, 3)
     orbit = torch.cat(
         [torch.einsum("sij,nj->nsi", Rs, v), torch.einsum("sij,nj->nsi", Rs, -v)],
@@ -155,17 +168,12 @@ def wedge_legend(
     # tall panel with the wedge hanging straight down (the rotation aligns
     # the wedge's angular bisector with the downward direction)
     if orientation == "vertical":
-        az = [
-            np.arctan2(c[k, 1] / (1 + c[k, 2]), c[k, 0] / (1 + c[k, 2]))
-            for k in (1, 2)
-        ]
+        az = [np.arctan2(c[k, 1] / (1 + c[k, 2]), c[k, 0] / (1 + c[k, 2])) for k in (1, 2)]
         th = -np.pi / 2 - (az[0] + az[1]) / 2
     else:
         th = 0.0
     rot = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
-    cxy = np.stack(
-        [c[:, 0] / (1 + c[:, 2]), c[:, 1] / (1 + c[:, 2])], axis=1
-    ) @ rot.T
+    cxy = np.stack([c[:, 0] / (1 + c[:, 2]), c[:, 1] / (1 + c[:, 2])], axis=1) @ rot.T
     cx, cy = cxy[:, 0], cxy[:, 1]
 
     # rasterize the wedge interior: invert the stereographic projection on a
@@ -174,15 +182,11 @@ def wedge_legend(
     m = 8
     x0, x1 = cx.min() - 0.02, cx.max() + 0.02
     y0, y1 = cy.min() - 0.02, cy.max() + 0.02
-    X, Y = np.meshgrid(
-        np.linspace(x0, x1, n * m), np.linspace(y0, y1, n * m), indexing="xy"
-    )
+    X, Y = np.meshgrid(np.linspace(x0, x1, n * m), np.linspace(y0, y1, n * m), indexing="xy")
     Xu = np.cos(th) * X + np.sin(th) * Y
     Yu = -np.sin(th) * X + np.cos(th) * Y
     denom = 1 + Xu**2 + Yu**2
-    V = np.stack(
-        [2 * Xu / denom, 2 * Yu / denom, (1 - Xu**2 - Yu**2) / denom], axis=-1
-    )
+    V = np.stack([2 * Xu / denom, 2 * Yu / denom, (1 - Xu**2 - Yu**2) / denom], axis=-1)
     A_inv = np.linalg.inv(c.T)
     W = V @ A_inv.T
     inside = (W > -1e-9).all(axis=-1)
@@ -195,9 +199,7 @@ def wedge_legend(
     for i0, i1 in ((0, 1), (1, 2), (2, 0)):
         e = c[i0][None, :] * (1 - tt) + c[i1][None, :] * tt
         e = e / np.linalg.norm(e, axis=1, keepdims=True)
-        exy = np.stack(
-            [e[:, 0] / (1 + e[:, 2]), e[:, 1] / (1 + e[:, 2])], axis=1
-        ) @ rot.T
+        exy = np.stack([e[:, 0] / (1 + e[:, 2]), e[:, 1] / (1 + e[:, 2])], axis=1) @ rot.T
         ax.plot(exy[:, 0], exy[:, 1], color="k", lw=1.2)
     if labels:
         names = crystal.zone_axis_wedge_labels() or ["", "", ""]
@@ -285,13 +287,9 @@ def plot_orientation_map(
                 "y": r"$\rightarrow$",
             }.get(direction, "")
             label = {"x": "r", "y": "c"}.get(direction, direction)
-            ax.set_title(
-                f"{om.crystal.name}  in-plane orientation  {label} {arrow}"
-            )
+            ax.set_title(f"{om.crystal.name}  in-plane orientation  {label} {arrow}")
         elif isinstance(direction, (int, float)):
-            ax.set_title(
-                f"{om.crystal.name}  in-plane orientation  ({direction:g}\u00b0)"
-            )
+            ax.set_title(f"{om.crystal.name}  in-plane orientation  ({direction:g}\u00b0)")
         else:
             ax.set_title(f"{om.crystal.name}  in-plane orientation")
     if scalebar is not None:
@@ -426,16 +424,13 @@ def plot_pattern_matches(
                     lw=0,
                 )
             sim = om.generate_pattern(rx, ry, match=m)
-            I = sim["intensity"].numpy()
-            sim_rc = (
-                np.stack([sim["qx"].numpy(), sim["qy"].numpy()], axis=1)
-                @ rot_back.T
-            )
-            if I.size:
+            inten = sim["intensity"].numpy()
+            sim_rc = np.stack([sim["qx"].numpy(), sim["qy"].numpy()], axis=1) @ rot_back.T
+            if inten.size:
                 ax.scatter(
                     sim_rc[:, 1],
                     sim_rc[:, 0],
-                    s=marker_scale * I / I.max(),
+                    s=marker_scale * inten / inten.max(),
                     marker="+",
                     color=colors[i_om % len(colors)],
                     lw=1.8,
@@ -446,8 +441,7 @@ def plot_pattern_matches(
             ax.set_yticks([])
             ax.set_aspect("equal")
             ax.set_title(
-                "%s %s\ncorr = %.2f"
-                % (om.crystal.name, ordinal[m], float(om.corr[rx, ry, m])),
+                "%s %s\ncorr = %.2f" % (om.crystal.name, ordinal[m], float(om.corr[rx, ry, m])),
                 fontsize=9,
             )
             if scalebar and pi == n_r - 1 and ci == 0:
@@ -465,6 +459,7 @@ def plot_pattern_matches(
                 )
     fig.tight_layout()
     return fig, axs
+
 
 def plot_cluster_map(
     om,
@@ -493,8 +488,14 @@ def plot_cluster_map(
     ax.set_yticks([])
     ax.set_title(f"{om.crystal.name} orientation clusters")
     handles = [
-        plt.Line2D([0], [0], marker="s", ls="", color=colors[k % len(colors)],
-                   label=f"{k + 1}  ({int(clusters['sizes'][k])} px)")
+        plt.Line2D(
+            [0],
+            [0],
+            marker="s",
+            ls="",
+            color=colors[k % len(colors)],
+            label=f"{k + 1}  ({int(clusters['sizes'][k])} px)",
+        )
         for k in range(K)
     ]
     ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8)
@@ -532,9 +533,7 @@ def _pole_points(
     else:
         w = torch.ones(q.shape[0], dtype=torch.float64)
     w_all = w[:, None].expand(-1, n_fam).reshape(-1)
-    src_all = (
-        torch.arange(q.shape[0])[:, None].expand(-1, n_fam).reshape(-1)
-    )
+    src_all = torch.arange(q.shape[0])[:, None].expand(-1, n_fam).reshape(-1)
     v = poles_lab.reshape(-1, 3)
     keep = (v[:, 2] > -1e-8) & (w_all > 0)
     v, w_keep, src = v[keep], w_all[keep], src_all[keep]
@@ -605,17 +604,26 @@ def plot_cluster_pole_figure(
     for k in range(K):
         xy = _pole_scatter_xy(clusters["mean_quats"][k], om.crystal, pole)
         ax.scatter(
-            xy[:, 0], xy[:, 1], s=60, marker="h",
-            color=colors[k % len(colors)], edgecolors="k", lw=0.4,
+            xy[:, 0],
+            xy[:, 1],
+            s=60,
+            marker="h",
+            color=colors[k % len(colors)],
+            edgecolors="k",
+            lw=0.4,
             label=f"{pole_label} {k + 1}",
         )
     if overlay is not None:
-        xy = _pole_scatter_xy(
-            overlay["quats"], overlay["crystal"], overlay["pole"]
-        )
+        xy = _pole_scatter_xy(overlay["quats"], overlay["crystal"], overlay["pole"])
         ax.scatter(
-            xy[:, 0], xy[:, 1], s=70, marker="D", facecolors="none",
-            edgecolors="k", lw=1.0, label=overlay.get("label", "overlay"),
+            xy[:, 0],
+            xy[:, 1],
+            s=70,
+            marker="D",
+            facecolors="none",
+            edgecolors="k",
+            lw=1.0,
+            label=overlay.get("label", "overlay"),
         )
     ax.set_xlim(-1.15, 1.15)
     ax.set_ylim(-1.15, 1.15)
@@ -720,9 +728,7 @@ def plot_pole_figure(
     # display in the image frame: horizontal = c (col, rightward), vertical =
     # r (row, downward), matching the orientation maps -- H is indexed
     # [row-bin, col-bin] so no transpose, origin upper
-    yy, xx = np.meshgrid(
-        0.5 * (ye[:-1] + ye[1:]), 0.5 * (xe[:-1] + xe[1:]), indexing="ij"
-    )
+    yy, xx = np.meshgrid(0.5 * (ye[:-1] + ye[1:]), 0.5 * (xe[:-1] + xe[1:]), indexing="ij")
     disp = disp.copy()
     disp[(xx**2 + yy**2).T > 1.0] = 1.0
 
@@ -772,17 +778,29 @@ def plot_pole_figure(
             (0.0, 0.22, "r", "center", "top"),
         ):
             ax.annotate(
-                "", xy=(gx + dx, gy + dy), xytext=(gx, gy),
+                "",
+                xy=(gx + dx, gy + dy),
+                xytext=(gx, gy),
                 arrowprops=dict(arrowstyle="-|>", color="0.3", lw=1.2),
                 annotation_clip=False,
             )
             ax.text(
-                gx + dx * 1.25, gy + dy * 1.25, lbl,
-                fontsize=9, ha=ha, va=va, color="0.3",
+                gx + dx * 1.25,
+                gy + dy * 1.25,
+                lbl,
+                fontsize=9,
+                ha=ha,
+                va=va,
+                color="0.3",
             )
         ax.text(
-            gx - 0.03, gy - 0.06, "scan axes", fontsize=7, ha="left",
-            va="bottom", color="0.45",
+            gx - 0.03,
+            gy - 0.06,
+            "scan axes",
+            fontsize=7,
+            ha="left",
+            va="bottom",
+            color="0.45",
         )
     if overlay is not None:
         if "om" in overlay:
@@ -804,15 +822,26 @@ def plot_pole_figure(
                 yc = 0.5 * (oye[:-1] + oye[1:])
                 # image frame: horizontal = col bins, vertical = row bins
                 ax.contour(
-                    yc, xc, Ho, levels=lev, colors="k",
-                    linewidths=[0.7, 1.3], alpha=0.85,
+                    yc,
+                    xc,
+                    Ho,
+                    levels=lev,
+                    colors="k",
+                    linewidths=[0.7, 1.3],
+                    alpha=0.85,
                 )
                 ax.plot([], [], color="k", lw=1.2, label=overlay.get("label", "overlay"))
         else:
             oxy = _pole_scatter_xy(overlay["quats"], overlay["crystal"], overlay["pole"])
             ax.scatter(
-                oxy[:, 1], oxy[:, 0], s=80, marker="D", facecolors="none",
-                edgecolors="k", lw=1.2, label=overlay.get("label", "overlay"),
+                oxy[:, 1],
+                oxy[:, 0],
+                s=80,
+                marker="D",
+                facecolors="none",
+                edgecolors="k",
+                lw=1.2,
+                label=overlay.get("label", "overlay"),
             )
         ax.legend(loc="upper right", fontsize=8)
     ax.set_xlim(-1.12, 1.12)

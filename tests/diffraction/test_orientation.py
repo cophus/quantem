@@ -18,9 +18,7 @@ def _make_peaks(xtl, q_true, sigma=0.02):
     )
     for i in range(N):
         p = xtl.generate_pattern(q_true[i], energy_ev=200e3, sigma_excitation=sigma)
-        peaks[0, i] = np.stack(
-            [p["qx"].numpy(), p["qy"].numpy(), p["intensity"].numpy()], axis=1
-        )
+        peaks[0, i] = np.stack([p["qx"].numpy(), p["qy"].numpy(), p["intensity"].numpy()], axis=1)
     return peaks
 
 
@@ -40,9 +38,7 @@ def test_roundtrip_matching(builder, kwargs):
     peaks = _make_peaks(xtl, q_true)
 
     om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
-    om.build_plan(
-        angle_step_zone_axis_deg=2.0, angle_step_in_plane_deg=2.0, power_intensity=0.0
-    )
+    om.build_plan(angle_step_zone_axis_deg=2.0, angle_step_in_plane_deg=2.0, power_intensity=0.0)
     om.match_orientations(progress_bar=False)
     # noiseless synthetic data: the envelope tilt is exact, so allow the
     # full grid-scale correction (the default trust region is sized for
@@ -125,3 +121,141 @@ def test_square_detector_correction():
     # with the aperture correction, kernel leakage at the hard detector edge
     # can push the normalized score a few percent above 1
     assert float(om.corr.max()) <= 1.05
+
+
+def _ase(spacegroup, symbols, basis, cellpar):
+    from ase.spacegroup import crystal as ase_crystal
+
+    return ase_crystal(symbols, basis=basis, spacegroup=spacegroup, cellpar=cellpar)
+
+
+@pytest.mark.parametrize(
+    "label,atoms,step",
+    [
+        (
+            "Bi -3m",
+            lambda: _ase(166, ["Bi"], [(0, 0, 0.234)], [4.55, 4.55, 11.86, 90, 90, 120]),
+            2.0,
+        ),
+        # ilmenite's projections are nearly mirror symmetric, so the flipped
+        # orientation is a close rival and needs the finer zone grid
+        (
+            "ilmenite -3",
+            lambda: _ase(
+                148,
+                ["Fe", "Ti", "O"],
+                [(0, 0, 0.355), (0, 0, 0.146), (0.317, 0.023, 0.245)],
+                [5.09, 5.09, 14.09, 90, 90, 120],
+            ),
+            1.0,
+        ),
+    ],
+)
+def test_roundtrip_low_symmetry(label, atoms, step):
+    # low-symmetry crystals see errors that cubic and hexagonal symmetry
+    # hides: a wrong wedge (trigonal) or a redundant library
+    torch.manual_seed(5)
+    xtl = Crystal.from_ase(atoms(), name=label, verbose=False)
+    xtl.calculate_structure_factors(k_max=1.3)
+    N = 20
+    q_true = qnormalize(torch.randn(N, 4, dtype=torch.float64))
+    peaks = _make_peaks(xtl, q_true)
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om.build_plan(angle_step_zone_axis_deg=step, angle_step_in_plane_deg=2.0, verbose=False)
+    om.match_orientations(progress_bar=False)
+    err = misorientation_angle_deg(q_true, om.quats[0, :, 0], xtl.sym_quats).numpy()
+    assert (err < 2.5).mean() >= 0.8
+    # symmetry copies of the best zone must not count as the second best
+    assert float(np.median(om.reliability[0].numpy())) > 0.02
+
+
+def test_reliability_with_hemisphere_library():
+    # Laue 2/m has no wedge: the hemisphere library holds every zone twice,
+    # and reliability must still see past the symmetry copy
+    torch.manual_seed(2)
+    atoms = _ase(
+        14,
+        ["Zr", "O", "O"],
+        [(0.275, 0.040, 0.208), (0.070, 0.332, 0.345), (0.450, 0.758, 0.479)],
+        [5.15, 5.21, 5.32, 90, 99.2, 90],
+    )
+    xtl = Crystal.from_ase(atoms, name="ZrO2", pseudo_symmetry_tol=None, verbose=False)
+    xtl.calculate_structure_factors(k_max=1.2)
+    assert xtl.zone_axis_wedge() is None
+    q_true = qnormalize(torch.randn(8, 4, dtype=torch.float64))
+    peaks = _make_peaks(xtl, q_true)
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om.build_plan(angle_step_zone_axis_deg=3.0, angle_step_in_plane_deg=3.0, verbose=False)
+    om.match_orientations(progress_bar=False)
+    assert float(np.median(om.reliability[0].numpy())) > 0.02
+
+
+def test_pseudo_symmetry_warning_on_plan():
+    import warnings
+
+    from ase import Atoms
+
+    ortho = Atoms("Au", positions=[[0, 0, 0]], cell=[4.000, 4.001, 4.002], pbc=True)
+    xtl = Crystal.from_ase(ortho, verbose=False)
+    xtl.calculate_structure_factors(k_max=1.2)
+    q_true = qnormalize(torch.randn(2, 4, dtype=torch.float64))
+    peaks = _make_peaks(xtl, q_true)
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        om.build_plan(angle_step_zone_axis_deg=5.0, angle_step_in_plane_deg=5.0, verbose=False)
+    assert any("pseudo-symmetry" in str(x.message) for x in w)
+
+
+def test_metadata_inheritance():
+    # each stage records its hyperparameters; later stages inherit what is
+    # left as None, so one tuned value propagates through the whole chain
+    from quantem.diffraction import bloch
+    from quantem.diffraction.phase import PhaseMap
+
+    torch.manual_seed(1)
+    xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True), verbose=False)
+    xtl.calculate_structure_factors(k_max=1.5)
+    q_true = qnormalize(torch.randn(4, 4, dtype=torch.float64))
+    peaks = _make_peaks(xtl, q_true)
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3, precession_deg=0.7)
+    om.build_plan(
+        angle_step_zone_axis_deg=3.0, corr_kernel_size=0.04, power_intensity=0.3, verbose=False
+    )
+    om.match_orientations(progress_bar=False)
+    om.refine_orientations(progress_bar=False)
+    assert om.metadata["plan"]["pair_distance"] == 0.04
+    assert om.metadata["refine"]["pair_distance"] == 0.04
+    assert om.metadata["match"]["min_number_peaks"] == 5
+    pm = PhaseMap.from_orientation_maps([om])
+    pm.fit(progress_bar=False)
+    assert pm.metadata["fit"]["pair_distance"] == 0.04
+    assert pm.metadata["fit"]["power_intensity"] == 0.3
+    assert pm.metadata["fit"]["min_number_peaks"] == 5
+    xtl.calculate_dynamical_structure_factors(energy_ev=200e3, k_max=2.0)
+    res = bloch.refine_dynamical(
+        pm,
+        thicknesses_A=[300.0, 400.0],
+        tilt_stages=((0.1, 0.1),),
+        n_precession=4,
+        k_max=1.0,
+        mask=np.array([[True, False, False, False]]),
+        progress_bar=False,
+    )
+    md = res["metadata"]
+    assert md["precession_deg"] == 0.7 and md["pair_distance"] == 0.04
+    assert md["power_intensity"] == 0.3 and md["min_number_peaks"] == 5
+    assert pm.metadata["dynamical"] is md
+    # explicit values still win
+    res2 = bloch.refine_dynamical(
+        pm,
+        thicknesses_A=[300.0],
+        tilt_stages=((0.1, 0.1),),
+        n_precession=4,
+        precession_deg=0.0,
+        pair_distance=0.06,
+        k_max=1.0,
+        mask=np.array([[True, False, False, False]]),
+        progress_bar=False,
+    )
+    assert res2["metadata"]["precession_deg"] == 0.0 and res2["metadata"]["pair_distance"] == 0.06

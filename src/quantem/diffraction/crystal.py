@@ -28,46 +28,42 @@ from ase import Atoms
 from ase.data import chemical_symbols
 
 from quantem.core.utils.utils import electron_wavelength_angstrom
+from quantem.diffraction.defaults import SIGMA_EXCITATION
 from quantem.diffraction.rotations import qrotate, symmetry_quaternions
 
-# Zone-axis fundamental wedge corners (Cartesian) for each Laue class, with
-# display labels for the IPF legend. Hexagonal / trigonal labels use 4-index
-# Miller-Bravais direction symbols. Any Laue class not listed falls back to
-# hemisphere sampling, which is always sufficient (all Laue classes contain
-# inversion) but redundant.
-_SQRT3_2 = np.sqrt(3) / 2
-LAUE_WEDGES: dict[str, list[list[float]]] = {
-    "m-3m": [[0, 0, 1], [0, 1, 1], [1, 1, 1]],
-    "m-3": [[0, 0, 1], [1, 0, 0], [1, 1, 1]],
-    "6/mmm": [[0, 0, 1], [_SQRT3_2, 0.5, 0], [1, 0, 0]],
-    "6/m": [[0, 0, 1], [1, 0, 0], [0.5, _SQRT3_2, 0]],
-    "-3m": [[0, 0, 1], [1, 0, 0], [0.5, _SQRT3_2, 0]],
-    "4/mmm": [[0, 0, 1], [1, 0, 0], [1, 1, 0]],
-    "4/m": [[0, 0, 1], [1, 0, 0], [0, 1, 0]],
-    "mmm": [[0, 0, 1], [1, 0, 0], [0, 1, 0]],
-}
-LAUE_WEDGE_LABELS: dict[str, list[str]] = {
-    "m-3m": ["[001]", "[011]", "[111]"],
-    "m-3": ["[001]", "[100]", "[111]"],
-    "6/mmm": ["[0001]", "[10$\\bar{1}$0]", "[2$\\bar{1}\\bar{1}$0]"],
-    "6/m": ["[0001]", "[2$\\bar{1}\\bar{1}$0]", "[11$\\bar{2}$0]"],
-    "-3m": ["[0001]", "[2$\\bar{1}\\bar{1}$0]", "[11$\\bar{2}$0]"],
-    "4/mmm": ["[001]", "[100]", "[110]"],
-    "4/m": ["[001]", "[100]", "[010]"],
-    "mmm": ["[001]", "[100]", "[010]"],
-}
-# plain-text (unicode combining-overline) forms for terminal printing
-_B = "\u0305"  # combining overline, applies to the preceding character
-LAUE_WEDGE_LABELS_TEXT: dict[str, list[str]] = {
-    "m-3m": ["[001]", "[011]", "[111]"],
-    "m-3": ["[001]", "[100]", "[111]"],
-    "6/mmm": ["[0001]", f"[101{_B}0]", f"[21{_B}1{_B}0]"],
-    "6/m": ["[0001]", f"[21{_B}1{_B}0]", f"[112{_B}0]"],
-    "-3m": ["[0001]", f"[21{_B}1{_B}0]", f"[112{_B}0]"],
-    "4/mmm": ["[001]", "[100]", "[110]"],
-    "4/m": ["[001]", "[100]", "[010]"],
-    "mmm": ["[001]", "[100]", "[010]"],
-}
+# unicode combining overline, applies to the preceding character
+_B = "\u0305"
+
+
+def direction_indices(
+    lat_real: torch.Tensor | np.ndarray, d, max_multiple: int = 12
+) -> np.ndarray | None:
+    """Smallest integer [uvw] along a Cartesian direction, or None if the
+    direction is not a lattice direction with indices up to max_multiple."""
+    A_T_inv = np.linalg.inv(np.asarray(lat_real, dtype=float).T)
+    v = A_T_inv @ np.asarray(d, dtype=float)
+    v = v / np.abs(v).max()
+    for m in range(1, max_multiple + 1):
+        w = v * m
+        if np.allclose(w, np.round(w), atol=2e-3):
+            ints = np.round(w).astype(int)
+            g = np.gcd.reduce(np.abs(ints))
+            return ints // max(g, 1)
+    return None
+
+
+def format_direction(uvw, hexagonal: bool = False, mathtext: bool = True) -> str:
+    """Direction label such as [011] or [10-10], with overlines on negative
+    indices (mathtext for figures, combining overlines for text)."""
+    if uvw is None:
+        return ""
+    ks = miller_to_miller_bravais(uvw) if hexagonal else np.asarray(uvw)
+    ks = np.atleast_1d(ks)
+    if mathtext:
+        body = "".join(str(k) if k >= 0 else "$\\bar{%d}$" % -k for k in ks)
+    else:
+        body = "".join(str(k) if k >= 0 else "%d%s" % (-k, _B) for k in ks)
+    return "[" + body + "]"
 
 
 def miller_to_miller_bravais(uvw: np.ndarray) -> np.ndarray:
@@ -94,26 +90,46 @@ def miller_bravais_to_miller(uvtw: np.ndarray) -> np.ndarray:
     u' = 2u + v, v' = 2v + u, w' = w (t is redundant: t = -(u + v)).
     """
     uvtw = np.atleast_2d(np.asarray(uvtw, dtype=float))
-    out = np.stack(
-        [2 * uvtw[:, 0] + uvtw[:, 1], 2 * uvtw[:, 1] + uvtw[:, 0], uvtw[:, 3]], axis=1
-    )
+    out = np.stack([2 * uvtw[:, 0] + uvtw[:, 1], 2 * uvtw[:, 1] + uvtw[:, 0], uvtw[:, 3]], axis=1)
     gcd = np.gcd.reduce(np.abs(np.round(out)).astype(int), axis=1)
     gcd[gcd == 0] = 1
     return (out / gcd[:, None]).astype(int).squeeze()
 
+
 # point group -> Laue class
 _LAUE_CLASS = {
-    "1": "-1", "-1": "-1",
-    "2": "2/m", "m": "2/m", "2/m": "2/m",
-    "222": "mmm", "mm2": "mmm", "mmm": "mmm",
-    "4": "4/m", "-4": "4/m", "4/m": "4/m",
-    "422": "4/mmm", "4mm": "4/mmm", "-42m": "4/mmm", "4/mmm": "4/mmm",
-    "3": "-3", "-3": "-3",
-    "32": "-3m", "3m": "-3m", "-3m": "-3m",
-    "6": "6/m", "-6": "6/m", "6/m": "6/m",
-    "622": "6/mmm", "6mm": "6/mmm", "-6m2": "6/mmm", "6/mmm": "6/mmm",
-    "23": "m-3", "m-3": "m-3",
-    "432": "m-3m", "-43m": "m-3m", "m-3m": "m-3m",
+    "1": "-1",
+    "-1": "-1",
+    "2": "2/m",
+    "m": "2/m",
+    "2/m": "2/m",
+    "222": "mmm",
+    "mm2": "mmm",
+    "mmm": "mmm",
+    "4": "4/m",
+    "-4": "4/m",
+    "4/m": "4/m",
+    "422": "4/mmm",
+    "4mm": "4/mmm",
+    "-42m": "4/mmm",
+    "4/mmm": "4/mmm",
+    "3": "-3",
+    "-3": "-3",
+    "32": "-3m",
+    "3m": "-3m",
+    "-3m": "-3m",
+    "6": "6/m",
+    "-6": "6/m",
+    "6/m": "6/m",
+    "622": "6/mmm",
+    "6mm": "6/mmm",
+    "-6m2": "6/mmm",
+    "6/mmm": "6/mmm",
+    "23": "m-3",
+    "m-3": "m-3",
+    "432": "m-3m",
+    "-43m": "m-3m",
+    "m-3m": "m-3m",
 }
 
 
@@ -173,17 +189,30 @@ class Crystal:
         atoms: Atoms,
         name: str | None = None,
         symprec: float = 1e-4,
-        pseudo_symmetry_tol: float | None = None,
+        pseudo_symmetry_tol: float | None = 0.1,
         verbose: bool = True,
     ):
+        """
+        Parameters
+        ----------
+        symprec : float, default=1e-4
+            spglib tolerance (Angstroms) for the cell's own symmetry.
+        pseudo_symmetry_tol : float | None, default=0.1
+            Tolerance (Angstroms) at which the symmetry is re-detected for
+            orientation matching. Cells within this distance of a higher
+            symmetry (a few percent of strain on a 5 Angstrom cell) are
+            matched with the parent group, so variants no experiment can
+            separate are never sampled as distinct orientations. The
+            library builders warn when this differs from the cell's own
+            symmetry; pass None to match with the exact symmetry.
+        """
         self.atoms = atoms
         self.name = name if name is not None else atoms.get_chemical_formula()
         self._pseudo_symmetry_tol = pseudo_symmetry_tol
+        self._wedge_cache: torch.Tensor | None | str = "unset"
 
         self.lat_real = torch.as_tensor(atoms.cell[:], dtype=torch.float64)
-        self.positions_frac = torch.as_tensor(
-            atoms.get_scaled_positions(), dtype=torch.float64
-        )
+        self.positions_frac = torch.as_tensor(atoms.get_scaled_positions(), dtype=torch.float64)
         self.numbers = torch.as_tensor(atoms.numbers, dtype=torch.long)
         occupancy = atoms.arrays.get("occupancy", np.ones(len(atoms)))
         self.occupancy = torch.as_tensor(np.asarray(occupancy, dtype=float))
@@ -245,8 +274,13 @@ class Crystal:
         self.laue_group: str = _LAUE_CLASS.get(pg, "-1")
         self.sym_quats = symmetry_quaternions(dataset.rotations, self.lat_real.numpy())
 
+        ds_pseudo = None
         if pseudo_symmetry_tol is not None and pseudo_symmetry_tol > symprec:
-            ds_pseudo = spglib.get_symmetry_dataset(cell, symprec=pseudo_symmetry_tol)
+            try:
+                ds_pseudo = spglib.get_symmetry_dataset(cell, symprec=pseudo_symmetry_tol)
+            except Exception:
+                ds_pseudo = None
+        if ds_pseudo is not None:
             pg_pseudo = spglib.get_pointgroup(ds_pseudo.rotations)[0].strip()
             self.pointgroup_matching: str = pg_pseudo
             self.laue_group_matching: str = _LAUE_CLASS.get(pg_pseudo, "-1")
@@ -261,18 +295,55 @@ class Crystal:
     def zone_axis_wedge(self) -> torch.Tensor | None:
         """Fundamental zone-axis wedge corners (3, 3) Cartesian, or None.
 
-        None means the Laue class has no simple 3-corner wedge and the
-        orientation plan should sample the full hemisphere.
+        Built from the symmetry operations actually used for matching (the
+        pseudo-symmetry group when one was found), so the wedge is right
+        for every crystal setting. None means the Laue class (-1 or 2/m)
+        has no 3-corner wedge and libraries sample the full hemisphere.
         """
-        corners = LAUE_WEDGES.get(self.laue_group)
+        if isinstance(self._wedge_cache, str):
+            from quantem.diffraction.rotations import fundamental_zone_axis_wedge
+
+            self._wedge_cache = fundamental_zone_axis_wedge(self.sym_quats_matching)
+        return self._wedge_cache
+
+    @property
+    def hexagonal_matching(self) -> bool:
+        """Whether the matching Laue class uses 4-index direction symbols."""
+        return self.laue_group_matching in ("6/m", "6/mmm", "-3", "-3m")
+
+    def zone_axis_wedge_labels(self, mathtext: bool = True) -> list[str] | None:
+        """Direction labels of the wedge corners (4-index for hexagonal and
+        trigonal crystals), indexed from the corner directions themselves."""
+        corners = self.zone_axis_wedge()
         if corners is None:
             return None
-        c = torch.tensor(corners, dtype=torch.float64)
-        return c / torch.linalg.norm(c, dim=-1, keepdim=True)
+        return [
+            format_direction(
+                direction_indices(self.lat_real, c.numpy()),
+                hexagonal=self.hexagonal_matching,
+                mathtext=mathtext,
+            )
+            for c in corners
+        ]
 
-    def zone_axis_wedge_labels(self) -> list[str] | None:
-        """Direction labels of the wedge corners (4-index for hex/trigonal)."""
-        return LAUE_WEDGE_LABELS.get(self.laue_group)
+    def matching_symmetry_warning(self) -> str | None:
+        """Message when the matching (pseudo) symmetry differs from the
+        cell's own symmetry, or None when they agree."""
+        if self.pointgroup_matching == self.pointgroup:
+            return None
+        n_extra = self.sym_quats_matching.shape[0] // max(self.sym_quats.shape[0], 1)
+        return (
+            f"{self.name}: orientation libraries are built with the "
+            f"pseudo-symmetry point group {self.pointgroup_matching} (Laue "
+            f"class {self.laue_group_matching}, found at pseudo_symmetry_tol = "
+            f"{self._pseudo_symmetry_tol:g} A), while the cell's own symmetry "
+            f"is {self.pointgroup} (Laue class {self.laue_group}). Orientations "
+            f"related by the extra operations give the same library entry, so "
+            f"the {n_extra} variants they generate are reported as one and the "
+            f"distortion between them is not resolved. To match with the exact "
+            f"symmetry, build the Crystal with pseudo_symmetry_tol=None (or a "
+            f"tolerance below the distortion)."
+        )
 
     def symmetry_summary(self) -> str:
         """Human-readable symmetry report, including any pseudo-symmetry."""
@@ -294,22 +365,20 @@ class Crystal:
             ]
         elif self._pseudo_symmetry_tol is not None:
             lines += [
-                "  pseudo-symmetry  none found at tol = "
-                f"{self._pseudo_symmetry_tol:g} A",
+                f"  pseudo-symmetry  none found at tol = {self._pseudo_symmetry_tol:g} A",
             ]
         else:
             lines += ["  pseudo-symmetry  not checked (set pseudo_symmetry_tol)"]
         # matching line reflects the symmetry actually used, after any
         # pseudo-symmetry reduction
-        labels = LAUE_WEDGE_LABELS_TEXT.get(self.laue_group_matching)
+        labels = self.zone_axis_wedge_labels(mathtext=False)
         wedge_txt = (
             f"zone axis wedge {labels[0]}, {labels[1]}, {labels[2]}"
             if labels is not None
             else "full hemisphere"
         )
         lines += [
-            f"  matching         {self.sym_quats_matching.shape[0]} proper "
-            f"rotations, {wedge_txt}"
+            f"  matching         {self.sym_quats_matching.shape[0]} proper rotations, {wedge_txt}"
         ]
         return "\n".join(lines)
 
@@ -459,7 +528,7 @@ class Crystal:
         self,
         orientation: torch.Tensor,
         energy_ev: float = 300e3,
-        sigma_excitation: float = 0.02,
+        sigma_excitation: float = SIGMA_EXCITATION,
         tol_excitation_mult: float = 3.0,
         k_max: float | None = None,
     ) -> dict[str, torch.Tensor]:

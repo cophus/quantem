@@ -22,6 +22,8 @@ Orientations are unit quaternions; see quantem.diffraction.rotations.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -30,6 +32,14 @@ from quantem.core.datastructures.vector import Vector
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffraction.crystal import Crystal
+from quantem.diffraction.defaults import (
+    MIN_NUMBER_PEAKS,
+    MIN_PAIRS,
+    PAIR_DISTANCE,
+    POWER_INTENSITY,
+    SIGMA_EXCITATION,
+    resolve,
+)
 from quantem.diffraction.rotations import (
     misorientation_angle_deg,
     qconj,
@@ -39,6 +49,7 @@ from quantem.diffraction.rotations import (
     quat_from_axis_angle,
     quat_from_zone_axis,
     sample_zone_axes,
+    symmetry_reduced_zone_angles,
 )
 
 
@@ -81,6 +92,12 @@ class OrientationMap(AutoSerialize):
         self.crystal = crystal
         self.energy_ev = float(energy_ev)
         self.wavelength = electron_wavelength_angstrom(energy_ev)
+        # processing hyperparameters of every stage, recorded as they run;
+        # later stages inherit from these when an argument is left as None
+        self.metadata: dict = {
+            "energy_ev": self.energy_ev,
+            "peaks": dict(getattr(peaks, "metadata", {}) or {}),
+        }
 
         # plan state
         self.zone_axes: torch.Tensor | None = None
@@ -101,6 +118,8 @@ class OrientationMap(AutoSerialize):
         peaks: Vector,
         crystal: Crystal,
         energy_ev: float = 300e3,
+        precession_deg: float = 0.0,
+        semiconv_mrad: float = 0.0,
     ) -> "OrientationMap":
         """Create from detected Bragg peaks.
 
@@ -111,12 +130,19 @@ class OrientationMap(AutoSerialize):
             ('qx', 'qy', 'intensity') in calibrated 1/Angstrom units.
         crystal : Crystal
             Candidate crystal with structure factors already calculated.
+        precession_deg, semiconv_mrad : float
+            Precession semi-angle and convergence semiangle of the
+            experiment, recorded for the dynamical refinements (which
+            average the intensities over them) and inherited by them.
         energy_ev : float, default=300e3
             Beam energy in eV.
         """
         if crystal.g_vec is None:
             raise RuntimeError("Run crystal.calculate_structure_factors() first.")
-        return cls(peaks, crystal, energy_ev, _token=cls._token)
+        om = cls(peaks, crystal, energy_ev, _token=cls._token)
+        om.metadata["precession_deg"] = float(precession_deg)
+        om.metadata["semiconv_mrad"] = float(semiconv_mrad)
+        return om
 
     # ------------------------------------------------------------------
     # orientation plan
@@ -124,12 +150,12 @@ class OrientationMap(AutoSerialize):
 
     def build_plan(
         self,
-        angle_step_zone_axis_deg: float = 2.0,
-        angle_step_in_plane_deg: float = 2.0,
-        corr_kernel_size: float = 0.05,
-        sigma_excitation: float = 0.04,
+        angle_step_zone_axis_deg: float = 1.0,
+        angle_step_in_plane_deg: float = 5.0,
+        corr_kernel_size: float = PAIR_DISTANCE,
+        sigma_excitation: float = SIGMA_EXCITATION,
         power_radial: float = 1.0,
-        power_intensity: float = 0.25,
+        power_intensity: float = POWER_INTENSITY,
         tol_shell_distance: float = 0.01,
         detector_q_max: float | tuple[float, float] | str | None = "auto",
         device: str | torch.device = "cpu",
@@ -139,11 +165,17 @@ class OrientationMap(AutoSerialize):
 
         Parameters
         ----------
-        angle_step_zone_axis_deg : float, default=2.0
-            Angular step between sampled zone axes.
-        angle_step_in_plane_deg : float, default=2.0
+        angle_step_zone_axis_deg : float, default=1.0
+            Angular step between sampled zone axes. The zone axis is the
+            coordinate the correlation search cannot refine continuously
+            (only by the neighbor-weighted centroid), so it is sampled
+            finely; the wedge sampling is isotropic at this step.
+        angle_step_in_plane_deg : float, default=5.0
             Angular step of the in-plane (gamma) axis; the number of gamma
-            samples is round(360 / step).
+            samples is round(360 / step). The in-plane angle is refined
+            continuously (parabolic sub-bin interpolation, then least
+            squares on the paired peaks in refine_orientations), so a
+            coarse step costs little accuracy and keeps the library small.
         corr_kernel_size : float, default=0.05
             Correlation kernel size delta (1/Angstroms): azimuthal extent of
             each reference peak and radial tolerance for shell assignment.
@@ -170,19 +202,29 @@ class OrientationMap(AutoSerialize):
             detector-to-scan rotation recorded on the peaks). None disables
             the correction.
         device : str | torch.device, default="cpu"
-            Device for the library and the correlation compute.
+            Device for the library and the correlation compute. On Apple
+            silicon 'mps' runs the correlation in float32 (about 1.5x faster
+            than the CPU); the refinements that follow stay on the CPU.
         verbose : bool, default=True
             Print the symmetry actually used for matching (including any
             pseudo-symmetry reduction) and the plan size.
         """
         crystal = self.crystal
         self.device = torch.device(device)
+        # MPS has no float64: the correlation runs in float32 there (the
+        # cosine similarities are insensitive to it); results are returned
+        # in float64 either way
+        self.dtype = torch.float32 if self.device.type == "mps" else torch.float64
+        self.cdtype = torch.complex64 if self.dtype == torch.float32 else torch.complex128
         self.corr_kernel_size = float(corr_kernel_size)
         self.sigma_excitation = float(sigma_excitation)
         self.power_radial = float(power_radial)
         self.power_intensity = float(power_intensity)
 
         # zone axis sampling over the matching (pseudo-symmetry-reduced) wedge
+        msg = crystal.matching_symmetry_warning()
+        if msg is not None:
+            warnings.warn(msg, stacklevel=2)
         wedge = crystal.zone_axis_wedge()
         if wedge is None:
             n_zones = int(np.ceil(2 * np.pi / np.deg2rad(angle_step_zone_axis_deg) ** 2))
@@ -203,9 +245,7 @@ class OrientationMap(AutoSerialize):
         Rs = quat_to_matrix(crystal.sym_quats_matching)
         images = torch.einsum("sij,zj->szi", Rs, za)
         images = torch.cat([images, -images], dim=0).reshape(-1, 3)  # (S2*Z, 3)
-        img_zone = torch.arange(za.shape[0]).repeat(
-            2 * crystal.sym_quats_matching.shape[0]
-        )
+        img_zone = torch.arange(za.shape[0]).repeat(2 * crystal.sym_quats_matching.shape[0])
         # deduplicate coincident image positions (keep one per position/zone)
         key = torch.cat(
             [torch.round(images / 1e-6) * 1e-6, img_zone[:, None].to(images.dtype)],
@@ -238,13 +278,11 @@ class OrientationMap(AutoSerialize):
         radii = torch.unique(torch.round(g_len / tol_shell_distance) * tol_shell_distance)
         self.shell_radii = radii
         self.num_gamma = int(round(360 / angle_step_in_plane_deg))
-        self.gamma = torch.linspace(
-            0, 2 * np.pi, self.num_gamma + 1, dtype=torch.float64
-        )[:-1]
+        self.gamma = torch.linspace(0, 2 * np.pi, self.num_gamma + 1, dtype=torch.float64)[:-1]
 
         plan = self._build_reference(self.zone_quats)
         # store conj(fft) along gamma so matching is a single complex matmul
-        self.plan_fft = torch.conj(torch.fft.fft(plan, dim=-1)).to(self.device)
+        self.plan_fft = torch.conj(torch.fft.fft(plan, dim=-1)).to(self.cdtype).to(self.device)
 
         # square-detector aperture correction: the masked template norm at
         # every in-plane shift is the circular correlation of the squared
@@ -258,9 +296,7 @@ class OrientationMap(AutoSerialize):
                 detector_q_max = None
             else:
                 th_b = np.deg2rad(-rot_deg)
-                rb = np.array(
-                    [[np.cos(th_b), -np.sin(th_b)], [np.sin(th_b), np.cos(th_b)]]
-                )
+                rb = np.array([[np.cos(th_b), -np.sin(th_b)], [np.sin(th_b), np.cos(th_b)]])
                 det_rc = flat[:, :2] @ rb.T
                 detector_q_max = (
                     float(np.abs(det_rc[:, 0]).max()) + self.corr_kernel_size,
@@ -274,8 +310,7 @@ class OrientationMap(AutoSerialize):
             r = self.shell_radii[:, None]
             g = self.gamma[None, :] - np.deg2rad(rot_deg)
             mask = (
-                (torch.abs(r * torch.cos(g)) <= qx_max)
-                & (torch.abs(r * torch.sin(g)) <= qy_max)
+                (torch.abs(r * torch.cos(g)) <= qx_max) & (torch.abs(r * torch.sin(g)) <= qy_max)
             ).to(torch.float64)
             self.detector_mask = mask  # (S, G)
             plan_sq_fft = torch.conj(torch.fft.fft(plan**2, dim=-1))
@@ -290,14 +325,29 @@ class OrientationMap(AutoSerialize):
             # fraction of template weight on the detector; used to suppress
             # zones that are mostly unmeasurable at a given rotation
             full = (plan**2).sum(dim=(1, 2))[:, None].clamp_min(1e-12)
-            self.plan_norm_shift = torch.stack(
-                [torch.sqrt(n2), torch.sqrt(n2_m)]
-            ).to(self.device)  # (2, Z, G)
-            self.plan_frac_shift = torch.stack([n2 / full, n2_m / full]).to(self.device)
+            self.plan_norm_shift = (
+                torch.stack([torch.sqrt(n2), torch.sqrt(n2_m)]).to(self.dtype).to(self.device)
+            )  # (2, Z, G)
+            self.plan_frac_shift = (
+                torch.stack([n2 / full, n2_m / full]).to(self.dtype).to(self.device)
+            )
         else:
             self.detector_mask = None
             self.plan_norm_shift = None
             self.plan_frac_shift = None
+        self.metadata["plan"] = dict(
+            angle_step_zone_axis_deg=float(angle_step_zone_axis_deg),
+            angle_step_in_plane_deg=float(angle_step_in_plane_deg),
+            corr_kernel_size=self.corr_kernel_size,
+            pair_distance=self.corr_kernel_size,
+            sigma_excitation=self.sigma_excitation,
+            power_radial=self.power_radial,
+            power_intensity=self.power_intensity,
+            tol_shell_distance=float(tol_shell_distance),
+            detector_q_max=None
+            if detector_q_max is None
+            else tuple(np.atleast_1d(detector_q_max).tolist()),
+        )
         if verbose:
             print(crystal.symmetry_summary())
             print(
@@ -317,8 +367,9 @@ class OrientationMap(AutoSerialize):
         qphi: torch.Tensor,
         amp: torch.Tensor,
         out: torch.Tensor,
+        image: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Deposit peaks into a polar image with the shared correlation kernel.
+        """Deposit peaks into polar images with the shared correlation kernel.
 
         Every peak spreads as a Gaussian of width delta in both the radial
         direction (across shells) and arc length (along gamma). The library
@@ -330,24 +381,34 @@ class OrientationMap(AutoSerialize):
         qr, qphi, amp : torch.Tensor
             Peak radii, azimuths, amplitudes, flat (K,).
         out : torch.Tensor
-            (S, G) accumulator, modified in place.
+            (S, G) accumulator, or (N, S, G) when `image` is given; modified
+            in place.
+        image : torch.Tensor | None
+            (K,) image index of every peak, so a whole batch of patterns
+            (or a whole library) is deposited in one call.
         """
         radii = self.shell_radii.to(qr.dtype)
         delta = self.corr_kernel_size
-        G = self.num_gamma
+        S = radii.shape[0]
 
         dr = qr[:, None] - radii[None, :]  # (K, S)
-        k_idx, s_idx = torch.nonzero(dr.abs() < 3 * delta, as_tuple=True)
-        if k_idx.numel() == 0:
+        k_all, s_all = torch.nonzero(dr.abs() < 3 * delta, as_tuple=True)
+        if k_all.numel() == 0:
             return out
-        w_r = torch.exp(-(dr[k_idx, s_idx] ** 2) / (2 * delta**2)) * amp[k_idx]
-
         gamma = self.gamma.to(qr.dtype)
-        dg = qphi[k_idx, None] - gamma[None, :]
-        dg = (dg + np.pi) % (2 * np.pi) - np.pi
-        arc = dg * qr[k_idx, None]
-        w = w_r[:, None] * torch.exp(-(arc**2) / (2 * delta**2))
-        out.index_add_(0, s_idx, w)
+        flat = out.view(-1, out.shape[-1])
+        # chunked so the (entries, G) weight array stays a few tens of MB
+        chunk = max(1, 4_000_000 // gamma.shape[0])
+        for c0 in range(0, k_all.numel(), chunk):
+            k_idx = k_all[c0 : c0 + chunk]
+            s_idx = s_all[c0 : c0 + chunk]
+            w_r = torch.exp(-(dr[k_idx, s_idx] ** 2) / (2 * delta**2)) * amp[k_idx]
+            dg = qphi[k_idx, None] - gamma[None, :]
+            dg = (dg + np.pi) % (2 * np.pi) - np.pi
+            arc = dg * qr[k_idx, None]
+            w = w_r[:, None] * torch.exp(-(arc**2) / (2 * delta**2))
+            rows = s_idx if image is None else image[k_idx] * S + s_idx
+            flat.index_add_(0, rows, w)
         return out
 
     def _build_reference(self, zone_quats: torch.Tensor) -> torch.Tensor:
@@ -365,8 +426,7 @@ class OrientationMap(AutoSerialize):
         amp = amp * (s_g.abs() < delta * 4)
 
         weight = (
-            crystal.g_len**self.power_radial
-            * crystal.struct_factors_int**self.power_intensity
+            crystal.g_len**self.power_radial * crystal.struct_factors_int**self.power_intensity
         )
         vals = amp * weight[None, :]  # (Z, N)
         qr = torch.hypot(gr[..., 0], gr[..., 1])
@@ -374,9 +434,10 @@ class OrientationMap(AutoSerialize):
 
         Z = zone_quats.shape[0]
         plan = torch.zeros((Z, self.shell_radii.shape[0], self.num_gamma), dtype=torch.float64)
-        for z in range(Z):
-            keep = vals[z] > 1e-8
-            self._deposit_polar(qr[z, keep], qphi[z, keep], vals[z, keep], plan[z])
+        z_idx, n_idx = torch.nonzero(vals > 1e-8, as_tuple=True)
+        self._deposit_polar(
+            qr[z_idx, n_idx], qphi[z_idx, n_idx], vals[z_idx, n_idx], plan, image=z_idx
+        )
 
         norm = torch.linalg.norm(plan.reshape(Z, -1), dim=1).clamp_min(1e-12)
         return plan / norm[:, None, None]
@@ -392,10 +453,26 @@ class OrientationMap(AutoSerialize):
         qr = torch.hypot(qx, qy)
         qphi = torch.atan2(qy, qx)
         amp = intensity.clamp_min(0) ** (self.power_intensity) * qr**self.power_radial
-        out = torch.zeros(
-            (self.shell_radii.shape[0], self.num_gamma), dtype=torch.float64
-        )
+        out = torch.zeros((self.shell_radii.shape[0], self.num_gamma), dtype=torch.float64)
         return self._deposit_polar(qr, qphi, amp, out)
+
+    def _polar_images(self, arrays: list[np.ndarray], ix: list[int]) -> torch.Tensor:
+        """Sparse polar images (B, S, G) of a batch of measured patterns,
+        deposited in one call."""
+        data = np.concatenate([a[:, ix] for a in arrays], axis=0)
+        image = torch.repeat_interleave(
+            torch.arange(len(arrays)), torch.tensor([a.shape[0] for a in arrays])
+        )
+        qx = torch.as_tensor(data[:, 0], dtype=torch.float64)
+        qy = torch.as_tensor(data[:, 1], dtype=torch.float64)
+        intensity = torch.as_tensor(data[:, 2], dtype=torch.float64)
+        qr = torch.hypot(qx, qy)
+        qphi = torch.atan2(qy, qx)
+        amp = intensity.clamp_min(0) ** (self.power_intensity) * qr**self.power_radial
+        out = torch.zeros(
+            (len(arrays), self.shell_radii.shape[0], self.num_gamma), dtype=torch.float64
+        )
+        return self._deposit_polar(qr, qphi, amp, out, image=image)
 
     # ------------------------------------------------------------------
     # matching
@@ -405,7 +482,7 @@ class OrientationMap(AutoSerialize):
         self,
         num_matches: int = 1,
         include_mirror: bool = True,
-        min_number_peaks: int = 3,
+        min_number_peaks: int | None = None,
         min_angle_between_matches_deg: float = 15.0,
         subpixel_gamma: bool = True,
         subpixel_zone: bool = True,
@@ -437,8 +514,9 @@ class OrientationMap(AutoSerialize):
             Also correlate against the in-plane mirrored pattern, testing
             inversion-related (opposite hemisphere) zone axes at no library
             cost. Exact in the flat-Ewald / Friedel limit.
-        min_number_peaks : int, default=3
-            Skip positions with fewer detected peaks.
+        min_number_peaks : int | None
+            Skip positions with fewer detected peaks (including the direct
+            beam); defaults to MIN_NUMBER_PEAKS (5).
         min_angle_between_matches_deg : float, default=15.0
             Exclusion radius (degrees, zone-axis distance) around earlier
             matches, both for later matches and for the second-best score
@@ -455,6 +533,16 @@ class OrientationMap(AutoSerialize):
         """
         if self.plan_fft is None:
             raise RuntimeError("Run build_plan() first.")
+        min_number_peaks = resolve(min_number_peaks, "min_number_peaks", default=MIN_NUMBER_PEAKS)
+        self.metadata["match"] = dict(
+            num_matches=int(num_matches),
+            include_mirror=bool(include_mirror),
+            min_number_peaks=int(min_number_peaks),
+            min_angle_between_matches_deg=float(min_angle_between_matches_deg),
+            subpixel_gamma=bool(subpixel_gamma),
+            subpixel_zone=bool(subpixel_zone),
+            min_detector_fraction=float(min_detector_fraction),
+        )
         peaks = self.peaks
         shape = peaks.shape
         R, C = shape[0], shape[1]
@@ -472,9 +560,16 @@ class OrientationMap(AutoSerialize):
         fields = peaks.fields
         ix = [fields.index(f) for f in ("qx", "qy", "intensity")]
 
-        # zone-pair angular distances, for the exclusion ball around matches
-        za = self.zone_axes.to(device)
-        zone_ang = torch.rad2deg(torch.acos((za @ za.T).clamp(-1, 1)))  # (Z, Z)
+        # zone-pair angular distances for the exclusion ball around matches,
+        # minimized over the matching symmetry: a redundant library
+        # (hemisphere fallback, pseudo-symmetry) holds symmetry copies of
+        # every zone, and those must not count as the "second best" match
+        dtype = getattr(self, "dtype", torch.float64)
+        zone_ang = (
+            symmetry_reduced_zone_angles(self.zone_axes, self.crystal.sym_quats_matching)
+            .to(dtype)
+            .to(device)
+        )  # (Z, Z)
 
         plan_fft = self.plan_fft  # (Z, S, G) complex
         valid_rc = [
@@ -482,26 +577,22 @@ class OrientationMap(AutoSerialize):
             for rx, ry in np.ndindex(R, C)
             if peaks[rx, ry].array.shape[0] >= min_number_peaks
         ]
-        batches = [
-            valid_rc[i : i + batch_size] for i in range(0, len(valid_rc), batch_size)
-        ]
+        batches = [valid_rc[i : i + batch_size] for i in range(0, len(valid_rc), batch_size)]
         if progress_bar:
             batches = tqdm(batches, desc=f"matching {self.crystal.name}")
 
         gamma_grid = self.gamma
         for batch in batches:
-            ims = []
-            for rx, ry in batch:
-                data = peaks[rx, ry].array
-                qx = torch.as_tensor(data[:, ix[0]], dtype=torch.float64)
-                qy = torch.as_tensor(data[:, ix[1]], dtype=torch.float64)
-                ii = torch.as_tensor(data[:, ix[2]], dtype=torch.float64)
-                ims.append(self._polar_image(qx, qy, ii))
-            im_stack = torch.stack(ims).to(device)
-            norms = torch.linalg.norm(im_stack.reshape(len(ims), -1), dim=1).clamp_min(
-                1e-12
+            im_stack = (
+                self._polar_images([peaks[rx, ry].array for rx, ry in batch], ix)
+                .to(dtype)
+                .to(device)
             )
-            im_fft = torch.fft.fft(im_stack, dim=-1)  # (B, S, G)
+            norms = torch.linalg.norm(im_stack.reshape(len(batch), -1), dim=1).clamp_min(1e-12)
+            with warnings.catch_warnings():
+                # torch's MPS FFT emits an internal out-tensor resize notice
+                warnings.simplefilter("ignore", UserWarning)
+                im_fft = torch.fft.fft(im_stack, dim=-1)  # (B, S, G)
 
             # contract shells: (B, Z, G) per channel
             cc = torch.einsum("zsg,bsg->bzg", plan_fft, im_fft)
@@ -533,7 +624,9 @@ class OrientationMap(AutoSerialize):
                             # zone index of previous match not stored; use angle
                             # to previous zone axis
                             zprev = self._zprev[b][mm]
-                            corr[b, :, zone_ang[zprev] < min_angle_between_matches_deg, :] = -torch.inf
+                            corr[
+                                b, :, zone_ang[zprev] < min_angle_between_matches_deg, :
+                            ] = -torch.inf
                 flat_idx = corr.reshape(B, -1).argmax(dim=1)
                 n_ch = corr.shape[1]
                 ch_i = flat_idx // (Z * G)
@@ -553,7 +646,7 @@ class OrientationMap(AutoSerialize):
                         (c2 - c0) / denom,
                         torch.zeros_like(denom),
                     ) * (2 * np.pi / G)
-                    gamma = gamma + dg.double().cpu()
+                    gamma = gamma + dg.cpu().double()
 
                 is_mirror = ch_i.cpu() == 1
                 q_zone = self.zone_quats[z_i.cpu()]
@@ -564,7 +657,7 @@ class OrientationMap(AutoSerialize):
                     # (see build_plan; images across the wedge boundary keep
                     # the centroid unbiased for boundary zones)
                     b_ar = torch.arange(B, device=corr.device)
-                    corr_z = corr[b_ar, ch_i].amax(dim=-1).cpu()  # (B, Z)
+                    corr_z = corr[b_ar, ch_i].amax(dim=-1).cpu().double()  # (B, Z)
                     zi_cpu = z_i.cpu()
                     n_idx = self.zone_nbr_idx[zi_cpu]  # (B, K)
                     n_pos = self.zone_nbr_pos[zi_cpu]  # (B, K, 3)
@@ -573,9 +666,9 @@ class OrientationMap(AutoSerialize):
                     c_floor = corr_z.gather(1, zi_cpu[:, None]) * 0.7
                     wgt = (c_n - c_floor).clamp_min(0) * n_ok
                     za_ref = (wgt[:, :, None] * n_pos).sum(dim=1)
-                    za_ref = za_ref / torch.linalg.norm(
-                        za_ref, dim=-1, keepdim=True
-                    ).clamp_min(1e-12)
+                    za_ref = za_ref / torch.linalg.norm(za_ref, dim=-1, keepdim=True).clamp_min(
+                        1e-12
+                    )
                     za_old = self.zone_axes[z_i.cpu()]
                     axis = torch.cross(za_ref, za_old, dim=-1)
                     sin_t = torch.linalg.norm(axis, dim=-1)
@@ -591,21 +684,17 @@ class OrientationMap(AutoSerialize):
                     q_zone = qmult(q_zone, dq)
 
                 q_flip = torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=torch.float64)
-                q_zone = torch.where(
-                    is_mirror[:, None], qmult(q_flip, q_zone), q_zone
-                )
+                q_zone = torch.where(is_mirror[:, None], qmult(q_flip, q_zone), q_zone)
                 gamma = torch.where(is_mirror, -gamma - np.pi, gamma)
                 half = gamma / 2
                 zeros = torch.zeros_like(half)
-                q_spin = torch.stack(
-                    (torch.cos(half), zeros, zeros, torch.sin(half)), dim=-1
-                )
+                q_spin = torch.stack((torch.cos(half), zeros, zeros, torch.sin(half)), dim=-1)
                 q = qmult(q_spin, q_zone)
 
                 for b, (rx, ry) in enumerate(batch):
                     if torch.isfinite(c_val[b]):
                         quats[rx, ry, m] = q[b]
-                        corr_out[rx, ry, m] = c_val[b].double().cpu()
+                        corr_out[rx, ry, m] = c_val[b].cpu().double()
                         mirror_out[rx, ry, m] = bool(is_mirror[b])
 
                 if m == 0:
@@ -619,7 +708,7 @@ class OrientationMap(AutoSerialize):
                     )
                     for b, (rx, ry) in enumerate(batch):
                         if torch.isfinite(c2[b]):
-                            corr_second[rx, ry] = c2[b].double().cpu()
+                            corr_second[rx, ry] = c2[b].cpu().double()
 
                 if M > 1:
                     if m == 0:
@@ -643,7 +732,7 @@ class OrientationMap(AutoSerialize):
         num_iterations: int = 5,
         pair_distance: float | None = None,
         sigma_excitation: float | None = None,
-        min_pairs: int = 3,
+        min_pairs: int | None = None,
         refine_tilt: bool = False,
         refine_zone: bool = True,
         zone_search_deg: float = 1.5,
@@ -682,8 +771,8 @@ class OrientationMap(AutoSerialize):
         sigma_excitation : float | None
             Excitation error envelope used for simulation; defaults to the
             plan's value.
-        min_pairs : int, default=3
-            Skip positions with fewer paired peaks.
+        min_pairs : int | None
+            Skip positions with fewer paired peaks; defaults to MIN_PAIRS (4).
         refine_tilt : bool, default=False
             Also solve the two tilt components from peak positions. Only
             meaningful for noise-free simulated data.
@@ -715,9 +804,24 @@ class OrientationMap(AutoSerialize):
             Minimum-neighbor misorientation that triggers the rescue pass.
         """
         assert self.quats is not None
-        delta = pair_distance if pair_distance is not None else self.corr_kernel_size
-        sigma = (
-            sigma_excitation if sigma_excitation is not None else self.sigma_excitation
+        plan_md = self.metadata.get("plan")
+        delta = resolve(pair_distance, "pair_distance", plan_md, default=self.corr_kernel_size)
+        sigma = resolve(
+            sigma_excitation, "sigma_excitation", plan_md, default=self.sigma_excitation
+        )
+        min_pairs = resolve(min_pairs, "min_pairs", default=MIN_PAIRS)
+        self.metadata["refine"] = dict(
+            num_iterations=int(num_iterations),
+            pair_distance=float(delta),
+            sigma_excitation=float(sigma),
+            min_pairs=int(min_pairs),
+            refine_tilt=bool(refine_tilt),
+            refine_zone=bool(refine_zone),
+            zone_search_deg=float(zone_search_deg),
+            zone_max_total_deg=zone_max_total_deg,
+            sigma_envelope=sigma_envelope,
+            neighbor_rescue=bool(neighbor_rescue),
+            rescue_threshold_deg=float(rescue_threshold_deg),
         )
         peaks = self.peaks
         R, C, M = self.quats.shape[:3]
@@ -732,9 +836,7 @@ class OrientationMap(AutoSerialize):
         )
         eye3 = torch.eye(3, dtype=torch.float64)
         tilt_cap = np.deg2rad(
-            zone_max_total_deg
-            if zone_max_total_deg is not None
-            else 0.375 * self.zone_step_deg
+            zone_max_total_deg if zone_max_total_deg is not None else 0.375 * self.zone_step_deg
         )
 
         def refine_single(q, q_exp, w_exp):
@@ -775,9 +877,7 @@ class OrientationMap(AutoSerialize):
                     a = torch.stack((-gp[:, 1], gp[:, 0]), dim=1)  # (P, 2)
                     num = (w[:, None] * a * r).sum()
                     den = (w[:, None] * a * a).sum().clamp_min(1e-12)
-                    omega = torch.tensor(
-                        [0.0, 0.0, float(num / den)], dtype=torch.float64
-                    )
+                    omega = torch.tensor([0.0, 0.0, float(num / den)], dtype=torch.float64)
                 angle = torch.linalg.norm(omega)
                 if angle > 1e-10:
                     dq = quat_from_axis_angle(omega / angle, angle)
@@ -801,9 +901,7 @@ class OrientationMap(AutoSerialize):
                         + tg[None, :, None] * a1[:, None, None]
                         + tg[None, None, :] * a2[:, None, None]
                     )
-                    pred = f_p[:, None, None] * torch.exp(
-                        -(S**2) / (2 * sigma_env**2)
-                    )
+                    pred = f_p[:, None, None] * torch.exp(-(S**2) / (2 * sigma_env**2))
                     E = (w[:, None, None] * pred).sum(dim=0) / (
                         (pred**2).sum(dim=0).sqrt().clamp_min(1e-12)
                     )
@@ -830,9 +928,7 @@ class OrientationMap(AutoSerialize):
                         if abs(den) > 1e-12:
                             wy += 0.5 * (c2 - c0) / den * step
                     # trust region on the cumulative tilt from the start
-                    prop = tilt_total + torch.tensor(
-                        [wx, wy], dtype=torch.float64
-                    )
+                    prop = tilt_total + torch.tensor([wx, wy], dtype=torch.float64)
                     over = float(torch.linalg.norm(prop)) - tilt_cap
                     if over > 0:
                         prop = prop * tilt_cap / float(torch.linalg.norm(prop))
@@ -899,9 +995,7 @@ class OrientationMap(AutoSerialize):
                 mm = misorientation_angle_deg(
                     a.reshape(-1, 4), b.reshape(-1, 4), self.crystal.sym_quats
                 ).reshape(R - dr, C - dc)
-                miso_min[: R - dr, : C - dc] = torch.minimum(
-                    miso_min[: R - dr, : C - dc], mm
-                )
+                miso_min[: R - dr, : C - dc] = torch.minimum(miso_min[: R - dr, : C - dc], mm)
                 miso_min[dr:, dc:] = torch.minimum(miso_min[dr:, dc:], mm)
             retry = torch.nonzero(miso_min > rescue_threshold_deg)
             it2 = retry.tolist()
@@ -918,18 +1012,11 @@ class OrientationMap(AutoSerialize):
                 for dr in (-1, 0, 1):
                     for dc in (-1, 0, 1):
                         nr, nc = rx + dr, ry + dc
-                        if (dr == 0 and dc == 0) or not (
-                            0 <= nr < R and 0 <= nc < C
-                        ):
+                        if (dr == 0 and dc == 0) or not (0 <= nr < R and 0 <= nc < C):
                             continue
                         qn = self.quats[nr, nc, 0]
                         if all(
-                            float(
-                                misorientation_angle_deg(
-                                    qn, c, self.crystal.sym_quats
-                                )
-                            )
-                            > 0.5
+                            float(misorientation_angle_deg(qn, c, self.crystal.sym_quats)) > 0.5
                             for c in cands
                         ):
                             cands.append(qn)
@@ -1023,9 +1110,7 @@ class OrientationMap(AutoSerialize):
                     if not bool(ok.any()):
                         break
                     sc = torch.where(ok, w_g.sum(dim=1), sc)
-                    tgt = torch.gather(
-                        qe, 1, j_min[..., None].expand(-1, -1, 2)
-                    )  # (B, G, 2)
+                    tgt = torch.gather(qe, 1, j_min[..., None].expand(-1, -1, 2))  # (B, G, 2)
                     r_vec = tgt - g[..., :2]
                     # in-plane closed form
                     a_vec = torch.stack((-g[..., 1], g[..., 0]), dim=-1)
@@ -1057,15 +1142,13 @@ class OrientationMap(AutoSerialize):
                             + tg[None, :, None] * gyf[:, None, None]
                             - tg[None, None, :] * gxf[:, None, None]
                         )  # (Np, T, T)
-                        pred = ff[:, None, None] * torch.exp(
-                            -(S**2) / (2 * sigma_env**2)
+                        pred = ff[:, None, None] * torch.exp(-(S**2) / (2 * sigma_env**2))
+                        E_num = torch.zeros((B, n_tg, n_tg), dtype=torch.float64).index_add_(
+                            0, idx_b, wf[:, None, None] * pred
                         )
-                        E_num = torch.zeros(
-                            (B, n_tg, n_tg), dtype=torch.float64
-                        ).index_add_(0, idx_b, wf[:, None, None] * pred)
-                        E_den = torch.zeros(
-                            (B, n_tg, n_tg), dtype=torch.float64
-                        ).index_add_(0, idx_b, pred**2)
+                        E_den = torch.zeros((B, n_tg, n_tg), dtype=torch.float64).index_add_(
+                            0, idx_b, pred**2
+                        )
                         E = E_num / E_den.sqrt().clamp_min(1e-12)  # (B, T, T)
                         flat_ij = E.reshape(B, -1).argmax(dim=1)
                         i_b, j_b = flat_ij // n_tg, flat_ij % n_tg
@@ -1096,7 +1179,8 @@ class OrientationMap(AutoSerialize):
                         prop = tilt_total + torch.stack((wx, wy), dim=-1)
                         norm = torch.linalg.norm(prop, dim=-1)
                         scale_f = torch.where(
-                            norm > tilt_cap, tilt_cap / norm.clamp_min(1e-12),
+                            norm > tilt_cap,
+                            tilt_cap / norm.clamp_min(1e-12),
                             torch.ones_like(norm),
                         )
                         prop = prop * scale_f[:, None]
@@ -1115,9 +1199,7 @@ class OrientationMap(AutoSerialize):
                             q[nz] = qmult(dq_t, q_nz)
                 quats[i0:i1, m] = torch.where(act[:, None], q, quats[i0:i1, m])
                 if m == 0:
-                    scores.reshape(-1)[i0:i1] = torch.where(
-                        act, sc, scores.reshape(-1)[i0:i1]
-                    )
+                    scores.reshape(-1)[i0:i1] = torch.where(act, sc, scores.reshape(-1)[i0:i1])
         self.quats = quats.reshape(R, C, M, 4)
 
     def generate_pattern(self, rx: int, ry: int, match: int = 0, **kwargs):
@@ -1134,7 +1216,7 @@ class OrientationMap(AutoSerialize):
         self,
         other: "OrientationMap",
         delete_radius: float = 0.04,
-        min_number_peaks: int = 3,
+        min_number_peaks: int = MIN_NUMBER_PEAKS,
         min_corr_other: float = 0.0,
         progress_bar: bool = True,
     ) -> "OrientationMap":
@@ -1166,8 +1248,10 @@ class OrientationMap(AutoSerialize):
         ix = [fields.index(f) for f in ("qx", "qy", "intensity")]
 
         residual = Vector.from_shape(
-            (R, C), fields=["qx", "qy", "intensity"],
-            units=["A^-1", "A^-1", "counts"], name="residual_peaks",
+            (R, C),
+            fields=["qx", "qy", "intensity"],
+            units=["A^-1", "A^-1", "counts"],
+            name="residual_peaks",
         )
         cells = []
         for rx, ry in np.ndindex(R, C):
@@ -1186,17 +1270,32 @@ class OrientationMap(AutoSerialize):
             cells.append(data[keep][:, ix])
         nested = [cells[r * C : (r + 1) * C] for r in range(R)]
         residual = Vector.from_data(
-            nested, fields=["qx", "qy", "intensity"],
-            units=["A^-1", "A^-1", "counts"], name="residual_peaks",
+            nested,
+            fields=["qx", "qy", "intensity"],
+            units=["A^-1", "A^-1", "counts"],
+            name="residual_peaks",
         )
 
         om_res = OrientationMap.from_vectors(residual, self.crystal, self.energy_ev)
         for attr in (
-            "device", "corr_kernel_size", "sigma_excitation", "power_radial",
-            "power_intensity", "zone_axes", "zone_quats", "zone_step_deg",
-            "zone_nbr_idx", "zone_nbr_pos", "zone_nbr_valid",
-            "plan_fft", "shell_radii", "num_gamma", "gamma", "detector_mask",
-            "plan_norm_shift", "plan_frac_shift",
+            "device",
+            "corr_kernel_size",
+            "sigma_excitation",
+            "power_radial",
+            "power_intensity",
+            "zone_axes",
+            "zone_quats",
+            "zone_step_deg",
+            "zone_nbr_idx",
+            "zone_nbr_pos",
+            "zone_nbr_valid",
+            "plan_fft",
+            "shell_radii",
+            "num_gamma",
+            "gamma",
+            "detector_mask",
+            "plan_norm_shift",
+            "plan_frac_shift",
         ):
             setattr(om_res, attr, getattr(self, attr))
         om_res.match_orientations(
@@ -1211,20 +1310,14 @@ class OrientationMap(AutoSerialize):
             pad_q = torch.zeros((R, C, 1, 4), dtype=torch.float64)
             pad_q[..., 0] = 1.0
             self.quats = torch.cat([self.quats, pad_q], dim=2)
-            self.corr = torch.cat(
-                [self.corr, torch.zeros((R, C, 1), dtype=torch.float64)], dim=2
-            )
-            self.mirror = torch.cat(
-                [self.mirror, torch.zeros((R, C, 1), dtype=torch.bool)], dim=2
-            )
+            self.corr = torch.cat([self.corr, torch.zeros((R, C, 1), dtype=torch.float64)], dim=2)
+            self.mirror = torch.cat([self.mirror, torch.zeros((R, C, 1), dtype=torch.bool)], dim=2)
         better = om_res.corr[..., 0] > self.corr[..., 1]
         self.quats[..., 1, :] = torch.where(
             better[..., None], om_res.quats[..., 0, :], self.quats[..., 1, :]
         )
         self.corr[..., 1] = torch.where(better, om_res.corr[..., 0], self.corr[..., 1])
-        self.mirror[..., 1] = torch.where(
-            better, om_res.mirror[..., 0], self.mirror[..., 1]
-        )
+        self.mirror[..., 1] = torch.where(better, om_res.mirror[..., 0], self.mirror[..., 1])
         return self
 
     def cluster_orientations(
@@ -1306,7 +1399,7 @@ class OrientationMap(AutoSerialize):
         self,
         match: int = 0,
         pair_distance: float | None = None,
-        min_pairs: int = 5,
+        min_pairs: int | None = None,
         mask: np.ndarray | None = None,
         ds_sampling: float | None = None,
         ds_units: str | None = None,
@@ -1333,7 +1426,17 @@ class OrientationMap(AutoSerialize):
         from quantem.diffraction.strain import StrainMap
 
         assert self.quats is not None
-        delta = pair_distance if pair_distance is not None else self.corr_kernel_size
+        delta = resolve(
+            pair_distance,
+            "pair_distance",
+            self.metadata.get("refine"),
+            self.metadata.get("plan"),
+            default=self.corr_kernel_size,
+        )
+        min_pairs = resolve(min_pairs, "min_pairs", self.metadata.get("refine"), default=MIN_PAIRS)
+        self.metadata["strain"] = dict(
+            match=int(match), pair_distance=float(delta), min_pairs=int(min_pairs)
+        )
         peaks = self.peaks
         R, C = peaks.shape[0], peaks.shape[1]
         fields = peaks.fields
@@ -1392,9 +1495,7 @@ class OrientationMap(AutoSerialize):
         sm.num_pairs = num_pairs
         return sm
 
-    def in_plane_angle_deg(
-        self, match: int = 0, mod_deg: float | None = None
-    ) -> torch.Tensor:
+    def in_plane_angle_deg(self, match: int = 0, mod_deg: float | None = None) -> torch.Tensor:
         """In-plane angle of the crystal a-axis at every position (degrees).
 
         The angle of the projected crystal [100] Cartesian axis, measured
@@ -1430,6 +1531,4 @@ class OrientationMap(AutoSerialize):
         q = self.quats[..., 0, :]
         if reference is None:
             reference = torch.tensor([1.0, 0, 0, 0], dtype=torch.float64)
-        return misorientation_angle_deg(
-            reference, q, self.crystal.sym_quats_matching
-        )
+        return misorientation_angle_deg(reference, q, self.crystal.sym_quats_matching)

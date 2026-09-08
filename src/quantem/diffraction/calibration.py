@@ -8,10 +8,10 @@ the ring positions of a reference crystal.
 from __future__ import annotations
 
 import numpy as np
-import torch
 
 from quantem.core.datastructures.vector import Vector
 from quantem.diffraction.crystal import Crystal
+from quantem.diffraction.defaults import MIN_NUMBER_PEAKS
 
 
 def _measure_raw_origins(bragg_vectors, search_radius: float) -> np.ndarray:
@@ -57,7 +57,10 @@ def plot_origin_fit(bragg_vectors, origins: np.ndarray, search_radius: float = 6
             c0 = 0.0 if j == 2 else center
             sp = max(np.nanstd(resid) * 3, 1e-3) if j == 2 else span
             im = axs[k, j].imshow(
-                img, cmap="RdBu_r", vmin=c0 - sp, vmax=c0 + sp,
+                img,
+                cmap="RdBu_r",
+                vmin=c0 - sp,
+                vmax=c0 + sp,
                 interpolation="nearest",
             )
             axs[k, j].set_title(title, fontsize=10)
@@ -135,7 +138,10 @@ def measure_origins(
                 c0 = 0.0 if j == 2 else center
                 s = max(np.nanstd(resid) * 3, 1e-3) if j == 2 else span
                 im = axs[k, j].imshow(
-                    img, cmap="RdBu_r", vmin=c0 - s, vmax=c0 + s,
+                    img,
+                    cmap="RdBu_r",
+                    vmin=c0 - s,
+                    vmax=c0 + s,
                     interpolation="nearest",
                 )
                 axs[k, j].set_title(title, fontsize=10)
@@ -253,9 +259,9 @@ def simulated_ring_profile(
     """1D ring profile of a crystal: Gaussians at |g| weighted by intensity."""
     g = crystal.g_len.numpy()
     w = crystal.struct_factors_int.numpy() * g**bragg_k_power
-    prof = (
-        w[None, :] * np.exp(-((k[:, None] - g[None, :]) ** 2) / (2 * k_broadening**2))
-    ).sum(axis=1)
+    prof = (w[None, :] * np.exp(-((k[:, None] - g[None, :]) ** 2) / (2 * k_broadening**2))).sum(
+        axis=1
+    )
     return prof
 
 
@@ -267,7 +273,7 @@ def calibrate_pixel_size_matching(
     subsample: int = 8,
     angle_step_deg: float = 3.0,
     corr_kernel_size: float = 0.02,
-    min_number_peaks: int = 6,
+    min_number_peaks: int = MIN_NUMBER_PEAKS,
     plot: bool = False,
     return_scores: bool = False,
     returnfig: bool = False,
@@ -425,15 +431,20 @@ def calibrate_pixel_size(
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(figsize=(10, 4))
-        prof = simulated_ring_profile(
-            crystal, k * scale, k_broadening / 2, bragg_k_power
-        )
+        prof = simulated_ring_profile(crystal, k * scale, k_broadening / 2, bragg_k_power)
         ax.fill_between(
-            k * scale, hist / hist.max(), color="r", alpha=0.75, lw=0,
+            k * scale,
+            hist / hist.max(),
+            color="r",
+            alpha=0.75,
+            lw=0,
             label="measured (scaled)",
         )
         ax.plot(
-            k * scale, prof / prof.max(), "k-", lw=1.0,
+            k * scale,
+            prof / prof.max(),
+            "k-",
+            lw=1.0,
             label=f"{crystal.name} rings",
         )
         ax.set_ylabel("intensity (norm.)")
@@ -533,8 +544,7 @@ def measure_scan_rotation(
         ax.set_xlabel("rotation (degrees)")
         ax.set_ylabel("field measure")
         ax.set_title(
-            "scan rotation = %.1f deg (or %.1f)"
-            % (rotation_ccw_deg, rotation_ccw_deg + 180)
+            "scan rotation = %.1f deg (or %.1f)" % (rotation_ccw_deg, rotation_ccw_deg + 180)
         )
         ax.legend()
         if returnfig:
@@ -621,16 +631,13 @@ def calibrate_ellipse(
         h0 = histogram(np.zeros(2))
         h1 = histogram(ellipse)
         fig, ax = plt.subplots(figsize=(10, 4))
-        ax.fill_between(
-            k_bins, h0 / h0.max(), color="0.7", lw=0, label="measured"
-        )
+        ax.fill_between(k_bins, h0 / h0.max(), color="0.7", lw=0, label="measured")
         ax.plot(k_bins, h1 / h1.max(), "r-", lw=1.0, label="ellipse corrected")
         ax.set_xlabel("scattering vector (1/$\\mathrm{\\AA}$)")
         ax.set_ylabel("intensity (norm.)")
         mag = np.hypot(*ellipse)
         ax.set_title(
-            "e11 = %.2e, e12 = %.2e  (%.2f%% ellipticity)"
-            % (ellipse[0], ellipse[1], 200 * mag)
+            "e11 = %.2e, e12 = %.2e  (%.2f%% ellipticity)" % (ellipse[0], ellipse[1], 200 * mag)
         )
         ax.legend()
         if returnfig:
@@ -657,10 +664,10 @@ def _hkl_label(hkl: np.ndarray, hexagonal: bool) -> str:
         txt = str(abs(v))
         return txt + "̅" if v < 0 else txt
 
-    h, k, l = (int(round(v)) for v in hkl)
+    h, k, ll = (int(round(v)) for v in hkl)
     if hexagonal:
-        return "(" + digit(h) + digit(k) + digit(-(h + k)) + digit(l) + ")"
-    return "(" + digit(h) + digit(k) + digit(l) + ")"
+        return "(" + digit(h) + digit(k) + digit(-(h + k)) + digit(ll) + ")"
+    return "(" + digit(h) + digit(k) + digit(ll) + ")"
 
 
 def plot_ring_comparison(
@@ -710,9 +717,7 @@ def plot_ring_comparison(
         axs = np.atleast_1d(axs)
 
     for ci, (ax, xtl) in enumerate(zip(axs, xtls)):
-        ax.fill_between(
-            k, hist / hist.max(), color="r", alpha=0.75, lw=0, label="measured"
-        )
+        ax.fill_between(k, hist / hist.max(), color="r", alpha=0.75, lw=0, label="measured")
         hexagonal = xtl.laue_group in ("6/m", "6/mmm", "-3", "-3m")
         g_len = xtl.g_len.numpy()
         ints = xtl.struct_factors_int.numpy() * g_len**bragg_k_power
@@ -724,13 +729,15 @@ def plot_ring_comparison(
 
         if k_broadening is not None:
             prof = simulated_ring_profile(xtl, k, k_broadening, bragg_k_power)
-            ax.plot(
-                k, prof / prof.max(), "k-", lw=1.0, label=f"{xtl.name} rings"
-            )
+            ax.plot(k, prof / prof.max(), "k-", lw=1.0, label=f"{xtl.name} rings")
         else:
             keep = (uniq > k_min) & (uniq < k_max)
             ax.vlines(
-                uniq[keep], 0, shell_int[keep], colors="k", lw=1.0,
+                uniq[keep],
+                0,
+                shell_int[keep],
+                colors="k",
+                lw=1.0,
                 label=f"{xtl.name} rings",
             )
 
@@ -751,8 +758,12 @@ def plot_ring_comparison(
                 y = 1.05 + 0.11 * (rows % 2)
                 rows += 1
                 ax.text(
-                    u, y, _hkl_label(hkl_np[best], hexagonal),
-                    fontsize=8, ha="center", va="bottom",
+                    u,
+                    y,
+                    _hkl_label(hkl_np[best], hexagonal),
+                    fontsize=8,
+                    ha="center",
+                    va="bottom",
                 )
         ax.set_ylabel("intensity (norm.)")
         ax.set_ylim(0, 1.32)
@@ -902,8 +913,12 @@ def plot_bragg_rings(
         order = np.argsort(shell_int)[::-1][:n_rings]
         for k, u in enumerate(np.sort(uniq[order])):
             ax.plot(
-                u * np.sin(th), u * np.cos(th),
-                ls=styles[ci % 3], color=colors[ci % 3], lw=0.5, alpha=0.6,
+                u * np.sin(th),
+                u * np.cos(th),
+                ls=styles[ci % 3],
+                color=colors[ci % 3],
+                lw=0.5,
+                alpha=0.6,
                 label=f"{xtl.name} rings" if k == 0 else None,
             )
     ax.set_xlabel("$q_c$ (1/$\\mathrm{\\AA}$)")
