@@ -576,3 +576,272 @@ def test_image_refinement_round_trip():
     assert pm.metadata["dynamical_image"]["disk_radius_px"] == disk_r
     pm.apply_dynamical(res)
     assert pm.metadata["dynamical_applied"]["precession_deg"] == 0.0
+
+
+def test_coupling_lookup_cannot_alias():
+    # a difference vector outside the stored factor box must come back as a
+    # missing factor (zero), never as another reflection's factor
+    from types import SimpleNamespace
+
+    crystal = SimpleNamespace(
+        hkl_dyn=torch.tensor([[1, 0, 0], [-1, 0, 0], [-1, 1, 0]]),
+        U_dyn=torch.tensor([1, 1, 7], dtype=torch.complex128),
+    )
+    U, _, _ = bloch._coupling_matrix(crystal, torch.tensor([[1, 0, 0], [-1, 0, 0]]), 1.0)
+    assert U[0, 1] == 0 and U[1, 0] == 0
+
+
+def test_illumination_nodes_moments():
+    # the convergence disk is integrated with the uniform-area measure: the
+    # second moment of a disk of radius R is R^2 / 4 per axis; the ring is
+    # normalized and its mean vanishes
+    lam = bloch.electron_wavelength_angstrom(200e3)
+    k0 = 1.0 / lam
+    t, w = bloch.illumination_nodes(200e3, semiconv_mrad=5.0, n_disk_radial=3, n_disk_azimuthal=16)
+    R = k0 * np.sin(5e-3)
+    assert np.isclose(float(w.sum()), 1.0)
+    assert np.isclose(float((w * t[:, 0] ** 2).sum()), R**2 / 4, rtol=1e-10)
+    t, w = bloch.illumination_nodes(200e3, precession_deg=0.5, n_precession=16)
+    assert np.isclose(float(w.sum()), 1.0) and float(t.mean(0).abs().max()) < 1e-12
+    assert np.allclose(torch.linalg.norm(t, dim=1).numpy(), k0 * np.sin(np.deg2rad(0.5)))
+    t, w = bloch.illumination_nodes(200e3)
+    assert t.shape == (1, 2) and float(w[0]) == 1.0
+
+
+def test_mean_absorption_and_forbidden_beam():
+    """Pure mean absorption damps the total intensity as exp(-2 pi u0 z/k0);
+    a glide-forbidden reflection (Si 200) acquires intensity through double
+    diffraction, which requires it to be in the beam list."""
+    si = _si(absorptive=True)
+    q = _zone_110()
+    z = torch.tensor([400.0, 800.0], dtype=torch.float64)
+    inten, g_xy, hkl = bloch._cbed_amplitudes(
+        si, q, torch.zeros((1, 2), dtype=torch.float64), z, 200e3, sg_max=0.06, k_max=1.0
+    )
+    keys = [tuple(h) for h in hkl.tolist()]
+    assert (0, 0, 2) in keys or (2, 0, 0) in keys or (0, 2, 0) in keys
+    i200 = next(i for i, h in enumerate(keys) if sorted(abs(v) for v in h) == [0, 0, 2])
+    assert float(inten[0, 1, i200]) > 1e-4  # populated by multiple scattering
+    # mean absorption alone: strip the off-diagonal absorptive part
+    U, u0, absorptive = bloch._coupling_matrix(si, hkl, bloch.relativistic_gamma(200e3))
+    Uel = 0.5 * (U + U.conj().T)
+    lam = bloch.electron_wavelength_angstrom(200e3)
+    k0 = 1.0 / lam
+    s_t = torch.zeros((1, hkl.shape[0]), dtype=torch.float64)
+    gl = bloch.qrotate(q, hkl[1:].to(torch.float64) @ si.lat_recip)
+    s_t[0, 1:] = (2 * gl[:, 2] - lam * (gl**2).sum(1)) / (2 - 2 * lam * gl[:, 2])
+    inten_np = bloch._bloch_solve(Uel, u0, True, s_t, k0, z, fast_absorption=False)
+    total = inten_np[0].sum(dim=1).numpy()
+    assert np.allclose(total, np.exp(-2 * np.pi * u0 * z.numpy() / k0), rtol=1e-8)
+
+
+def test_fourier_ring_matches_quadrature():
+    """The harmonic propagation of the centered precession ring reproduces a
+    converged azimuthal quadrature, with the full complex coupling."""
+    si = _si(absorptive=True)
+    q = _zone_110()
+    z = torch.tensor([300.0, 600.0])
+    trial = torch.zeros((1, 2), dtype=torch.float64)
+    beams = bloch.select_dynamical_beams(si, q, 200e3, np.deg2rad(0.4), 0.06, 1.0)
+    ring, w = bloch.illumination_nodes(200e3, precession_deg=0.4, n_precession=96)
+    inten, g_xy, _ = bloch._cbed_amplitudes(
+        si, q, ring, z, 200e3, 0.06, 1.0, tilt_batch=128, beams=beams
+    )
+    ref = (inten * w[:, None, None]).sum(0)
+    got, g2 = bloch.average_bloch_fourier(si, q, trial, z, 200e3, 0.4, 0.06, 1.0, beams=beams)
+    assert np.allclose(g2.numpy(), g_xy.numpy())
+    assert np.allclose(got[0].numpy(), ref.numpy(), atol=1e-11, rtol=1e-9)
+    # a displaced ring through the sampled coefficients
+    trial = torch.tensor([[0.15, -0.1]], dtype=torch.float64)
+    inten, _, _ = bloch._cbed_amplitudes(
+        si, q, ring + trial, z, 200e3, 0.06, 1.0, tilt_batch=128, beams=beams
+    )
+    ref = (inten * w[:, None, None]).sum(0)
+    got, _ = bloch.average_bloch_fourier(
+        si, q, trial, z, 200e3, 0.4, 0.06, 1.0, beams=beams, n_geometry=128
+    )
+    assert np.allclose(got[0].numpy(), ref.numpy(), atol=1e-9, rtol=1e-7)
+
+
+def test_refine_dynamical_reported_cost_reproducible():
+    """The stored cost and thickness belong to the stored orientation."""
+    from quantem.core.datastructures.vector import Vector
+    from quantem.diffraction.orientation import OrientationMap
+    from quantem.diffraction.phase import PhaseMap
+    from quantem.diffraction.rotations import qnormalize
+
+    energy_ev = 200e3
+    xtl = _si(absorptive=True)
+    torch.manual_seed(3)
+    q_true = qnormalize(torch.randn(3, 4, dtype=torch.float64))
+    peaks = Vector.from_shape(
+        (1, 3), fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t"
+    )
+    for i in range(3):
+        inten, g_xy, _ = bloch._cbed_amplitudes(
+            xtl,
+            q_true[i],
+            torch.zeros((1, 2), dtype=torch.float64),
+            torch.tensor([450.0]),
+            energy_ev,
+            0.06,
+            1.0,
+            progress_bar=False,
+        )
+        inten_np = inten[0, 0, 1:].numpy()
+        keep = inten_np > 1e-3 * inten_np.max()
+        peaks[0, i] = np.column_stack([g_xy[1:].numpy()[keep], inten_np[keep]])
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=energy_ev)
+    om.build_plan(angle_step_zone_axis_deg=3.0, verbose=False)
+    om.match_orientations(progress_bar=False)
+    om.quats[0, :, 0] = q_true
+    om.corr[0, :, 0] = 1.0
+    pm = PhaseMap.from_orientation_maps([om])
+    pm.fit(progress_bar=False)
+    res = bloch.refine_dynamical(
+        pm,
+        thicknesses_A=np.arange(300, 600, 50.0),
+        tilt_stages=((0.1, 0.05),),
+        sg_max=0.06,
+        k_max=1.0,
+        progress_bar=False,
+    )
+    for i in range(3):
+        if not torch.isfinite(res["cost"][0, i, 0]) or peaks[0, i].array.shape[0] < 5:
+            continue
+        q = res["quats"][0, i, 0]
+        d3 = torch.eye(3, dtype=torch.float64)
+        d3[:2, :2] = res["deformation"][0, i, 0]
+        beams = bloch.select_dynamical_beams(
+            xtl, res["quats_base"][0, i, 0], energy_ev, np.deg2rad(0.1) * np.sqrt(2), 0.06, 1.0, d3
+        )
+        inten, g_xy, _ = bloch._cbed_amplitudes(
+            xtl,
+            q,
+            torch.zeros((1, 2), dtype=torch.float64),
+            np.arange(300, 600, 50.0),
+            energy_ev,
+            0.06,
+            1.0,
+            fast_absorption=True,
+            deform=d3,
+            beams=beams,
+        )
+        data = peaks[0, i].array
+        qxy = torch.as_tensor(data[:, :2])
+        im = torch.as_tensor(data[:, 2]).clamp_min(0) ** 0.25
+        cost, _, _, _ = bloch._dynamical_cost(inten[:, :, 1:], g_xy[1:], qxy, im, 0.05, 0.25, 0.02)
+        t_idx = int(np.argmin(np.abs(np.arange(300, 600, 50.0) - float(res["thickness"][0, i]))))
+        assert np.isclose(float(cost[0, t_idx]), float(res["cost"][0, i, 0]), rtol=1e-6, atol=1e-9)
+
+
+def test_image_cost_radial_background():
+    """A quadratic radial floor is removed by the radial background model
+    and biases the constant one."""
+    torch.manual_seed(0)
+    shape = (48, 48)
+    yy, xx = np.mgrid[0:48, 0:48]
+    radius = torch.as_tensor(np.hypot(yy - 24.0, xx - 24.0))
+    centers = torch.tensor([[24.0, 24.0], [30.0, 35.0], [15.0, 20.0], [36.0, 12.0]])
+    inten = torch.tensor([0.8, 0.05, 0.02, 0.01], dtype=torch.float64)
+    sim = bloch.render_disks(centers, inten, shape, 3.0, 0.7)
+    sim_wrong = bloch.render_disks(
+        centers, inten * torch.tensor([1.0, 0.5, 2.0, 1.0]), shape, 3.0, 0.7
+    )
+    floor = 5.0 + 0.2 * radius - 0.004 * radius**2
+    meas = 1000 * sim + floor
+    mask = bloch._image_mask(shape, (24.0, 24.0), None, 4.5)
+    c_const = bloch._image_cost(meas, torch.stack([sim, sim_wrong]), mask, 0.5, "constant")
+    c_rad = bloch._image_cost(meas, torch.stack([sim, sim_wrong]), mask, 0.5, "radial", radius)
+    assert float(c_rad[0]) < 1e-12  # exact model with the right background
+    assert float(c_const[0]) > 1e-4  # the constant background cannot absorb it
+    assert float(c_rad[1]) > float(c_rad[0])
+
+
+def test_refine_dynamical_with_precession_and_convergence():
+    """End-to-end recovery with a precession ring and a convergence disk:
+    the ground truth is integrated with denser illumination nodes than
+    the model uses."""
+    from quantem.core.datastructures.vector import Vector
+    from quantem.diffraction.orientation import OrientationMap
+    from quantem.diffraction.phase import PhaseMap
+    from quantem.diffraction.rotations import (
+        misorientation_angle_deg,
+        qmult,
+        qnormalize,
+        quat_from_axis_angle,
+    )
+
+    energy_ev = 200e3
+    xtl = _si(absorptive=True)
+    torch.manual_seed(5)
+    rng = np.random.default_rng(5)
+    N = 3
+    q_true = qnormalize(torch.randn(N, 4, dtype=torch.float64))
+    t_true = torch.tensor([300.0, 450.0, 600.0])
+    ring, w = bloch.illumination_nodes(
+        energy_ev,
+        precession_deg=0.4,
+        n_precession=32,
+        semiconv_mrad=1.5,
+        n_disk_radial=3,
+        n_disk_azimuthal=12,
+    )
+    peaks = Vector.from_shape(
+        (1, N), fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t"
+    )
+    for i in range(N):
+        inten, g_xy, _ = bloch._cbed_amplitudes(
+            xtl,
+            q_true[i],
+            ring,
+            t_true[i : i + 1],
+            energy_ev,
+            0.06,
+            1.0,
+            tilt_batch=256,
+            progress_bar=False,
+        )
+        I_avg = (inten[:, 0, 1:] * w[:, None]).sum(0).numpy()
+        keep = I_avg > 1e-3 * I_avg.max()
+        peaks[0, i] = np.column_stack([g_xy[1:].numpy()[keep], I_avg[keep]])
+    om = OrientationMap.from_vectors(
+        peaks, xtl, energy_ev=energy_ev, precession_deg=0.4, semiconv_mrad=1.5
+    )
+    om.build_plan(angle_step_zone_axis_deg=3.0, verbose=False)
+    om.match_orientations(progress_bar=False)
+    phis = rng.uniform(0, 2 * np.pi, N)
+    om.quats[0, :, 0] = torch.stack(
+        [
+            qmult(
+                quat_from_axis_angle(
+                    torch.tensor([np.cos(p), np.sin(p), 0.0], dtype=torch.float64),
+                    torch.tensor(np.deg2rad(0.12), dtype=torch.float64),
+                ),
+                q_true[i],
+            )
+            for i, p in enumerate(phis)
+        ]
+    )
+    om.corr[0, :, 0] = 1.0
+    pm = PhaseMap.from_orientation_maps([om])
+    pm.fit(progress_bar=False)
+    res = bloch.refine_dynamical(
+        pm,
+        thicknesses_A=np.arange(200, 700, 25.0),
+        tilt_stages=((0.15, 0.05), (0.03, 0.01)),
+        n_precession=12,
+        n_disk_radial=2,
+        n_disk_azimuthal=6,
+        power_intensity=0.5,
+        sg_max=0.06,
+        k_max=1.0,
+        progress_bar=False,
+    )
+    assert res["metadata"]["precession_deg"] == 0.4 and res["metadata"]["semiconv_mrad"] == 1.5
+    valid = np.array([peaks[0, i].array.shape[0] >= 6 for i in range(N)])
+    assert valid.sum() >= 2
+    err = misorientation_angle_deg(q_true, om.quats[0, :, 0], xtl.sym_quats).numpy()[valid]
+    t_err = np.abs(res["thickness"][0].numpy() - t_true.numpy())[valid]
+    assert np.median(err) < 0.03
+    assert (t_err <= 25).sum() >= valid.sum() - 1

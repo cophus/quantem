@@ -183,7 +183,11 @@ class OrientationMap(AutoSerialize):
             Excitation error envelope of the library (1/Angstroms). Keep this
             about 2x the physical excitation tolerance: orientations halfway
             between sampled zones shift s_g by ~ (step/2) * k, and a wider
-            envelope keeps their library intensities from collapsing.
+            envelope keeps their library intensities from collapsing. With a
+            precession angle or convergence semiangle recorded by
+            from_vectors, the envelope of every library reflection is its
+            exact average over that illumination
+            (quantem.diffraction.illumination).
         power_radial, power_intensity : float
             Weighting prefactor q^power_radial * |V_g|^power_intensity for
             library peaks. power_intensity=0 matches on positions only
@@ -336,6 +340,9 @@ class OrientationMap(AutoSerialize):
             self.plan_norm_shift = None
             self.plan_frac_shift = None
         self.metadata["plan"] = dict(
+            excitation_model="gaussian",
+            precession_deg=float(self.metadata.get("precession_deg", 0.0) or 0.0),
+            semiconv_mrad=float(self.metadata.get("semiconv_mrad", 0.0) or 0.0),
             angle_step_zone_axis_deg=float(angle_step_zone_axis_deg),
             angle_step_in_plane_deg=float(angle_step_in_plane_deg),
             corr_kernel_size=self.corr_kernel_size,
@@ -422,8 +429,26 @@ class OrientationMap(AutoSerialize):
         gz = gr[..., 2]
         g2 = (gr**2).sum(-1)
         s_g = (2 * gz - lam * g2) / (2 - 2 * lam * gz)
-        amp = torch.exp(-(s_g**2) / (2 * self.sigma_excitation**2))
-        amp = amp * (s_g.abs() < delta * 4)
+        prec = float(self.metadata.get("precession_deg", 0.0) or 0.0)
+        conv = float(self.metadata.get("semiconv_mrad", 0.0) or 0.0)
+        if prec > 0 or conv > 0:
+            # excitation envelope averaged over the illumination
+            # (quantem.diffraction.illumination); the peak weighting below
+            # keeps the established correlation-library semantics
+            from quantem.diffraction.illumination import (
+                excitation_amplitudes,
+                gaussian_envelope,
+            )
+
+            a_r, b_r = excitation_amplitudes(gr, self.energy_ev, prec, conv)
+            amp = torch.as_tensor(
+                gaussian_envelope(s_g.numpy(), a_r.numpy(), b_r.numpy(), self.sigma_excitation),
+                dtype=torch.float64,
+            )
+            amp = amp * (s_g.abs() < a_r + b_r + delta * 4)
+        else:
+            amp = torch.exp(-(s_g**2) / (2 * self.sigma_excitation**2))
+            amp = amp * (s_g.abs() < delta * 4)
 
         weight = (
             crystal.g_len**self.power_radial * crystal.struct_factors_int**self.power_intensity
@@ -830,6 +855,31 @@ class OrientationMap(AutoSerialize):
         g_all = self.crystal.g_vec
         lam = self.wavelength
         sigma_env = sigma_envelope if sigma_envelope is not None else sigma / 2
+        prec_ill = float(self.metadata.get("precession_deg", 0.0) or 0.0)
+        conv_ill = float(self.metadata.get("semiconv_mrad", 0.0) or 0.0)
+
+        def envelope(S, g_rows):
+            # Laue-circle envelope of the paired reflections at shifted
+            # excitation errors S (P, T, T), averaged over the illumination
+            # recorded on this map (ring: Bessel series; disk: transform)
+            if prec_ill <= 0 and conv_ill <= 0:
+                return torch.exp(-(S**2) / (2 * sigma_env**2))
+            from quantem.diffraction.illumination import (
+                excitation_amplitudes,
+                gaussian_envelope,
+                gaussian_envelope_ring_series,
+            )
+
+            a_r, b_r = excitation_amplitudes(g_rows, self.energy_ev, prec_ill, conv_ill)
+            if conv_ill <= 0:
+                return gaussian_envelope_ring_series(S, a_r[:, None, None], sigma_env)
+            return torch.as_tensor(
+                gaussian_envelope(
+                    S.numpy(), a_r[:, None, None].numpy(), b_r[:, None, None].numpy(), sigma_env
+                ),
+                dtype=torch.float64,
+            )
+
         f_all = self.crystal.struct_factors_int.to(torch.float64)
         tg = torch.deg2rad(
             torch.linspace(-zone_search_deg, zone_search_deg, 17, dtype=torch.float64)
@@ -901,7 +951,7 @@ class OrientationMap(AutoSerialize):
                         + tg[None, :, None] * a1[:, None, None]
                         + tg[None, None, :] * a2[:, None, None]
                     )
-                    pred = f_p[:, None, None] * torch.exp(-(S**2) / (2 * sigma_env**2))
+                    pred = f_p[:, None, None] * envelope(S, g_sel[pair])
                     E = (w[:, None, None] * pred).sum(dim=0) / (
                         (pred**2).sum(dim=0).sqrt().clamp_min(1e-12)
                     )
@@ -1059,6 +1109,30 @@ class OrientationMap(AutoSerialize):
         f_all = self.crystal.struct_factors_int.to(torch.float64)
         lam = self.wavelength
         n_tg = tg.shape[0]
+        prec_ill = float(self.metadata.get("precession_deg", 0.0) or 0.0)
+        conv_ill = float(self.metadata.get("semiconv_mrad", 0.0) or 0.0)
+
+        def envelope(S, g_rows):
+            # Laue-circle envelope of the paired reflections at shifted
+            # excitation errors S (P, T, T), averaged over the illumination
+            # recorded on this map (ring: Bessel series; disk: transform)
+            if prec_ill <= 0 and conv_ill <= 0:
+                return torch.exp(-(S**2) / (2 * sigma_env**2))
+            from quantem.diffraction.illumination import (
+                excitation_amplitudes,
+                gaussian_envelope,
+                gaussian_envelope_ring_series,
+            )
+
+            a_r, b_r = excitation_amplitudes(g_rows, self.energy_ev, prec_ill, conv_ill)
+            if conv_ill <= 0:
+                return gaussian_envelope_ring_series(S, a_r[:, None, None], sigma_env)
+            return torch.as_tensor(
+                gaussian_envelope(
+                    S.numpy(), a_r[:, None, None].numpy(), b_r[:, None, None].numpy(), sigma_env
+                ),
+                dtype=torch.float64,
+            )
 
         # flatten measured peaks once, padded per position
         cells = [peaks[r, c].array for r, c in np.ndindex(R, C)]
@@ -1142,7 +1216,7 @@ class OrientationMap(AutoSerialize):
                             + tg[None, :, None] * gyf[:, None, None]
                             - tg[None, None, :] * gxf[:, None, None]
                         )  # (Np, T, T)
-                        pred = ff[:, None, None] * torch.exp(-(S**2) / (2 * sigma_env**2))
+                        pred = ff[:, None, None] * envelope(S, g[idx_b, idx_g])
                         E_num = torch.zeros((B, n_tg, n_tg), dtype=torch.float64).index_add_(
                             0, idx_b, wf[:, None, None] * pred
                         )
@@ -1205,6 +1279,8 @@ class OrientationMap(AutoSerialize):
     def generate_pattern(self, rx: int, ry: int, match: int = 0, **kwargs):
         """Simulated pattern for the matched orientation at (rx, ry)."""
         assert self.quats is not None
+        kwargs.setdefault("precession_deg", self.metadata.get("precession_deg", 0.0))
+        kwargs.setdefault("semiconv_mrad", self.metadata.get("semiconv_mrad", 0.0))
         return self.crystal.generate_pattern(
             self.quats[rx, ry, match],
             energy_ev=self.energy_ev,

@@ -27,7 +27,6 @@ import torch
 from ase import Atoms
 from ase.data import chemical_symbols
 
-from quantem.core.utils.utils import electron_wavelength_angstrom
 from quantem.diffraction.defaults import SIGMA_EXCITATION
 from quantem.diffraction.rotations import qrotate, symmetry_quaternions
 
@@ -522,6 +521,7 @@ class Crystal:
         self.g_len_dyn = g_len
         self.U_dyn = torch.as_tensor(U, dtype=torch.complex128)
         self.dyn_energy_ev = float(energy_ev)
+        self.dyn_k_max = float(k_max)
         return self
 
     def generate_pattern(
@@ -531,8 +531,20 @@ class Crystal:
         sigma_excitation: float = SIGMA_EXCITATION,
         tol_excitation_mult: float = 3.0,
         k_max: float | None = None,
+        precession_deg: float = 0.0,
+        semiconv_mrad: float = 0.0,
+        excitation_model: str = "gaussian",
+        thickness_A: float | None = None,
     ) -> dict[str, torch.Tensor]:
         """Kinematical diffraction pattern for one orientation.
+
+        The intensity of each reflection is |F_g|^2 times a Gaussian
+        excitation envelope of width sigma_excitation, averaged exactly over
+        the illumination when a precession angle or a convergence
+        semiangle is given (quantem.diffraction.illumination): the
+        precession ring sweeps the excitation error of reflection g by
+        +- a_g = r |g_xy| / |K - g_z| about its central value c_g, and the
+        averaged envelope is the Bessel transform G(c_g, a_g, b_g; sigma).
 
         Parameters
         ----------
@@ -547,29 +559,80 @@ class Crystal:
             Include reflections with |s_g| below this multiple of sigma.
         k_max : float | None
             Optionally trim the pattern below the structure-factor k_max.
+        precession_deg, semiconv_mrad : float
+            Precession semi-angle (degrees) and convergence semiangle
+            (mrad) of the illumination the intensities are averaged over.
+        excitation_model : {"gaussian", "slab"}
+            "gaussian" is the empirical envelope of width sigma_excitation
+            used by the orientation library. "slab" is the finite-thickness
+            first Born rocking curve, (pi |U_g| z / k0)^2 sinc(s_g z)^2
+            with U_g = gamma_rel F_g / pi, averaged over the illumination
+            the same way; it needs thickness_A and is the kinematical limit
+            of the Bloch wave calculation for thin crystals.
+        thickness_A : float | None
+            Thickness for the slab model (Angstroms).
 
         Returns
         -------
-        dict with 'qx', 'qy', 'intensity', 'hkl', 's_g' tensors.
+        dict with 'qx', 'qy', 'intensity', 'hkl', 's_g' (the central
+        excitation error), 'a' and 'b' (ring and disk sweep amplitudes).
         """
         if self.g_vec is None:
             raise RuntimeError("Run calculate_structure_factors first.")
-        lam = electron_wavelength_angstrom(energy_ev)
-        g = qrotate(orientation, self.g_vec)
-        gz, g2 = g[:, 2], (g**2).sum(dim=1)
-        s_g = (2 * gz - lam * g2) / (2 - 2 * lam * gz)
-        keep = torch.abs(s_g) < sigma_excitation * tol_excitation_mult
-        if k_max is not None:
-            keep &= self.g_len <= k_max
-        intensity = self.struct_factors_int[keep] * torch.exp(
-            -(s_g[keep] ** 2) / (2 * sigma_excitation**2)
+        from quantem.diffraction.illumination import (
+            averaged_gaussian_intensity_envelope,
+            excitation_coefficients,
+            slab_envelope,
         )
+
+        g = qrotate(orientation, self.g_vec)
+        if excitation_model == "slab":
+            if thickness_A is None:
+                raise ValueError("the slab excitation model needs thickness_A")
+            c, a, b = excitation_coefficients(g, energy_ev, precession_deg, semiconv_mrad)
+            # the sinc^2 tails are algebraic: keep everything whose main
+            # lobe (width 1/z) plus illumination sweep is within the tolerance
+            width = tol_excitation_mult / float(thickness_A)
+            c_t = torch.as_tensor(c, dtype=torch.float64)
+            a_t = torch.as_tensor(a, dtype=torch.float64)
+            b_t = torch.as_tensor(b, dtype=torch.float64)
+            keep = torch.abs(c_t) < a_t + b_t + width
+            if k_max is not None:
+                keep &= self.g_len <= k_max
+            env = slab_envelope(
+                c[keep.numpy()], a[keep.numpy()], b[keep.numpy()], float(thickness_A)
+            )
+            from quantem.core.utils.utils import electron_wavelength_angstrom
+
+            lam = electron_wavelength_angstrom(energy_ev)
+            gamma_rel = 1.0 + float(energy_ev) / 510998.95
+            u_abs = torch.abs(self.struct_factors[keep]) * (gamma_rel / np.pi)
+            intensity = (np.pi * u_abs * float(thickness_A) * lam) ** 2 * torch.as_tensor(
+                env, dtype=torch.float64
+            )
+        else:
+            env, c, a, b = averaged_gaussian_intensity_envelope(
+                g, energy_ev, sigma_excitation, precession_deg, semiconv_mrad
+            )
+            c_t = torch.as_tensor(c, dtype=torch.float64)
+            a_t = torch.as_tensor(a, dtype=torch.float64)
+            b_t = torch.as_tensor(b, dtype=torch.float64)
+            # the full illumination support enters the selection, not only
+            # the central excitation error
+            keep = torch.abs(c_t) < a_t + b_t + sigma_excitation * tol_excitation_mult
+            if k_max is not None:
+                keep &= self.g_len <= k_max
+            intensity = (
+                self.struct_factors_int[keep] * torch.as_tensor(env, dtype=torch.float64)[keep]
+            )
         return {
             "qx": g[keep, 0],
             "qy": g[keep, 1],
             "intensity": intensity,
             "hkl": self.hkl[keep],
-            "s_g": s_g[keep],
+            "s_g": c_t[keep],
+            "a": a_t[keep],
+            "b": b_t[keep],
         }
 
     def __repr__(self) -> str:

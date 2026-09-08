@@ -259,3 +259,67 @@ def test_metadata_inheritance():
         progress_bar=False,
     )
     assert res2["metadata"]["precession_deg"] == 0.0 and res2["metadata"]["pair_distance"] == 0.06
+
+
+def test_precession_envelope_matches_quadrature():
+    # the analytic ring-averaged envelope equals the positive quadrature of
+    # the static envelope over the exact excitation errors on the ring
+    from quantem.diffraction.illumination import ring_disk_quadrature
+    from quantem.diffraction.rotations import qrotate
+
+    xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True), verbose=False)
+    xtl.calculate_structure_factors(k_max=1.5)
+    torch.manual_seed(4)
+    q = qnormalize(torch.randn(4, dtype=torch.float64))
+    energy_ev, sigma, prec = 200e3, 0.04, 0.6
+    from quantem.core.utils.utils import electron_wavelength_angstrom
+
+    lam = electron_wavelength_angstrom(energy_ev)
+    k0 = 1.0 / lam
+    pat = xtl.generate_pattern(q, energy_ev, sigma_excitation=sigma, precession_deg=prec)
+    g = qrotate(q, xtl.g_vec)
+    hkl_map = {tuple(h): i for i, h in enumerate(xtl.hkl.tolist())}
+    idx = torch.tensor([hkl_map[tuple(h)] for h in pat["hkl"].tolist()])
+    gs = g[idx].numpy()
+    r = k0 * np.sin(np.deg2rad(prec))
+    t, w = ring_disk_quadrature(r, 0.0, n_phi=256)
+    kz = np.sqrt(k0**2 - (t**2).sum(1))[:, None]
+    s = (2 * kz * gs[:, 2] - 2 * (t @ gs[:, :2].T) - (gs**2).sum(1)) / (2 * (kz - gs[:, 2]))
+    ref = (w[:, None] * np.exp(-0.5 * (s / sigma) ** 2)).sum(0) * xtl.struct_factors_int[
+        idx
+    ].numpy()
+    assert np.allclose(pat["intensity"].numpy(), ref, rtol=1e-6, atol=1e-9)
+    # without precession the static envelope is recovered exactly
+    pat0 = xtl.generate_pattern(q, energy_ev, sigma_excitation=sigma)
+    s0 = pat0["s_g"].numpy()
+    assert np.allclose(
+        pat0["intensity"].numpy(),
+        xtl.struct_factors_int[[hkl_map[tuple(h)] for h in pat0["hkl"].tolist()]].numpy()
+        * np.exp(-0.5 * (s0 / sigma) ** 2),
+    )
+
+
+def test_roundtrip_with_precession():
+    # library, matching and refinement with the precession-averaged
+    # envelope: patterns simulated with precession are recovered
+    torch.manual_seed(6)
+    xtl = Crystal.from_ase(bulk("Ti", "hcp", a=2.95, c=4.686), verbose=False)
+    xtl.calculate_structure_factors(k_max=1.5)
+    N = 12
+    q_true = qnormalize(torch.randn(N, 4, dtype=torch.float64))
+    peaks = Vector.from_shape(
+        (1, N), fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t"
+    )
+    for i in range(N):
+        p = xtl.generate_pattern(
+            q_true[i], energy_ev=200e3, sigma_excitation=0.02, precession_deg=0.7
+        )
+        peaks[0, i] = np.stack([p["qx"].numpy(), p["qy"].numpy(), p["intensity"].numpy()], axis=1)
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3, precession_deg=0.7)
+    om.build_plan(angle_step_zone_axis_deg=2.0, verbose=False)
+    om.match_orientations(progress_bar=False)
+    om.refine_orientations(zone_max_total_deg=1.5, progress_bar=False)
+    err = misorientation_angle_deg(q_true, om.quats[0, :, 0], xtl.sym_quats).numpy()
+    assert np.median(err) < 0.3
+    assert (err < 1.5).mean() >= 0.75
+    assert om.metadata["precession_deg"] == 0.7
