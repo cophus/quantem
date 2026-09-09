@@ -200,3 +200,36 @@ def slab_envelope(c, a, b, thickness_A: float) -> np.ndarray:
     x = 2 * np.pi * thickness_A * _V
     integrand = np.cos(c[..., None] * x) * j0(a[..., None] * x) * _jinc(b[..., None] * x)
     return np.clip(integrand @ _WV, 0.0, 1.0)
+
+
+def gaussian_envelope_ring_torch(c: torch.Tensor, a: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Ring-averaged Gaussian envelope (b = 0) in torch, for the refinement
+    loops: the Bessel series of gaussian_envelope_ring_series truncated
+    after the I_4 term, with I_n(u) from the I_0 / I_1 recurrences (and
+    their small-argument series where the recurrence would cancel). Below
+    v = a^2 / 4 sigma^2 = 0.3 the truncation error is under 1e-5; larger
+    sweeps fall back to the reference series."""
+    c = c.to(torch.float64)
+    a = torch.as_tensor(a, dtype=torch.float64)
+    u = c * a / sigma**2
+    v = a * a / (4 * sigma**2)
+    i0u = torch.special.i0(u)
+    i1u = torch.special.i1(u)
+    small2 = u.abs() < 1e-3
+    u_safe = torch.where(small2, torch.ones_like(u), u)
+    i2u = torch.where(small2, u * u / 8, i0u - 2 * i1u / u_safe)
+    small4 = u.abs() < 5e-2
+    i3u = torch.where(small4, u**3 / 48, i1u - 4 * i2u / u_safe)
+    i4u = torch.where(small4, u**4 / 384, i2u - 6 * i3u / u_safe)
+    i0v = torch.special.i0(v)
+    i1v = torch.special.i1(v)
+    smallv = v < 1e-3
+    v_safe = torch.where(smallv, torch.ones_like(v), v)
+    i2v = torch.where(smallv, v * v / 8, i0v - 2 * i1v / v_safe)
+    out = torch.exp(-0.5 * (c / sigma) ** 2 - v) * (i0u * i0v - 2 * i2u * i1v + 2 * i4u * i2v)
+    big = v > 0.3
+    if bool(big.any()):
+        out = out.clone()
+        ref = gaussian_envelope_ring_series(c[big], torch.broadcast_to(a, c.shape)[big], sigma)
+        out[big] = ref.to(out.dtype)
+    return out.clamp(0.0, 1.0)

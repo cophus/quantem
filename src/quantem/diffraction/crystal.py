@@ -188,7 +188,8 @@ class Crystal:
         atoms: Atoms,
         name: str | None = None,
         symprec: float = 1e-4,
-        pseudo_symmetry_tol: float | None = 0.1,
+        pseudo_symmetry_tol: float | None = 0.01,
+        pseudo_symmetry_intensity_tol: float = 0.05,
         verbose: bool = True,
     ):
         """
@@ -196,18 +197,29 @@ class Crystal:
         ----------
         symprec : float, default=1e-4
             spglib tolerance (Angstroms) for the cell's own symmetry.
-        pseudo_symmetry_tol : float | None, default=0.1
-            Tolerance (Angstroms) at which the symmetry is re-detected for
-            orientation matching. Cells within this distance of a higher
-            symmetry (a few percent of strain on a 5 Angstrom cell) are
-            matched with the parent group, so variants no experiment can
-            separate are never sampled as distinct orientations. The
-            library builders warn when this differs from the cell's own
-            symmetry; pass None to match with the exact symmetry.
+        pseudo_symmetry_tol : float | None, default=0.01
+            Dimensionless distance tolerance for the symmetry used in
+            orientation matching: a fraction of the shortest lattice vector
+            within which atoms and lattice vectors are allowed to deviate
+            from a higher-symmetry parent (a 4 A cell with an atom at
+            (0.5, 0.5, 0.50001) is body centered at any tolerance above
+            1e-5). Cells within it are matched with the parent group, so
+            variants no experiment can separate are never sampled as
+            distinct orientations; the library builders warn when the
+            matching group differs from the cell's own. None matches with
+            the exact symmetry.
+        pseudo_symmetry_intensity_tol : float, default=0.05
+            Dimensionless intensity tolerance of the same decision: the
+            extra operations of the parent group must map the kinematical
+            intensities of the reflections they relate onto each other
+            within this fraction of the strongest reflection, otherwise the
+            patterns are distinguishable and the parent group is rejected.
         """
         self.atoms = atoms
         self.name = name if name is not None else atoms.get_chemical_formula()
         self._pseudo_symmetry_tol = pseudo_symmetry_tol
+        self._pseudo_symmetry_intensity_tol = float(pseudo_symmetry_intensity_tol)
+        self.pseudo_symmetry_report: dict = {}
         self._wedge_cache: torch.Tensor | None | str = "unset"
 
         self.lat_real = torch.as_tensor(atoms.cell[:], dtype=torch.float64)
@@ -216,7 +228,7 @@ class Crystal:
         occupancy = atoms.arrays.get("occupancy", np.ones(len(atoms)))
         self.occupancy = torch.as_tensor(np.asarray(occupancy, dtype=float))
 
-        self._setup_symmetry(symprec, pseudo_symmetry_tol)
+        self._setup_symmetry(symprec, pseudo_symmetry_tol, pseudo_symmetry_intensity_tol)
         if verbose:
             print(self.symmetry_summary())
 
@@ -249,17 +261,41 @@ class Crystal:
         """Reciprocal lattice vectors as rows, no 2*pi factor."""
         return torch.linalg.inv(self.lat_real).T
 
-    def _setup_symmetry(self, symprec: float, pseudo_symmetry_tol: float | None) -> None:
+    def _quick_intensities(self, k_max: float = 1.2) -> tuple[torch.Tensor, torch.Tensor]:
+        """Kinematical |F|^2 of every reflection with |g| <= k_max (hkl, I),
+        for the pseudo-symmetry intensity check; no thermal factors."""
+        recip = self.lat_recip
+        k_len = torch.linalg.norm(recip, dim=1)
+        n_max = torch.ceil(k_max / k_len * 2).to(torch.long)
+        ranges = [torch.arange(-int(n), int(n) + 1) for n in n_max]
+        hkl = torch.cartesian_prod(*ranges).to(torch.float64)
+        g_vec = hkl @ recip
+        g_len = torch.linalg.norm(g_vec, dim=1)
+        keep = (g_len <= k_max) & (g_len > 0)
+        hkl, g_len = hkl[keep], g_len[keep]
+        f_e = electron_scattering_factor(self.numbers, g_len)
+        phase = torch.exp(-2j * np.pi * (self.positions_frac @ hkl.T))
+        F = (f_e * self.occupancy[:, None] * phase).sum(dim=0) / self.volume
+        return hkl.to(torch.long), torch.abs(F) ** 2
+
+    def _setup_symmetry(
+        self, symprec: float, pseudo_symmetry_tol: float | None, intensity_tol: float
+    ) -> None:
         """Detect the true symmetry group, and optionally a pseudo-symmetry group.
 
         The true group (at `symprec`) is stored for reporting and refinement.
-        When `pseudo_symmetry_tol` is set, the symmetry is re-detected at that
-        looser tolerance: nearly-degenerate cells (e.g. an orthorhombic cell
-        with a = 4.000, b = 4.001, c = 4.002 Angstroms) are idealized to their
-        higher-symmetry parent, and *matching* uses that group --- orientations
-        that no experiment could distinguish are never sampled separately.
+        The pseudo-symmetry group is detected at a distance tolerance of
+        `pseudo_symmetry_tol` times the shortest lattice vector and kept
+        only if its extra operations relate reflections of equal kinematical
+        intensity to within `intensity_tol` of the strongest reflection:
+        two orientations are merged only when no experiment could tell
+        their patterns apart, in position or in intensity. Matching uses
+        that group, so nearly-degenerate cells are idealized to their
+        higher-symmetry parent.
         """
         import spglib
+
+        from quantem.diffraction.rotations import quat_to_matrix
 
         cell = (
             self.lat_real.numpy(),
@@ -273,23 +309,53 @@ class Crystal:
         self.laue_group: str = _LAUE_CLASS.get(pg, "-1")
         self.sym_quats = symmetry_quaternions(dataset.rotations, self.lat_real.numpy())
 
-        ds_pseudo = None
-        if pseudo_symmetry_tol is not None and pseudo_symmetry_tol > symprec:
-            try:
-                ds_pseudo = spglib.get_symmetry_dataset(cell, symprec=pseudo_symmetry_tol)
-            except Exception:
-                ds_pseudo = None
-        if ds_pseudo is not None:
-            pg_pseudo = spglib.get_pointgroup(ds_pseudo.rotations)[0].strip()
-            self.pointgroup_matching: str = pg_pseudo
-            self.laue_group_matching: str = _LAUE_CLASS.get(pg_pseudo, "-1")
-            self.sym_quats_matching = symmetry_quaternions(
-                ds_pseudo.rotations, self.lat_real.numpy()
-            )
-        else:
-            self.pointgroup_matching = pg
-            self.laue_group_matching = self.laue_group
-            self.sym_quats_matching = self.sym_quats
+        self.pointgroup_matching = pg
+        self.laue_group_matching = self.laue_group
+        self.sym_quats_matching = self.sym_quats
+        if pseudo_symmetry_tol is None:
+            return
+        a_min = float(torch.linalg.norm(self.lat_real, dim=1).min())
+        symprec_pseudo = float(pseudo_symmetry_tol) * a_min
+        self.pseudo_symmetry_report = {"distance_A": symprec_pseudo}
+        if symprec_pseudo <= symprec:
+            return
+        try:
+            ds_pseudo = spglib.get_symmetry_dataset(cell, symprec=symprec_pseudo)
+        except Exception:
+            ds_pseudo = None
+        if ds_pseudo is None:
+            return
+        pg_pseudo = spglib.get_pointgroup(ds_pseudo.rotations)[0].strip()
+        quats_pseudo = symmetry_quaternions(ds_pseudo.rotations, self.lat_real.numpy())
+        if quats_pseudo.shape[0] <= self.sym_quats.shape[0]:
+            return
+
+        # intensity check on the extra operations: |F|^2 of every reflection
+        # against |F|^2 of its image, relative to the strongest reflection
+        hkl, inten = self._quick_intensities()
+        lut = {tuple(h): i for i, h in enumerate(hkl.tolist())}
+        g = hkl.to(torch.float64) @ self.lat_recip
+        i_max = float(inten.max())
+        Rs = quat_to_matrix(quats_pseudo)
+        Rs_true = quat_to_matrix(self.sym_quats)
+        worst = 0.0
+        for R in Rs:
+            if any(float((R - Rt).abs().max()) < 1e-6 for Rt in Rs_true):
+                continue
+            g_img = g @ R.T
+            hkl_img = torch.round(g_img @ self.lat_real.T).to(torch.long)
+            idx = torch.tensor([lut.get(tuple(h), -1) for h in hkl_img.tolist()])
+            ok = idx >= 0
+            diff = (inten[ok] - inten[idx[ok]]).abs() / i_max
+            worst = max(worst, float(diff.max()) if ok.any() else 0.0)
+        self.pseudo_symmetry_report["intensity_mismatch"] = worst
+        self.pseudo_symmetry_report["candidate"] = pg_pseudo
+        if worst > intensity_tol:
+            self.pseudo_symmetry_report["rejected"] = True
+            return
+        self.pointgroup_matching = pg_pseudo
+        self.laue_group_matching = _LAUE_CLASS.get(pg_pseudo, "-1")
+        self.sym_quats_matching = quats_pseudo
 
     def zone_axis_wedge(self) -> torch.Tensor | None:
         """Fundamental zone-axis wedge corners (3, 3) Cartesian, or None.
@@ -335,7 +401,9 @@ class Crystal:
             f"{self.name}: orientation libraries are built with the "
             f"pseudo-symmetry point group {self.pointgroup_matching} (Laue "
             f"class {self.laue_group_matching}, found at pseudo_symmetry_tol = "
-            f"{self._pseudo_symmetry_tol:g} A), while the cell's own symmetry "
+            f"{self._pseudo_symmetry_tol:g} of the shortest lattice vector, "
+            f"intensities matching within {self.pseudo_symmetry_report.get('intensity_mismatch', 0.0):.1%}), "
+            f"while the cell's own symmetry "
             f"is {self.pointgroup} (Laue class {self.laue_group}). Orientations "
             f"related by the extra operations give the same library entry, so "
             f"the {n_extra} variants they generate are reported as one and the "
@@ -363,9 +431,18 @@ class Crystal:
                 "-- used for orientation matching",
             ]
         elif self._pseudo_symmetry_tol is not None:
-            lines += [
-                f"  pseudo-symmetry  none found at tol = {self._pseudo_symmetry_tol:g} A",
-            ]
+            rep = self.pseudo_symmetry_report
+            if rep.get("rejected"):
+                lines += [
+                    f"  pseudo-symmetry  {rep['candidate']} within {self._pseudo_symmetry_tol:g} of "
+                    f"the lattice, rejected: intensities differ by "
+                    f"{rep['intensity_mismatch']:.1%} (tol {self._pseudo_symmetry_intensity_tol:.0%})",
+                ]
+            else:
+                lines += [
+                    f"  pseudo-symmetry  none found at tol = {self._pseudo_symmetry_tol:g} "
+                    f"({rep.get('distance_A', 0.0):.3f} A)",
+                ]
         else:
             lines += ["  pseudo-symmetry  not checked (set pseudo_symmetry_tol)"]
         # matching line reflects the symmetry actually used, after any

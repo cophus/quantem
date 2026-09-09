@@ -44,7 +44,7 @@ def test_ring_positions(ti_beta):
 def test_pseudo_symmetry():
     ortho = Atoms("Au", positions=[[0, 0, 0]], cell=[4.000, 4.001, 4.002], pbc=True)
     exact = Crystal.from_ase(ortho, pseudo_symmetry_tol=None)
-    pseudo = Crystal.from_ase(ortho, pseudo_symmetry_tol=0.01)
+    pseudo = Crystal.from_ase(ortho, pseudo_symmetry_tol=0.01)  # 0.04 A on a 4 A cell
     assert exact.pointgroup_matching == "mmm"
     assert pseudo.pointgroup_matching == "m-3m"
     assert pseudo.sym_quats_matching.shape[0] == 24
@@ -173,8 +173,9 @@ def test_wedge_follows_cell_setting():
 
 def test_pseudo_symmetry_default_and_warning():
     ortho = Atoms("Au", positions=[[0, 0, 0]], cell=[4.000, 4.001, 4.002], pbc=True)
-    xtl = Crystal.from_ase(ortho, verbose=False)  # default tolerance 0.1 A
+    xtl = Crystal.from_ase(ortho, verbose=False)  # default tolerance 1% of the cell
     assert xtl.pointgroup == "mmm" and xtl.pointgroup_matching == "m-3m"
+    assert xtl.pseudo_symmetry_report["intensity_mismatch"] < 0.05
     msg = xtl.matching_symmetry_warning()
     assert msg is not None and "pseudo_symmetry_tol=None" in msg
     # the pseudo group's operators are exact rotations (orthonormalized), so
@@ -183,3 +184,26 @@ def test_pseudo_symmetry_default_and_warning():
     assert int(hits.min()) >= 1
     exact = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True), verbose=False)
     assert exact.matching_symmetry_warning() is None
+
+
+def test_pseudo_symmetry_dimensionless_and_intensity_check():
+    # an almost body-centered cell: the center atom 0.002 A off (0.5, 0.5, 0.5)
+    # is body centered at the default tolerance, and its 100/010/001
+    # patterns are identical within any measurable intensity
+    almost_bcc = Atoms(
+        "Fe2", scaled_positions=[[0, 0, 0], [0.5, 0.5, 0.5005]], cell=[4.0, 4.0, 4.0], pbc=True
+    )
+    xtl = Crystal.from_ase(almost_bcc, verbose=False)
+    assert xtl.pointgroup_matching == "m-3m"
+    assert xtl.pseudo_symmetry_report["intensity_mismatch"] < 1e-3
+    # the same cell at an unmeasurably tight distance tolerance keeps its
+    # own (lower) symmetry; the tolerance is a fraction of the lattice
+    tight = Crystal.from_ase(almost_bcc, pseudo_symmetry_tol=1e-7, verbose=False)
+    assert tight.pointgroup_matching == tight.pointgroup
+    # a candidate whose intensities do not match within the intensity
+    # tolerance is rejected and the cell keeps its own symmetry
+    strict = Crystal.from_ase(almost_bcc, pseudo_symmetry_intensity_tol=1e-9, verbose=False)
+    assert strict.pseudo_symmetry_report.get("candidate") == "m-3m"
+    assert strict.pseudo_symmetry_report.get("rejected") is True
+    assert strict.pointgroup_matching == strict.pointgroup
+    assert "rejected" in strict.symmetry_summary()

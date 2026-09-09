@@ -438,13 +438,19 @@ class OrientationMap(AutoSerialize):
             from quantem.diffraction.illumination import (
                 excitation_amplitudes,
                 gaussian_envelope,
+                gaussian_envelope_ring_torch,
             )
 
             a_r, b_r = excitation_amplitudes(gr, self.energy_ev, prec, conv)
-            amp = torch.as_tensor(
-                gaussian_envelope(s_g.numpy(), a_r.numpy(), b_r.numpy(), self.sigma_excitation),
-                dtype=torch.float64,
-            )
+            if conv <= 0:
+                amp = gaussian_envelope_ring_torch(s_g, a_r, self.sigma_excitation)
+            else:
+                amp = torch.as_tensor(
+                    gaussian_envelope(
+                        s_g.numpy(), a_r.numpy(), b_r.numpy(), self.sigma_excitation
+                    ),
+                    dtype=torch.float64,
+                )
             amp = amp * (s_g.abs() < a_r + b_r + delta * 4)
         else:
             amp = torch.exp(-(s_g**2) / (2 * self.sigma_excitation**2))
@@ -867,12 +873,12 @@ class OrientationMap(AutoSerialize):
             from quantem.diffraction.illumination import (
                 excitation_amplitudes,
                 gaussian_envelope,
-                gaussian_envelope_ring_series,
+                gaussian_envelope_ring_torch,
             )
 
             a_r, b_r = excitation_amplitudes(g_rows, self.energy_ev, prec_ill, conv_ill)
             if conv_ill <= 0:
-                return gaussian_envelope_ring_series(S, a_r[:, None, None], sigma_env)
+                return gaussian_envelope_ring_torch(S, a_r[:, None, None], sigma_env)
             return torch.as_tensor(
                 gaussian_envelope(
                     S.numpy(), a_r[:, None, None].numpy(), b_r[:, None, None].numpy(), sigma_env
@@ -1121,12 +1127,12 @@ class OrientationMap(AutoSerialize):
             from quantem.diffraction.illumination import (
                 excitation_amplitudes,
                 gaussian_envelope,
-                gaussian_envelope_ring_series,
+                gaussian_envelope_ring_torch,
             )
 
             a_r, b_r = excitation_amplitudes(g_rows, self.energy_ev, prec_ill, conv_ill)
             if conv_ill <= 0:
-                return gaussian_envelope_ring_series(S, a_r[:, None, None], sigma_env)
+                return gaussian_envelope_ring_torch(S, a_r[:, None, None], sigma_env)
             return torch.as_tensor(
                 gaussian_envelope(
                     S.numpy(), a_r[:, None, None].numpy(), b_r[:, None, None].numpy(), sigma_env

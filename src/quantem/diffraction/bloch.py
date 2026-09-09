@@ -2131,9 +2131,10 @@ def _fit_deformation(sq, qxy, w_exp, delta):
 def refine_dynamical(
     phase_map,
     thicknesses_A: np.ndarray | None = None,
-    tilt_stages=((0.3, 0.05), (0.06, 0.01)),
+    tilt_stages=((0.3, 0.1), (0.1, 0.025), (0.03, 0.006)),
     precession_deg: float | None = None,
     n_precession: int = 32,
+    n_precession_search: int | None = None,
     semiconv_mrad: float | None = None,
     n_disk_radial: int = 4,
     n_disk_azimuthal: int = 16,
@@ -2149,7 +2150,10 @@ def refine_dynamical(
     fast_absorption: bool = True,
     update_orientations: bool = True,
     require_phase_weight: bool = True,
-    ring_method: str = "quadrature",
+    warm_start: bool = True,
+    neighbor_rescue: bool = True,
+    rescue_thickness_A: float = 100.0,
+    rescue_tilt_deg: float = 0.05,
     progress_bar: bool = True,
 ) -> dict:
     """Dynamical refinement on the Bragg vectors: orientation, thickness,
@@ -2172,9 +2176,15 @@ def refine_dynamical(
     The intensities are far more tilt-sensitive than the positions: at
     500 A the rocking curve width is ~2e-3 1/A, so a 0.05 degree tilt
     error is already visible in the weak beams. The default stages search
-    +-0.3 degrees at 0.05 and then +-0.06 at 0.01 degrees, 338 trial
-    orientations per candidate, and should start from orientations
-    refined by refine_orientations().
+    +-0.3 degrees at 0.1, +-0.1 at 0.025 and +-0.03 at 0.006 degrees, 251
+    trial orientations per candidate, and should start from orientations
+    refined by refine_orientations(). The compute goes into the Bloch
+    eigensolves, one per trial orientation, illumination node and
+    candidate; the search stages use fewer precession nodes and the
+    first-order absorption, and the reported solution is then evaluated
+    once with the full node count and the exact absorption, so the stored
+    cost, thickness and orientation are at full accuracy while the search
+    costs a fraction of a full-accuracy grid.
 
     Parameters left as None inherit from the previous stages: the
     pairing distance, intensity power, weak-beam cut and peak minimum from
@@ -2194,10 +2204,15 @@ def refine_dynamical(
         Successive tilt grids, each centered on the previous optimum.
     precession_deg, n_precession : float | None, int
         Precession semi-angle (inherited from the OrientationMap) and the
-        number of azimuthal samples on the ring. Uniform sampling is the
-        Gauss-Chebyshev quadrature of the ring integral; the rocking
-        curves oscillate at pi t rho k0 g along the ring, so 32 or more
-        samples are needed at 500 A and 0.5 degrees.
+        number of azimuthal samples on the ring for the last stage and the
+        final evaluation. Uniform sampling is the Gauss-Chebyshev
+        quadrature of the ring integral; the rocking curves oscillate at
+        pi t rho k0 g along the ring, so 32 or more samples are needed at
+        500 A and 0.5 degrees.
+    n_precession_search : int | None
+        Ring samples for the search stages before the last one; defaults
+        to half of n_precession (at least 8). The coarse stages only have
+        to find the basin, which the reduced sampling does.
     semiconv_mrad : float | None
         Convergence semiangle (inherited); the intensities are averaged
         over the disk with n_disk_radial Gauss-Legendre radii times
@@ -2217,24 +2232,30 @@ def refine_dynamical(
     mask : np.ndarray | None
         (R, C) boolean; only these positions are refined.
     fast_absorption : bool, default=True
-        First-order treatment of absorption (Hermitian eigh, ~4x faster,
-        0.5% rms intensity error); the tilt and thickness are never
-        treated perturbatively.
+        First-order treatment of absorption during the search (Hermitian
+        eigh, ~4x faster, 0.5% rms intensity error); the final evaluation
+        of the reported solution always uses the exact complex absorption.
+        The tilt and thickness are never treated perturbatively.
     update_orientations : bool, default=True
         Write the refined quaternions back into the OrientationMaps.
     require_phase_weight : bool, default=True
         Refine only candidates that carried weight in the kinematical
         phase fit; False refines every matched candidate, so the dynamical
         pass can rescue a candidate the kinematical model rejected.
-    ring_method : {"quadrature", "fourier"}
-        How the precession ring is integrated: azimuthal quadrature
-        (n_precession nodes, the production path), or the exact harmonic
-        propagation of average_bloch_fourier() with the crystal rotated to
-        every trial orientation, so each ring is centered and the form is
-        exact. The quadrature with 48 nodes reproduces the exact result to
-        1e-15 (silicon, 0.4 degrees, 600 A) at 30-50x lower cost (43 beams,
-        169 trials, 78 thicknesses: 3-10 s against 160 s), so the harmonic
-        path is a reference, not the production setting.
+    warm_start : bool, default=True
+        Start each position from the refined orientation of an already
+        refined neighbor (above or to the left, same candidate) and skip
+        the coarsest stage. Neighbors within one grain share their
+        orientation to well inside the fine stages, so this removes about
+        half of the eigensolves; the in-plane deformation and rotation are
+        still fit from the position's own peaks, and the final evaluation
+        is unchanged.
+    neighbor_rescue : bool, default=True
+        Second pass: positions whose winning solution differs from a
+        4-neighbor of the same crystal by more than rescue_thickness_A or
+        rescue_tilt_deg are refined again from that neighbor's solution,
+        and the lower cost is kept. Repairs isolated wrong basins
+        (thickness aliases, tilt minima at a grid edge).
 
     Returns
     -------
@@ -2247,10 +2268,11 @@ def refine_dynamical(
     'cost' is the gain of the tilt search; a small gain means the
     intensities do not constrain the tilt), 'quats_base' (R, C, F, 4) the
     matched orientation with the in-plane rotation folded in, from which
-    'tilt_deg' leads to 'quats', 'phase_index' (R, C),
+    'tilt_deg' leads to 'quats', 'warm_started' (R, C, F) and 'rescued'
+    (R, C) flags, 'phase_index' (R, C),
     'candidate' (R, C), 'thickness_per_candidate' (R, C, F).
     """
-    from quantem.diffraction.rotations import qmult, quat_from_axis_angle
+    from quantem.diffraction.rotations import misorientation_angle_deg, qmult, quat_from_axis_angle
 
     if thicknesses_A is None:
         thicknesses_A = np.arange(50.0, 2000.0, 25.0)
@@ -2270,11 +2292,14 @@ def refine_dynamical(
     )
     precession_deg = float(resolve(precession_deg, "precession_deg", om_md, default=0.0))
     semiconv_mrad = float(resolve(semiconv_mrad, "semiconv_mrad", om_md, default=0.0))
+    if n_precession_search is None:
+        n_precession_search = max(8, n_precession // 2)
     used = dict(
         thicknesses_A=np.asarray(thicknesses_A, dtype=float).tolist(),
         tilt_stages=[tuple(float(v) for v in st) for st in tilt_stages],
         precession_deg=precession_deg,
         n_precession=int(n_precession),
+        n_precession_search=int(n_precession_search),
         semiconv_mrad=semiconv_mrad,
         n_disk_radial=int(n_disk_radial),
         n_disk_azimuthal=int(n_disk_azimuthal),
@@ -2288,7 +2313,10 @@ def refine_dynamical(
         min_number_peaks=int(min_number_peaks),
         fast_absorption=bool(fast_absorption),
         require_phase_weight=bool(require_phase_weight),
-        ring_method=str(ring_method),
+        warm_start=bool(warm_start),
+        neighbor_rescue=bool(neighbor_rescue),
+        rescue_thickness_A=float(rescue_thickness_A),
+        rescue_tilt_deg=float(rescue_tilt_deg),
     )
     if hasattr(phase_map, "metadata"):
         phase_map.metadata["dynamical"] = used
@@ -2314,6 +2342,16 @@ def refine_dynamical(
     )  # (Mr, 2), (Mr,)
     Mr = ring.shape[0]
     alpha_ill = float(torch.linalg.norm(ring, dim=1).max()) / k0
+    ring_s, w_ring_s = illumination_nodes(
+        energy_ev,
+        precession_deg,
+        n_precession_search,
+        semiconv_mrad,
+        n_disk_radial,
+        n_disk_azimuthal,
+        maped_tilts_deg=maped_tilts_deg,
+    )
+    Mr_s = ring_s.shape[0]
 
     def stage_grid(center, half, step):
         n = int(round(2 * half / step)) + 1
@@ -2332,6 +2370,169 @@ def refine_dynamical(
     deform_out = torch.zeros((R, C, F, 2, 2), dtype=torch.float64)
     deform_out[..., 0, 0] = 1.0
     deform_out[..., 1, 1] = 1.0
+    warm_out = torch.zeros((R, C, F), dtype=torch.bool)
+    rescued_out = torch.zeros((R, C), dtype=torch.bool)
+
+    def refine_from(crystal, q_start, qxy, im, w_exp, stages):
+        """Search from q_start: in-plane deformation and rotation from the
+        positions, one beam list, the tilt stages, and the exact final
+        evaluation. Returns None or a dict with the solution."""
+        q0 = q_start
+        S = None
+        deform3 = None
+        if refine_deformation:
+            # in-plane deformation and rotation from the positions first:
+            # the rotation is folded into the orientation and the
+            # symmetric deformation applied to the tilted cell, so the
+            # intensity search below sees the strained lattice and a
+            # pairing free of position residuals
+            g0 = qrotate(q0, crystal.g_vec)
+            near = (
+                torch.abs((2 * g0[:, 2] - lam * (g0**2).sum(1)) / (2 - 2 * lam * g0[:, 2]))
+                < sg_max
+            )
+            S, wz, _ = _fit_deformation(g0[near, :2], qxy, w_exp, delta)
+            if S is not None:
+                half_z = torch.tensor(wz / 2, dtype=torch.float64)
+                dqz = torch.stack(
+                    [torch.cos(half_z), torch.zeros(()), torch.zeros(()), torch.sin(half_z)]
+                ).to(torch.float64)
+                q0 = qmult(dqz, q0)
+                deform3 = torch.eye(3, dtype=torch.float64)
+                deform3[:2, :2] = S
+        # one beam list for the whole search of this candidate: every
+        # trial center, the illumination and the deformation are inside
+        # its selection, so all stages compare the same truncated system
+        beam_list = select_dynamical_beams(
+            crystal,
+            q0,
+            energy_ev,
+            np.deg2rad(stages[0][0]) * np.sqrt(2) + alpha_ill,
+            sg_max,
+            k_max,
+            deform3,
+        )
+        if beam_list.shape[0] < 2:
+            return None
+        center = torch.zeros(2, dtype=torch.float64)
+        best = None
+        cost0 = float("nan")
+        n_stages = len(stages)
+        for i_stage, (half, step) in enumerate(stages):
+            half = np.deg2rad(half)
+            step = np.deg2rad(step)
+            w_grid, n, tg = stage_grid(center, half, step)
+            Mt = w_grid.shape[0]
+            last = i_stage == n_stages - 1
+            nodes, w_nodes, M_nodes = (ring, w_ring, Mr) if last else (ring_s, w_ring_s, Mr_s)
+            # crystal tilt (wx, wy) about the in-plane axes shifts s_g by
+            # wx g_y - wy g_x; the same excitation errors come from a beam
+            # tilt k0 (wy, -wx) in the fixed-normal Bloch geometry, so every
+            # trial orientation is a full re-solve of the Bloch problem
+            # with the coupling matrix shared
+            trial = k0 * torch.stack([w_grid[:, 1], -w_grid[:, 0]], dim=1)
+            tilts = (trial[:, None, :] + nodes[None, :, :]).reshape(-1, 2)
+            inten, g_xy, _ = _cbed_amplitudes(
+                crystal,
+                q0,
+                tilts,
+                t_grid,
+                energy_ev,
+                sg_max,
+                k_max,
+                tilt_batch=max(64, M_nodes * 8),
+                progress_bar=False,
+                fast_absorption=fast_absorption,
+                deform=deform3,
+                beams=beam_list,
+            )
+            inten = (inten.reshape(Mt, M_nodes, T, -1) * w_nodes[None, :, None, None]).sum(dim=1)
+            sq = g_xy[1:]
+            if sq.shape[0] == 0:
+                break
+            cost, pair, j_min, d_min = _dynamical_cost(
+                inten[:, :, 1:], sq, qxy, im, delta, power_intensity, min_sim_intensity_rel
+            )
+            if cost is None:
+                break
+            flat = int(cost.argmin())
+            m_best, t_best = flat // T, flat % T
+            i_b, j_b = m_best // n, m_best % n
+            if i_stage == 0:
+                # untilted reference: the best thickness at the start
+                # orientation, for the gain the tilt search achieves
+                m0 = int(((w_grid**2).sum(1)).argmin())
+                cost0 = float(cost[m0].min())
+            cost_t = cost[:, t_best].reshape(n, n)
+            wx, wy = float(w_grid[m_best, 0]), float(w_grid[m_best, 1])
+            if 0 < i_b < n - 1:
+                c0, c1, c2 = cost_t[i_b - 1, j_b], cost_t[i_b, j_b], cost_t[i_b + 1, j_b]
+                den = float(c0 - 2 * c1 + c2)
+                if den > 1e-12:
+                    wx += 0.5 * float(c0 - c2) / den * step
+            if 0 < j_b < n - 1:
+                c0, c1, c2 = cost_t[i_b, j_b - 1], cost_t[i_b, j_b], cost_t[i_b, j_b + 1]
+                den = float(c0 - 2 * c1 + c2)
+                if den > 1e-12:
+                    wy += 0.5 * float(c0 - c2) / den * step
+            center = torch.tensor([wx, wy], dtype=torch.float64)
+            best = (float(cost[m_best, t_best]), float(t_grid[t_best]), wx, wy)
+        if best is None:
+            return None
+        c_best, t_fit, wx, wy = best
+        q = q0
+        ang = float(np.hypot(wx, wy))
+        if ang > 1e-12:
+            axis = torch.tensor([wx / ang, wy / ang, 0.0], dtype=torch.float64)
+            q = qmult(quat_from_axis_angle(axis, torch.tensor(ang, dtype=torch.float64)), q0)
+        # the reported solution is the crystal rotated by the interpolated
+        # tilt with the beam along the foil normal: evaluate that model once
+        # more, with the full illumination and the exact absorption, so the
+        # stored cost and thickness belong to the stored orientation at full
+        # accuracy (the beam-offset search geometry is paraxially, not
+        # exactly, equivalent to it)
+        inten, g_xy, _ = _cbed_amplitudes(
+            crystal,
+            q,
+            ring,
+            t_grid,
+            energy_ev,
+            sg_max,
+            k_max,
+            tilt_batch=max(64, Mr * 8),
+            progress_bar=False,
+            fast_absorption=False,
+            deform=deform3,
+            beams=beam_list,
+        )
+        inten = (inten * w_ring[:, None, None]).sum(dim=0, keepdim=True)
+        cost, _, _, _ = _dynamical_cost(
+            inten[:, :, 1:], g_xy[1:], qxy, im, delta, power_intensity, min_sim_intensity_rel
+        )
+        if cost is not None:
+            t_best = int(cost[0].argmin())
+            c_best, t_fit = float(cost[0, t_best]), float(t_grid[t_best])
+        return dict(cost=c_best, t=t_fit, wx=wx, wy=wy, q=q, q0=q0, S=S, cost0=cost0)
+
+    def store(rx, ry, f, sol):
+        cost_out[rx, ry, f] = sol["cost"]
+        thick_out[rx, ry, f] = sol["t"]
+        tilt_out[rx, ry, f, 0] = sol["wx"]
+        tilt_out[rx, ry, f, 1] = sol["wy"]
+        quat_base[rx, ry, f] = sol["q0"]
+        quat_out[rx, ry, f] = sol["q"]
+        if sol["S"] is not None:
+            deform_out[rx, ry, f] = sol["S"]
+        if np.isfinite(sol["cost0"]):
+            cost0_out[rx, ry, f] = sol["cost0"]
+
+    def peaks_at(rx, ry):
+        data = peaks[rx, ry].array
+        if data.shape[0] < min_number_peaks:
+            return None
+        qxy = torch.as_tensor(data[:, ix[:2]], dtype=torch.float64)
+        im = torch.as_tensor(data[:, ix[2]], dtype=torch.float64).clamp_min(0) ** power_intensity
+        return qxy, im, im / im.max().clamp_min(1e-12)
 
     iterator = list(np.ndindex(R, C))
     if mask is not None:
@@ -2339,14 +2540,10 @@ def refine_dynamical(
     if progress_bar:
         iterator = tqdm(iterator, desc="dynamical refinement")
     for rx, ry in iterator:
-        data = peaks[rx, ry].array
-        if data.shape[0] < min_number_peaks:
+        pk = peaks_at(rx, ry)
+        if pk is None:
             continue
-        qxy = torch.as_tensor(data[:, ix[:2]], dtype=torch.float64)
-        im = torch.as_tensor(data[:, ix[2]], dtype=torch.float64).clamp_min(0)
-        im = im**power_intensity
-        w_exp = im / im.max().clamp_min(1e-12)
-
+        qxy, im, w_exp = pk
         for f, (i_om, m) in enumerate(cands):
             om = oms[i_om]
             if om.corr[rx, ry, m] <= 0:
@@ -2357,198 +2554,75 @@ def refine_dynamical(
                 and float(phase_map.phase_weights[rx, ry, f]) <= 0
             ):
                 continue
-            q0 = om.quats[rx, ry, m]
-            quat_out[rx, ry, f] = q0
-            S = None
-            deform3 = None
-            if refine_deformation:
-                # in-plane deformation and rotation from the positions first:
-                # the rotation is folded into the orientation and the
-                # symmetric deformation applied to the tilted cell, so the
-                # intensity search below sees the strained lattice and a
-                # pairing free of position residuals
-                g0 = qrotate(q0, om.crystal.g_vec)
-                near = (
-                    torch.abs((2 * g0[:, 2] - lam * (g0**2).sum(1)) / (2 - 2 * lam * g0[:, 2]))
-                    < sg_max
-                )
-                S, wz, _ = _fit_deformation(g0[near, :2], qxy, w_exp, delta)
-                if S is not None:
-                    half_z = torch.tensor(wz / 2, dtype=torch.float64)
-                    dqz = torch.stack(
-                        [torch.cos(half_z), torch.zeros(()), torch.zeros(()), torch.sin(half_z)]
-                    ).to(torch.float64)
-                    q0 = qmult(dqz, q0)
-                    deform3 = torch.eye(3, dtype=torch.float64)
-                    deform3[:2, :2] = S
-                    deform_out[rx, ry, f] = S
-            # one beam list for the whole search of this candidate: every
-            # trial center, the illumination and the deformation are inside
-            # its selection, so all stages compare the same truncated system
-            beam_list = select_dynamical_beams(
-                om.crystal,
-                q0,
-                energy_ev,
-                np.deg2rad(tilt_stages[0][0]) * np.sqrt(2) + alpha_ill,
-                sg_max,
-                k_max,
-                deform3,
-            )
-            if beam_list.shape[0] < 2:
-                continue
-            center = torch.zeros(2, dtype=torch.float64)
-            best = None
-            for half, step in tilt_stages:
-                half = np.deg2rad(half)
-                step = np.deg2rad(step)
-                w_grid, n, tg = stage_grid(center, half, step)
-                Mt = w_grid.shape[0]
-                # crystal tilt (wx, wy) about the in-plane axes shifts s_g by
-                # wx g_y - wy g_x; the same excitation errors come from a
-                # beam tilt k0 (wy, -wx) in the fixed-normal Bloch geometry,
-                # so every trial orientation is a full re-solve of the Bloch
-                # problem with the coupling matrix shared
-                trial = k0 * torch.stack([w_grid[:, 1], -w_grid[:, 0]], dim=1)
-                tilts = (trial[:, None, :] + ring[None, :, :]).reshape(-1, 2)
-                if ring_method == "fourier" and precession_deg > 0 and semiconv_mrad <= 0:
-                    # exact reference path: the crystal is rotated to every
-                    # trial orientation, so each precession ring is centered
-                    # and its three-coefficient harmonic form is exact; the
-                    # positions are those of the untilted orientation
-                    inten = []
-                    for wt in w_grid:
-                        angw = float(torch.linalg.norm(wt))
-                        q_t = q0
-                        if angw > 1e-12:
-                            q_t = qmult(
-                                quat_from_axis_angle(
-                                    torch.tensor(
-                                        [wt[0] / angw, wt[1] / angw, 0.0], dtype=torch.float64
-                                    ),
-                                    torch.tensor(angw, dtype=torch.float64),
-                                ),
-                                q0,
-                            )
-                        i_t, _ = average_bloch_fourier(
-                            om.crystal,
-                            q_t,
-                            torch.zeros((1, 2), dtype=torch.float64),
-                            t_grid,
-                            energy_ev,
-                            precession_deg,
-                            sg_max,
-                            k_max,
-                            deform=deform3,
-                            beams=beam_list,
-                        )
-                        inten.append(i_t[0])
-                    inten = torch.stack(inten)
-                    g_xy = torch.cat(
-                        [
-                            torch.zeros((1, 3), dtype=torch.float64),
-                            qrotate(q0, beam_list[1:].to(torch.float64) @ om.crystal.lat_recip)
-                            @ (
-                                deform3
-                                if deform3 is not None
-                                else torch.eye(3, dtype=torch.float64)
-                            ).T,
-                        ]
-                    )[:, :2]
-                else:
-                    inten, g_xy, _ = _cbed_amplitudes(
-                        om.crystal,
-                        q0,
-                        tilts,
-                        t_grid,
-                        energy_ev,
-                        sg_max,
-                        k_max,
-                        tilt_batch=max(64, Mr * 8),
-                        progress_bar=False,
-                        fast_absorption=fast_absorption,
-                        deform=deform3,
-                        beams=beam_list,
+            q_start = om.quats[rx, ry, m]
+            quat_out[rx, ry, f] = q_start
+            stages = tilt_stages
+            if warm_start and len(tilt_stages) > 1:
+                # an already refined neighbor of the same candidate (raster
+                # order: above or to the left) is a start inside the fine
+                # stages' reach; its solution costs one coarse stage less
+                for nr, nc in ((rx - 1, ry), (rx, ry - 1)):
+                    if nr < 0 or nc < 0 or not torch.isfinite(cost_out[nr, nc, f]):
+                        continue
+                    # same grain: the kinematically matched orientations of
+                    # the two positions agree within the coarse stage
+                    miso = float(
+                        misorientation_angle_deg(
+                            om.quats[rx, ry, m][None],
+                            om.quats[nr, nc, m][None],
+                            om.crystal.sym_quats,
+                        )[0]
                     )
-                    inten = (inten.reshape(Mt, Mr, T, -1) * w_ring[None, :, None, None]).sum(dim=1)
-                sq = g_xy[1:]
-                if sq.shape[0] == 0:
-                    break
-                cost, pair, j_min, d_min = _dynamical_cost(
-                    inten[:, :, 1:], sq, qxy, im, delta, power_intensity, min_sim_intensity_rel
-                )
-                if cost is None:
-                    break
-                flat = int(cost.argmin())
-                m_best, t_best = flat // T, flat % T
-                i_b, j_b = m_best // n, m_best % n
-                if half == np.deg2rad(tilt_stages[0][0]):
-                    # untilted reference: the best thickness at the matched
-                    # orientation, for the gain the tilt search achieves
-                    m0 = int(((w_grid**2).sum(1)).argmin())
-                    cost0_out[rx, ry, f] = float(cost[m0].min())
-                cost_t = cost[:, t_best].reshape(n, n)
-                wx, wy = float(w_grid[m_best, 0]), float(w_grid[m_best, 1])
-                if 0 < i_b < n - 1:
-                    c0, c1, c2 = cost_t[i_b - 1, j_b], cost_t[i_b, j_b], cost_t[i_b + 1, j_b]
-                    den = float(c0 - 2 * c1 + c2)
-                    if den > 1e-12:
-                        wx += 0.5 * float(c0 - c2) / den * step
-                if 0 < j_b < n - 1:
-                    c0, c1, c2 = cost_t[i_b, j_b - 1], cost_t[i_b, j_b], cost_t[i_b, j_b + 1]
-                    den = float(c0 - 2 * c1 + c2)
-                    if den > 1e-12:
-                        wy += 0.5 * float(c0 - c2) / den * step
-                center = torch.tensor([wx, wy], dtype=torch.float64)
-                best = (
-                    float(cost[m_best, t_best]),
-                    float(t_grid[t_best]),
-                    wx,
-                    wy,
-                    sq,
-                    pair,
-                    j_min,
-                    d_min,
-                )
-            if best is None:
+                    if miso < tilt_stages[0][0]:
+                        q_start = quat_out[nr, nc, f]
+                        stages = tilt_stages[1:]
+                        warm_out[rx, ry, f] = True
+                        break
+            sol = refine_from(om.crystal, q_start, qxy, im, w_exp, stages)
+            if sol is None:
                 continue
-            c_best, t_fit, wx, wy, sq, pair, j_min, d_min = best
-            q = q0
-            ang = float(np.hypot(wx, wy))
-            if ang > 1e-12:
-                axis = torch.tensor([wx / ang, wy / ang, 0.0], dtype=torch.float64)
-                q = qmult(quat_from_axis_angle(axis, torch.tensor(ang, dtype=torch.float64)), q0)
-            # the reported solution is the crystal rotated by the interpolated
-            # tilt with the beam along the foil normal: evaluate that model
-            # once more so the stored cost and thickness belong to the stored
-            # orientation (the beam-offset search geometry is paraxially, not
-            # exactly, equivalent to it)
-            inten, g_xy, _ = _cbed_amplitudes(
-                om.crystal,
-                q,
-                ring,
-                t_grid,
-                energy_ev,
-                sg_max,
-                k_max,
-                tilt_batch=max(64, Mr * 8),
-                progress_bar=False,
-                fast_absorption=fast_absorption,
-                deform=deform3,
-                beams=beam_list,
-            )
-            inten = (inten * w_ring[:, None, None]).sum(dim=0, keepdim=True)
-            cost, _, _, _ = _dynamical_cost(
-                inten[:, :, 1:], g_xy[1:], qxy, im, delta, power_intensity, min_sim_intensity_rel
-            )
-            if cost is not None:
-                t_best = int(cost[0].argmin())
-                c_best, t_fit = float(cost[0, t_best]), float(t_grid[t_best])
-            cost_out[rx, ry, f] = c_best
-            thick_out[rx, ry, f] = t_fit
-            tilt_out[rx, ry, f, 0] = wx
-            tilt_out[rx, ry, f, 1] = wy
-            quat_base[rx, ry, f] = q0
-            quat_out[rx, ry, f] = q
+            store(rx, ry, f, sol)
+
+    if neighbor_rescue and len(tilt_stages) > 1:
+        cost_f0 = torch.nan_to_num(cost_out, nan=torch.inf)
+        f_win = cost_f0.argmin(dim=-1)
+        done = torch.isfinite(cost_out).any(dim=-1)
+        rescue_list = []
+        for rx, ry in np.ndindex(R, C):
+            if not done[rx, ry]:
+                continue
+            f = int(f_win[rx, ry])
+            i_om = cands[f][0]
+            starts = []
+            for nr, nc in ((rx - 1, ry), (rx + 1, ry), (rx, ry - 1), (rx, ry + 1)):
+                if not (0 <= nr < R and 0 <= nc < C) or not done[nr, nc]:
+                    continue
+                fn = int(f_win[nr, nc])
+                if cands[fn][0] != i_om:
+                    continue
+                dt = abs(float(thick_out[nr, nc, fn]) - float(thick_out[rx, ry, f]))
+                dtilt = float(
+                    torch.rad2deg(torch.linalg.norm(tilt_out[nr, nc, fn] - tilt_out[rx, ry, f]))
+                )
+                if dt > rescue_thickness_A or dtilt > rescue_tilt_deg:
+                    starts.append((nr, nc, fn))
+            if starts:
+                rescue_list.append((rx, ry, f, starts))
+        it = tqdm(rescue_list, desc="neighbor rescue") if progress_bar else rescue_list
+        for rx, ry, f, starts in it:
+            pk = peaks_at(rx, ry)
+            if pk is None:
+                continue
+            qxy, im, w_exp = pk
+            crystal = oms[cands[f][0]].crystal
+            for nr, nc, fn in starts:
+                sol = refine_from(crystal, quat_out[nr, nc, fn], qxy, im, w_exp, tilt_stages[1:])
+                if sol is not None and sol["cost"] < float(cost_out[rx, ry, f]) - 1e-9:
+                    cost0_keep = float(cost0_out[rx, ry, f])
+                    store(rx, ry, f, sol)
+                    if np.isfinite(cost0_keep):
+                        cost0_out[rx, ry, f] = cost0_keep
+                    rescued_out[rx, ry] = True
 
     n_maps = len(oms)
     cost_f = torch.nan_to_num(cost_out, nan=torch.inf)
@@ -2575,11 +2649,95 @@ def refine_dynamical(
         "cost": cost_out,
         "cost_zero_tilt": cost0_out,
         "quats_base": quat_base,
+        "warm_started": warm_out,
+        "rescued": rescued_out,
         "phase_index": phase_index,
         "candidate": f_best,
         "thickness_per_candidate": thick_out,
         "metadata": used,
     }
+
+
+def dynamical_maps(result: dict, phase_map, crystal_index: int | None = None) -> dict:
+    """Maps of the winning candidate of a refine_dynamical() result.
+
+    Returns 'thickness' (A), 'tilt_deg' (magnitude of the tilt correction),
+    'gain' (cost at the start orientation minus the final cost), 'cost',
+    'phase_index', 'mask' (positions refined, and of the given crystal when
+    crystal_index is set), 'quats' (R, C, 4), 'deformation' (R, C, 2, 2)
+    and 'strain', the crystal-frame strain components of
+    strain_crystal_frame(); unrefined or masked positions are NaN.
+    """
+    cand = result["candidate"]
+    R, C = cand.shape
+    idx4 = cand[..., None, None]
+    quats = torch.gather(result["quats"], 2, idx4.expand(R, C, 1, 4)).squeeze(2)
+    deform = torch.gather(
+        result["deformation"], 2, cand[..., None, None, None].expand(R, C, 1, 2, 2)
+    ).squeeze(2)
+    cost = torch.gather(result["cost"], 2, cand[..., None]).squeeze(-1)
+    cost0 = torch.gather(result["cost_zero_tilt"], 2, cand[..., None]).squeeze(-1)
+    mask = torch.isfinite(cost)
+    if crystal_index is not None:
+        i_om = torch.tensor([c[0] for c in phase_map.candidates])
+        mask &= i_om[cand] == crystal_index
+    nan = torch.full((R, C), torch.nan, dtype=torch.float64)
+    strain = strain_crystal_frame(deform, quats)
+    out = {
+        "thickness": torch.where(mask, result["thickness"], nan),
+        "tilt_deg": torch.where(mask, torch.linalg.norm(result["tilt_deg"], dim=-1), nan),
+        "gain": torch.where(mask, cost0 - cost, nan),
+        "cost": torch.where(mask, cost, nan),
+        "phase_index": result["phase_index"],
+        "mask": mask,
+        "quats": quats,
+        "deformation": deform,
+        "strain": {k: torch.where(mask, v, nan) for k, v in strain.items() if k != "eps_crystal"},
+    }
+    return out
+
+
+def plot_dynamical_maps(
+    maps: dict,
+    scalebar=None,
+    thickness_range_A: tuple[float, float] = (0.0, 2000.0),
+    tilt_range_deg: tuple[float, float] = (0.0, 0.3),
+    gain_range: tuple[float, float] = (0.0, 0.05),
+    axsize: tuple[float, float] = (4.0, 4.0),
+):
+    """Thickness, tilt correction, gain of the tilt search and final cost
+    of a dynamical refinement, from dynamical_maps()."""
+    from quantem.core.visualization import show_2d
+
+    imgs = [
+        [np.nan_to_num(maps["thickness"].numpy()), np.nan_to_num(maps["tilt_deg"].numpy())],
+        [np.nan_to_num(maps["gain"].numpy()), np.nan_to_num(maps["cost"].numpy())],
+    ]
+    cmax = (
+        float(np.nanmax(maps["cost"].numpy())) if np.isfinite(maps["cost"].numpy()).any() else 1.0
+    )
+    return show_2d(
+        imgs,
+        title=[["thickness (A)", "tilt correction (deg)"], ["gain of the tilt search", "cost"]],
+        cmap=[["viridis", "magma"], ["magma", "gray_r"]],
+        cbar=True,
+        norm=[
+            [
+                {
+                    "interval_type": "manual",
+                    "vmin": thickness_range_A[0],
+                    "vmax": thickness_range_A[1],
+                },
+                {"interval_type": "manual", "vmin": tilt_range_deg[0], "vmax": tilt_range_deg[1]},
+            ],
+            [
+                {"interval_type": "manual", "vmin": gain_range[0], "vmax": gain_range[1]},
+                {"interval_type": "manual", "vmin": 0.0, "vmax": cmax},
+            ],
+        ],
+        scalebar=scalebar,
+        axsize=axsize,
+    )
 
 
 def strain_crystal_frame(deformation: torch.Tensor, quats: torch.Tensor) -> dict:

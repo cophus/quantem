@@ -723,7 +723,7 @@ def test_refine_dynamical_reported_cost_reproducible():
             energy_ev,
             0.06,
             1.0,
-            fast_absorption=True,
+            fast_absorption=False,
             deform=d3,
             beams=beams,
         )
@@ -831,6 +831,7 @@ def test_refine_dynamical_with_precession_and_convergence():
         thicknesses_A=np.arange(200, 700, 25.0),
         tilt_stages=((0.15, 0.05), (0.03, 0.01)),
         n_precession=12,
+        n_precession_search=12,
         n_disk_radial=2,
         n_disk_azimuthal=6,
         power_intensity=0.5,
@@ -845,3 +846,144 @@ def test_refine_dynamical_with_precession_and_convergence():
     t_err = np.abs(res["thickness"][0].numpy() - t_true.numpy())[valid]
     assert np.median(err) < 0.03
     assert (t_err <= 25).sum() >= valid.sum() - 1
+
+
+def _smooth_map_setup(n, tilt_start_deg, corrupt=None):
+    """A 1 x n 'map' of one grain: orientations a few hundredths of a degree
+    apart, thickness varying slowly, strained cell; starts tilted by
+    tilt_start_deg (and one position by `corrupt` degrees)."""
+    from quantem.core.datastructures.vector import Vector
+    from quantem.diffraction.orientation import OrientationMap
+    from quantem.diffraction.phase import PhaseMap
+    from quantem.diffraction.rotations import qmult, quat_from_axis_angle
+
+    energy_ev = 200e3
+    xtl = _si(absorptive=True)
+    torch.manual_seed(7)
+    rng = np.random.default_rng(7)
+    # a well-populated pattern: 1.5 degrees off the [110] zone axis
+    base = qmult(
+        quat_from_axis_angle(
+            torch.tensor([0.6, 0.8, 0.0], dtype=torch.float64),
+            torch.tensor(np.deg2rad(1.5), dtype=torch.float64),
+        ),
+        _zone_110(),
+    )
+    q_true = torch.stack(
+        [
+            qmult(
+                quat_from_axis_angle(
+                    torch.tensor([1.0, 0.3, 0.0], dtype=torch.float64) / np.hypot(1, 0.3),
+                    torch.tensor(np.deg2rad(0.03 * i), dtype=torch.float64),
+                ),
+                base,
+            )
+            for i in range(n)
+        ]
+    )
+    t_true = torch.tensor([400.0 + 25.0 * i for i in range(n)])
+    A_true = torch.tensor([[1.008, 0.002], [0.002, 0.996]], dtype=torch.float64)
+    deform3 = torch.eye(3, dtype=torch.float64)
+    deform3[:2, :2] = A_true
+    peaks = Vector.from_shape(
+        (1, n), fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t"
+    )
+    for i in range(n):
+        inten, g_xy, _ = bloch._cbed_amplitudes(
+            xtl,
+            q_true[i],
+            torch.zeros((1, 2), dtype=torch.float64),
+            t_true[i : i + 1],
+            energy_ev,
+            0.06,
+            1.0,
+            progress_bar=False,
+            deform=deform3,
+        )
+        inten_np = inten[0, 0, 1:].numpy()
+        keep = inten_np > 1e-3 * inten_np.max()
+        peaks[0, i] = np.column_stack([g_xy[1:].numpy()[keep], inten_np[keep]])
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=energy_ev)
+    om.build_plan(angle_step_zone_axis_deg=3.0, verbose=False)
+    om.match_orientations(progress_bar=False)
+    phis = rng.uniform(0, 2 * np.pi, n)
+    starts = []
+    for i, p in enumerate(phis):
+        ang = tilt_start_deg if (corrupt is None or i != corrupt[0]) else corrupt[1]
+        starts.append(
+            qmult(
+                quat_from_axis_angle(
+                    torch.tensor([np.cos(p), np.sin(p), 0.0], dtype=torch.float64),
+                    torch.tensor(np.deg2rad(ang), dtype=torch.float64),
+                ),
+                q_true[i],
+            )
+        )
+    om.quats[0, :, 0] = torch.stack(starts)
+    om.corr[0, :, 0] = 1.0
+    pm = PhaseMap.from_orientation_maps([om])
+    pm.fit(progress_bar=False)
+    return xtl, om, pm, q_true, t_true, A_true
+
+
+def test_refine_dynamical_warm_start_matches_cold():
+    from quantem.diffraction.rotations import misorientation_angle_deg
+
+    n = 5
+    kw = dict(
+        thicknesses_A=np.arange(300, 700, 25.0),
+        tilt_stages=((0.25, 0.05), (0.04, 0.01)),
+        power_intensity=0.5,
+        sg_max=0.06,
+        k_max=1.0,
+        neighbor_rescue=False,
+        progress_bar=False,
+    )
+    out = {}
+    for warm in (False, True):
+        xtl, om, pm, q_true, t_true, A_true = _smooth_map_setup(n, 0.1)
+        res = bloch.refine_dynamical(pm, warm_start=warm, **kw)
+        out[warm] = (res, om.quats[0, :, 0].clone(), q_true, t_true, xtl)
+    res_c, q_c, q_true, t_true, xtl = out[False]
+    res_w, q_w, _, _, _ = out[True]
+    assert not res_c["warm_started"].any()
+    assert res_w["warm_started"][0, 1:, 0].all() and not res_w["warm_started"][0, 0, 0]
+    # same solution from both routes, both correct
+    d = misorientation_angle_deg(q_c, q_w, xtl.sym_quats).numpy()
+    assert d.max() < 0.03
+    assert np.allclose(res_c["thickness"][0].numpy(), res_w["thickness"][0].numpy())
+    err = misorientation_angle_deg(q_true, q_w, xtl.sym_quats).numpy()
+    assert err.max() < 0.03
+    assert np.abs(res_w["thickness"][0].numpy() - t_true.numpy()).max() <= 25
+
+
+def test_refine_dynamical_neighbor_rescue():
+    from quantem.diffraction.rotations import misorientation_angle_deg
+
+    n = 5
+    # position 2 starts 0.45 degrees off: outside the coarse stage's reach,
+    # so its cold search settles in a wrong basin; its neighbors are right
+    xtl, om, pm, q_true, t_true, A_true = _smooth_map_setup(n, 0.1, corrupt=(2, 0.45))
+    kw = dict(
+        thicknesses_A=np.arange(300, 700, 25.0),
+        tilt_stages=((0.25, 0.05), (0.04, 0.01)),
+        power_intensity=0.5,
+        sg_max=0.06,
+        k_max=1.0,
+        warm_start=False,
+        progress_bar=False,
+    )
+    res = bloch.refine_dynamical(pm, neighbor_rescue=False, **kw)
+    err0 = misorientation_angle_deg(q_true, om.quats[0, :, 0], xtl.sym_quats).numpy()
+    assert err0[2] > 0.1  # the cold start fails there
+    xtl, om, pm, q_true, t_true, A_true = _smooth_map_setup(n, 0.1, corrupt=(2, 0.45))
+    res = bloch.refine_dynamical(pm, neighbor_rescue=True, **kw)
+    err1 = misorientation_angle_deg(q_true, om.quats[0, :, 0], xtl.sym_quats).numpy()
+    assert bool(res["rescued"][0, 2])
+    assert err1[2] < 0.03
+    assert abs(float(res["thickness"][0, 2]) - float(t_true[2])) <= 25
+    # map-level outputs
+    maps = bloch.dynamical_maps(res, pm, crystal_index=0)
+    assert maps["mask"][0].all()
+    assert set(maps["strain"]) == {"aa", "bb", "cc", "ab", "ac", "bc"}
+    assert torch.isfinite(maps["gain"][0]).all()
