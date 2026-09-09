@@ -34,9 +34,31 @@ export interface CrystalData {
   hexagonal: boolean;
 }
 
-export function parseCrystal(json: string): CrystalData | null {
+/** Relativistic electron wavelength (A) for a beam energy in eV. */
+export function electronWavelength(energyEv: number): number {
+  return 12.2643 / Math.sqrt(energyEv * (1 + 0.97845e-6 * energyEv));
+}
+
+/** Relativistic mass factor 1 + E / (m0 c^2). */
+export function relativisticGamma(energyEv: number): number {
+  return 1 + energyEv / 510998.95;
+}
+
+/**
+ * Parse the crystal data. With energyEv the stored couplings (computed at
+ * the data's energy) are rescaled by the ratio of relativistic mass factors
+ * and the wavelength is recomputed: exact for the elastic potential, an
+ * approximation for the absorptive part. Kinematical |F|^2 is unchanged.
+ */
+export function parseCrystal(json: string, energyEv?: number): CrystalData | null {
   if (!json || json === "{}") return null;
   const o = JSON.parse(json);
+  const scaleU = energyEv && Math.abs(energyEv - o.energy_ev) > 1 ? relativisticGamma(energyEv) / relativisticGamma(o.energy_ev) : 1;
+  if (scaleU !== 1) {
+    o.energy_ev = energyEv;
+    o.wavelength = electronWavelength(energyEv!);
+    o.u0_imag = o.u0_imag * scaleU;
+  }
   // reflection indices packed as int16 triplets; g rebuilt from the reciprocal cell
   const bin = atob(o.hkl_i16 || "");
   const bytes = new Uint8Array(bin.length);
@@ -54,6 +76,7 @@ export function parseCrystal(json: string): CrystalData | null {
     g[3 * i + 2] = h * B[0][2] + k * B[1][2] + l * B[2][2];
   }
   const U_re = decodeF32(o.U_re), U_im = decodeF32(o.U_im);
+  if (scaleU !== 1) for (let i = 0; i < U_re.length; i++) { U_re[i] *= scaleU; U_im[i] *= scaleU; }
   const couplingRe = new Map<string, number>();
   const couplingIm = new Map<string, number>();
   for (let i = 0; i < n; i++) {
@@ -249,6 +272,97 @@ export function kinematicalTilted(c: CrystalData, beams: Reflection[], tilt: [nu
     if (r.index < 0) { out[i] = 1; continue; }
     const s = tiltedExcitation(r, kz, tilt);
     out[i] = c.F2[r.index] * Math.exp(-(s * s) / (2 * sigma * sigma));
+  }
+  return out;
+}
+
+/**
+ * Incident-beam tilts (1/A) sampling a precession cone of half angle
+ * precDeg: n points evenly spaced on the ring of radius k0 sin(phi), the
+ * Gauss-Chebyshev quadrature of the azimuthal average. No precession
+ * returns the single untilted beam.
+ */
+export function precessionTilts(k0: number, precDeg: number, n: number): [number, number][] {
+  if (!(precDeg > 0) || n < 1) return [[0, 0]];
+  const r = k0 * Math.sin((precDeg * Math.PI) / 180);
+  const out: [number, number][] = [];
+  for (let i = 0; i < n; i++) {
+    const th = (2 * Math.PI * (i + 0.5)) / n;
+    out.push([r * Math.cos(th), r * Math.sin(th)]);
+  }
+  return out;
+}
+
+/**
+ * Hybrid nanobeam intensities averaged over incident tilts: Bloch
+ * intensities of the first nDyn beams from one solution per tilt, thin-slab
+ * intensities for the rest, mean over the tilts.
+ */
+export function averagedIntensities(
+  c: CrystalData, beams: Reflection[], nDyn: number, sols: (BlochSolution | null)[], tilts: [number, number][], thickness: number,
+): Float64Array {
+  const out = new Float64Array(beams.length);
+  const tmp = new Float64Array(beams.length);
+  for (let t = 0; t < tilts.length; t++) {
+    tmp.fill(0);
+    const sol = sols[t];
+    if (sol) tmp.set(blochIntensities(sol, thickness));
+    slabIntensities(c, beams, sol ? nDyn : 0, tilts[t], thickness, tmp);
+    for (let i = 0; i < beams.length; i++) out[i] += tmp[i] / tilts.length;
+  }
+  return out;
+}
+
+export interface NanobeamSolution {
+  beams: Reflection[]; // DIRECT + every reflection within kMax (draw list)
+  nodes: { tilt: [number, number]; sol: BlochSolution; pos: Int32Array }[]; // pos: position of each Bloch beam in beams
+  nDynMean: number;
+}
+
+/**
+ * Nanobeam pattern averaged over incident tilts (precession ring, or the
+ * single untilted beam). Each node selects its own Bloch set from the
+ * reflections within sgMax of ITS Ewald sphere (capped at maxBeams by
+ * |U_g| / |s_g|), so a 3 degree precession cone excites the right beams at
+ * every azimuth; every other reflection takes the thin-slab intensity.
+ */
+export function nanobeamSolve(c: CrystalData, q: Quat, kMax: number, sgMax: number, maxBeams: number, tilts: [number, number][]): NanobeamSolution {
+  const k0 = 1 / c.wavelength;
+  const all = labReflections(c, q, kMax);
+  const beams = [DIRECT, ...all];
+  const nodes: NanobeamSolution["nodes"] = [];
+  let nSum = 0;
+  for (const tilt of tilts) {
+    const kz = Math.sqrt(Math.max(k0 * k0 - tilt[0] ** 2 - tilt[1] ** 2, 1e-12));
+    const cand: { i: number; s: number; score: number }[] = [];
+    for (let i = 0; i < all.length; i++) {
+      const st = tiltedExcitation(all[i], kz, tilt);
+      if (Math.abs(st) < sgMax) {
+        const r = all[i];
+        cand.push({ i, s: st, score: Math.hypot(c.U_re[r.index], c.U_im[r.index]) / (Math.abs(st) + 1e-4) });
+      }
+    }
+    if (cand.length > maxBeams) { cand.sort((a, b) => b.score - a.score); cand.length = maxBeams; }
+    const dyn = [DIRECT, ...cand.map((x) => all[x.i])];
+    const pos = new Int32Array(dyn.length);
+    pos[0] = 0;
+    cand.forEach((x, j) => { pos[j + 1] = x.i + 1; });
+    nodes.push({ tilt, sol: blochSolve(c, dyn, tilt), pos });
+    nSum += cand.length;
+  }
+  return { beams, nodes, nDynMean: nSum / Math.max(1, tilts.length) };
+}
+
+/** Intensities of a NanobeamSolution at a thickness (A): mean over the nodes. */
+export function nanobeamIntensities(c: CrystalData, ns: NanobeamSolution, thickness: number): Float64Array {
+  const out = new Float64Array(ns.beams.length);
+  const tmp = new Float64Array(ns.beams.length);
+  for (const node of ns.nodes) {
+    slabIntensities(c, ns.beams, 1, node.tilt, thickness, tmp); // every diffracted beam, then overwrite the Bloch ones
+    tmp[0] = 0;
+    const bi = blochIntensities(node.sol, thickness);
+    for (let j = 0; j < node.pos.length; j++) tmp[node.pos[j]] = bi[j];
+    for (let i = 0; i < out.length; i++) out[i] += tmp[i] / ns.nodes.length;
   }
   return out;
 }

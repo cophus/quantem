@@ -90,11 +90,51 @@ export function directionIndices(cell: number[][], d: Vec3, maxMult = 8): [numbe
     const w = v.map((x) => x * mult);
     if (w.every((x) => Math.abs(x - Math.round(x)) < 0.02)) {
       const ints = w.map((x) => Math.round(x)) as [number, number, number];
+      // accept only if the integer direction is within 0.3 degrees of d
+      const c = cell;
+      const v: Vec3 = [
+        ints[0] * c[0][0] + ints[1] * c[1][0] + ints[2] * c[2][0],
+        ints[0] * c[0][1] + ints[1] * c[1][1] + ints[2] * c[2][1],
+        ints[0] * c[0][2] + ints[1] * c[1][2] + ints[2] * c[2][2],
+      ];
+      const cosang = (v[0] * d[0] + v[1] * d[1] + v[2] * d[2]) / ((Math.hypot(...v) * Math.hypot(...d)) || 1);
+      if (Math.abs(cosang) < Math.cos((0.3 * Math.PI) / 180)) return null;
       const g = gcd3(ints);
       return ints.map((x) => x / g) as [number, number, number];
     }
   }
   return null;
+}
+
+/** Miller-Bravais direction [u v t w] -> three-index [U V W] = [2u+v, u+2v, w]. */
+export function fourToThree(v: number[]): [number, number, number] {
+  const [u, vv, , w] = v;
+  return [2 * u + vv, u + 2 * vv, w];
+}
+
+/** Three-index direction [U V W] of a hexagonal cell -> smallest integer [u v t w]. */
+export function threeToFour(d: [number, number, number]): [number, number, number, number] {
+  const [U, V, W] = d;
+  // u = (2U - V)/3, v = (2V - U)/3, t = -(u + v): scale by 3 and reduce
+  const ints = [2 * U - V, 2 * V - U, -(U + V), 3 * W];
+  const g = Math.max(1, ints.reduce((a, b) => gcd(a, b), 0));
+  return ints.map((x) => x / g) as [number, number, number, number];
+}
+
+/** Parse "1 1 0", "110", "1,-1,0", "[1-10]" or a 4-index "0001" / "1 0 -1 0"; 4 indices are Miller-Bravais. */
+export function parseDirection(text: string): [number, number, number] | null {
+  const t = text.trim().replace(/[\[\]()]/g, "");
+  let parts: string[];
+  if (/[\s,]/.test(t)) parts = t.split(/[\s,]+/).filter(Boolean);
+  else parts = t.match(/-?\d/g) || [];
+  if (parts.length !== 3 && parts.length !== 4) return null;
+  const v = parts.map(Number);
+  if (v.some((x) => !isFinite(x)) || v.every((x) => x === 0)) return null;
+  if (v.length === 4) {
+    if (Math.abs(v[0] + v[1] + v[2]) > 1e-9) return null; // u + v + t must vanish
+    return fourToThree(v);
+  }
+  return v as [number, number, number];
 }
 
 function gcd(a: number, b: number): number {

@@ -2154,6 +2154,7 @@ def refine_dynamical(
     neighbor_rescue: bool = True,
     rescue_thickness_A: float = 100.0,
     rescue_tilt_deg: float = 0.05,
+    rescue_max_starts: int = 2,
     progress_bar: bool = True,
 ) -> dict:
     """Dynamical refinement on the Bragg vectors: orientation, thickness,
@@ -2250,6 +2251,9 @@ def refine_dynamical(
         half of the eigensolves; the in-plane deformation and rotation are
         still fit from the position's own peaks, and the final evaluation
         is unchanged.
+    rescue_max_starts : int, default=2
+        Neighbor solutions tried per rescued position, lowest cost first,
+        skipping neighbors whose solution repeats one already tried.
     neighbor_rescue : bool, default=True
         Second pass: positions whose winning solution differs from a
         4-neighbor of the same crystal by more than rescue_thickness_A or
@@ -2317,6 +2321,7 @@ def refine_dynamical(
         neighbor_rescue=bool(neighbor_rescue),
         rescue_thickness_A=float(rescue_thickness_A),
         rescue_tilt_deg=float(rescue_tilt_deg),
+        rescue_max_starts=int(rescue_max_starts),
     )
     if hasattr(phase_map, "metadata"):
         phase_map.metadata["dynamical"] = used
@@ -2363,6 +2368,7 @@ def refine_dynamical(
     cost_out = torch.full((R, C, F), torch.nan, dtype=torch.float64)
     cost0_out = torch.full((R, C, F), torch.nan, dtype=torch.float64)
     thick_out = torch.full((R, C, F), torch.nan, dtype=torch.float64)
+    tcontrast_out = torch.full((R, C, F), torch.nan, dtype=torch.float64)
     tilt_out = torch.zeros((R, C, F, 2), dtype=torch.float64)
     quat_out = torch.zeros((R, C, F, 4), dtype=torch.float64)
     quat_out[..., 0] = 1.0
@@ -2509,14 +2515,22 @@ def refine_dynamical(
         cost, _, _, _ = _dynamical_cost(
             inten[:, :, 1:], g_xy[1:], qxy, im, delta, power_intensity, min_sim_intensity_rel
         )
+        t_contrast = float("nan")
         if cost is not None:
             t_best = int(cost[0].argmin())
             c_best, t_fit = float(cost[0, t_best]), float(t_grid[t_best])
-        return dict(cost=c_best, t=t_fit, wx=wx, wy=wy, q=q, q0=q0, S=S, cost0=cost0)
+            # how much the cost varies over the thickness grid at this
+            # orientation: a flat curve means the thickness is not
+            # determined by these intensities (precession, few beams)
+            t_contrast = float(cost[0].max() - cost[0].min())
+        return dict(
+            cost=c_best, t=t_fit, wx=wx, wy=wy, q=q, q0=q0, S=S, cost0=cost0, t_contrast=t_contrast
+        )
 
     def store(rx, ry, f, sol):
         cost_out[rx, ry, f] = sol["cost"]
         thick_out[rx, ry, f] = sol["t"]
+        tcontrast_out[rx, ry, f] = sol.get("t_contrast", float("nan"))
         tilt_out[rx, ry, f, 0] = sol["wx"]
         tilt_out[rx, ry, f, 1] = sol["wy"]
         quat_base[rx, ry, f] = sol["q0"]
@@ -2605,9 +2619,33 @@ def refine_dynamical(
                     torch.rad2deg(torch.linalg.norm(tilt_out[nr, nc, fn] - tilt_out[rx, ry, f]))
                 )
                 if dt > rescue_thickness_A or dtilt > rescue_tilt_deg:
-                    starts.append((nr, nc, fn))
+                    starts.append((float(cost_out[nr, nc, fn]), nr, nc, fn))
             if starts:
-                rescue_list.append((rx, ry, f, starts))
+                # lowest-cost neighbors first, one start per distinct
+                # solution, at most rescue_max_starts (each start is a full
+                # fine-stage search)
+                starts.sort(key=lambda x: x[0])
+                kept: list = []
+                for c_n, nr, nc, fn in starts:
+                    dup = False
+                    for _, kr, kc, kf in kept:
+                        if (
+                            abs(float(thick_out[nr, nc, fn]) - float(thick_out[kr, kc, kf]))
+                            <= rescue_thickness_A
+                            and float(
+                                torch.rad2deg(
+                                    torch.linalg.norm(tilt_out[nr, nc, fn] - tilt_out[kr, kc, kf])
+                                )
+                            )
+                            <= rescue_tilt_deg
+                        ):
+                            dup = True
+                            break
+                    if not dup:
+                        kept.append((c_n, nr, nc, fn))
+                    if len(kept) >= max(1, rescue_max_starts):
+                        break
+                rescue_list.append((rx, ry, f, [(nr, nc, fn) for _, nr, nc, fn in kept]))
         it = tqdm(rescue_list, desc="neighbor rescue") if progress_bar else rescue_list
         for rx, ry, f, starts in it:
             pk = peaks_at(rx, ry)
@@ -2632,6 +2670,7 @@ def refine_dynamical(
     phase_index = cost_phase.argmin(dim=-1)
     f_best = cost_f.argmin(dim=-1)
     thickness = torch.gather(thick_out, 2, f_best[..., None]).squeeze(-1)
+    thickness_contrast = torch.gather(tcontrast_out, 2, f_best[..., None]).squeeze(-1)
     tilt_deg = torch.rad2deg(
         torch.gather(tilt_out, 2, f_best[..., None, None].expand(R, C, 1, 2)).squeeze(2)
     )
@@ -2643,6 +2682,7 @@ def refine_dynamical(
 
     return {
         "thickness": thickness,
+        "thickness_contrast": thickness_contrast,
         "tilt_deg": tilt_deg,
         "quats": quat_out,
         "deformation": deform_out,
@@ -2658,15 +2698,24 @@ def refine_dynamical(
     }
 
 
-def dynamical_maps(result: dict, phase_map, crystal_index: int | None = None) -> dict:
+def dynamical_maps(
+    result: dict,
+    phase_map,
+    crystal_index: int | None = None,
+    min_thickness_contrast: float = 0.02,
+) -> dict:
     """Maps of the winning candidate of a refine_dynamical() result.
 
     Returns 'thickness' (A), 'tilt_deg' (magnitude of the tilt correction),
     'gain' (cost at the start orientation minus the final cost), 'cost',
     'phase_index', 'mask' (positions refined, and of the given crystal when
     crystal_index is set), 'quats' (R, C, 4), 'deformation' (R, C, 2, 2)
-    and 'strain', the crystal-frame strain components of
-    strain_crystal_frame(); unrefined or masked positions are NaN.
+    'thickness_contrast' (range of the cost over the thickness grid at the
+    refined orientation) and 'strain', the crystal-frame strain components
+    of strain_crystal_frame(); unrefined or masked positions are NaN. The
+    thickness is NaN where the contrast is below min_thickness_contrast:
+    a flat cost curve, typical of precessed data with few beams, does not
+    determine the thickness and the grid minimum there is not a measurement.
     """
     cand = result["candidate"]
     R, C = cand.shape
@@ -2677,6 +2726,9 @@ def dynamical_maps(result: dict, phase_map, crystal_index: int | None = None) ->
     ).squeeze(2)
     cost = torch.gather(result["cost"], 2, cand[..., None]).squeeze(-1)
     cost0 = torch.gather(result["cost_zero_tilt"], 2, cand[..., None]).squeeze(-1)
+    tcon = result.get("thickness_contrast")
+    if tcon is None:
+        tcon = torch.full_like(cost, torch.nan)
     mask = torch.isfinite(cost)
     if crystal_index is not None:
         i_om = torch.tensor([c[0] for c in phase_map.candidates])
@@ -2684,9 +2736,12 @@ def dynamical_maps(result: dict, phase_map, crystal_index: int | None = None) ->
     nan = torch.full((R, C), torch.nan, dtype=torch.float64)
     strain = strain_crystal_frame(deform, quats)
     out = {
-        "thickness": torch.where(mask, result["thickness"], nan),
+        "thickness": torch.where(
+            mask & ~(tcon < min_thickness_contrast), result["thickness"], nan
+        ),
         "tilt_deg": torch.where(mask, torch.linalg.norm(result["tilt_deg"], dim=-1), nan),
         "gain": torch.where(mask, cost0 - cost, nan),
+        "thickness_contrast": torch.where(mask, tcon, nan),
         "cost": torch.where(mask, cost, nan),
         "phase_index": result["phase_index"],
         "mask": mask,

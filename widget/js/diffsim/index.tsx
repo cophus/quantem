@@ -23,15 +23,15 @@ import Tooltip from "@mui/material/Tooltip";
 import { useTheme } from "../theme";
 import { COLORMAP_NAMES } from "../colormaps";
 import { downloadBlob } from "../format";
-import { Quat, Vec3, directionIndices, matTVec, qmult, qnormalize, quatFromAxisAngle, quatFromZoneAxis, quatToMatrix } from "./math";
+import { Quat, Vec3, directionIndices, matTVec, parseDirection, qmult, qnormalize, quatFromAxisAngle, quatFromZoneAxis, quatToMatrix, threeToFour } from "./math";
 import {
   Reflection, blochIntensities, blochSolve, kinematicalTilted, kosselLines, kosselLookup, labReflections,
-  parseCrystal, parseKossel, hybridBeams, slabIntensities,
+  nanobeamIntensities, nanobeamSolve, parseCrystal, parseKossel, hybridBeams, precessionTilts, slabIntensities,
 } from "./physics";
 import { cellGeometry, drawCell } from "./crystal3d";
 import {
-  Frame, cbedImage, drawImage, drawKikuchiOverlay, drawKosselLines, drawMarkers, histogramBins, nanobeamImage,
-  setupCanvas, tiltGrid, toPx,
+  Frame, cbedImage, drawDisks, drawEwaldPanel, drawImage, drawKikuchiOverlay, drawKosselLines, drawMarkers, histogramBins,
+  nanobeamImage, setupCanvas, tiltGrid, toPx,
 } from "./pattern";
 
 const DIRECT: Reflection = { index: -1, hkl: [0, 0, 0], g: [0, 0, 0], gLen: 0, s: 0 };
@@ -104,20 +104,10 @@ function LabeledSlider({ label, value, onChange, min, max, step, fmt, width = 20
   );
 }
 
-function parseZoneAxis(text: string): Vec3 | null {
-  const t = text.trim().replace(/[\[\]()]/g, "");
-  let parts: string[];
-  if (/[\s,]/.test(t)) parts = t.split(/[\s,]+/).filter(Boolean);
-  else parts = t.match(/-?\d/g) || [];
-  if (parts.length !== 3) return null;
-  const v = parts.map(Number);
-  if (v.some((x) => !isFinite(x)) || v.every((x) => x === 0)) return null;
-  return v as Vec3;
-}
-
-function fmtIndices(v: [number, number, number] | null, brackets = "[]"): string {
+function fmtIndices(v: [number, number, number] | null, hexagonal = false): string {
   if (!v) return "—";
-  return brackets[0] + v.map((h) => (h < 0 ? `${-h}̅` : `${h}`)).join("") + brackets[1];
+  const idx: number[] = hexagonal ? threeToFour(v) : v;
+  return "[" + idx.map((h) => (h < 0 ? `${-h}̅` : `${h}`)).join("") + "]";
 }
 
 // ---------------------------------------------------------------------------
@@ -139,17 +129,23 @@ function DiffSim() {
   const [dynamical, setDynamical] = useModelState<boolean>("dynamical");
   const [thickness, setThickness] = useModelState<number>("thickness_A");
   const [semiconv, setSemiconv] = useModelState<number>("semiconv_mrad");
+  const [precession, setPrecession] = useModelState<number>("precession_deg");
+  const [nPrecession] = useModelState<number>("n_precession");
   const [sigma, setSigma] = useModelState<number>("sigma_excitation");
   const [stepDeg, setStepDeg] = useModelState<number>("rotation_step_deg");
   const [scaling, setScaling] = useModelState<string>("scaling");
   const [power, setPower] = useModelState<number>("power");
   const [cmap, setCmap] = useModelState<string>("cmap");
+  const [markerPower, setMarkerPower] = useModelState<number>("marker_power");
+  const [markerSize, setMarkerSize] = useModelState<number>("marker_size");
   const [vminPct, setVminPct] = useModelState<number>("vmin_pct");
   const [vmaxPct, setVmaxPct] = useModelState<number>("vmax_pct");
   const [showLabels, setShowLabels] = useModelState<boolean>("show_labels");
+  const [showHkl, setShowHkl] = useModelState<boolean>("show_hkl");
   const [showCellAxes, setShowCellAxes] = useModelState<boolean>("show_cell_axes");
   const [nCells, setNCells] = useModelState<number[]>("n_cells");
   const [polyhedra, setPolyhedra] = useModelState<boolean>("polyhedra");
+  const [showEwald, setShowEwald] = useModelState<boolean>("show_ewald");
   const [sizePref] = useModelState<number>("size");
   const [status] = useModelState<string>("status");
 
@@ -176,7 +172,11 @@ function DiffSim() {
     window.addEventListener("resize", f);
     return () => window.removeEventListener("resize", f);
   }, []);
+  // pattern square S on the right; on the left the cell square Sc above the Ewald panel (Sc x Se), S = Sc + gap + Se
   const S = Math.max(220, Math.min(sizePref, winW - 40));
+  const GAP = 8;
+  const Sc = showEwald ? Math.round((S - GAP) / 1.5) : S;
+  const Se = showEwald ? S - GAP - Sc : 0;
 
   // orientation: local quaternion for smooth dragging, pushed to the model with a throttle
   const [quat, setQuatLocal] = React.useState<Quat>(orientation as Quat);
@@ -221,9 +221,17 @@ function DiffSim() {
         if (da < -Math.PI) da += 2 * Math.PI;
         rotateLab([0, 0, 1], (-da * 180) / Math.PI, false);
       }
+    } else if (e.shiftKey) {
+      // shift-drag: twist about the beam (the desktop version of the two-finger gesture)
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+      let da = Math.atan2(cur[1] - cy, cur[0] - cx) - Math.atan2(prev[1] - cy, prev[0] - cx);
+      if (da > Math.PI) da -= 2 * Math.PI;
+      if (da < -Math.PI) da += 2 * Math.PI;
+      rotateLab([0, 0, 1], (-da * 180) / Math.PI, false);
     } else {
       const dx = cur[0] - prev[0], dy = cur[1] - prev[1];
-      const degPerPx = 180 / S;
+      const degPerPx = 180 / Sc;
       const ang = Math.hypot(dx, dy) * degPerPx;
       if (ang > 0) rotateLab([dy, dx, 0], ang, false); // trackball: the face nearest the viewer follows the pointer
     }
@@ -266,6 +274,13 @@ function DiffSim() {
         if (da < -Math.PI) da += 2 * Math.PI;
         rotateLab([0, 0, 1], (-da * 180) / Math.PI, false);
       }
+    } else if (e.shiftKey) {
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+      let da = Math.atan2(cur[1] - cy, cur[0] - cx) - Math.atan2(prev[1] - cy, prev[0] - cx);
+      if (da > Math.PI) da -= 2 * Math.PI;
+      if (da < -Math.PI) da += 2 * Math.PI;
+      rotateLab([0, 0, 1], (-da * 180) / Math.PI, false);
     } else {
       const dx = (viewX * (cur[0] - prev[0])) / patScale.current, dy = -(cur[1] - prev[1]) / patScale.current;
       shiftPattern(dx, dy, mode !== "kossel", false);
@@ -276,11 +291,45 @@ function DiffSim() {
     patPointers.current.delete(e.pointerId);
     if (patPointers.current.size === 0) { setDragging(false); setQuat(quatRef.current, true); }
   };
+  // Double-click on a visible disk: tilt the crystal to the exact Bragg
+  // condition of that reflection (two-beam: the Laue circle through 000 and
+  // g). A crystal tilt (wx, wy) about the lab axes changes s_g by
+  // wx g_y - wy g_x, so w = s_g (-g_y, g_x) / |g_xy|^2 zeroes it. On empty
+  // space the Laue-circle centre moves to the clicked point (same sense:
+  // the zone axis tilts away from the click by q / k0); in Kossel mode the
+  // clicked direction of the tilt map moves onto the axis.
   const onPatDoubleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left, y = e.clientY - rect.top;
+    if (mode === "nanobeam" && crystal) {
+      const snapPx = Math.max(8, 1.2 * (render === "disks" ? k0 * Math.sin(alpha) * patScale.current : markerSize * (S / 420)));
+      // candidates under the click: several reflections of different g_z
+      // share one spot (in hcp the first HOLZ layer is only 0.21 1/A up), so
+      // take the one that needs the SMALLEST tilt to reach Bragg, and never
+      // jump by more than 5 degrees
+      let best: Reflection | null = null, bestTilt = (5 * Math.PI) / 180;
+      let iMax = 0;
+      for (let i = 1; i < nbBeams.length; i++) iMax = Math.max(iMax, nbInten[i] || 0);
+      for (let i = 0; i < nbBeams.length; i++) {
+        const b = nbBeams[i];
+        if (b.index < 0 || !(nbInten[i] > 1e-4 * iMax)) continue;
+        const [px, py] = toPx(frame, b.g[0], b.g[1]);
+        if (Math.hypot(px - x, py - y) > snapPx) continue;
+        const gxy = Math.hypot(b.g[0], b.g[1]);
+        if (gxy < 1e-6) continue;
+        const tilt = Math.abs(b.s) / gxy;
+        if (tilt < bestTilt) { bestTilt = tilt; best = b; }
+      }
+      if (best) {
+        const gxy2 = best.g[0] ** 2 + best.g[1] ** 2;
+        const wx = (-best.s * best.g[1]) / gxy2, wy = (best.s * best.g[0]) / gxy2;
+        setQuat(qnormalize(qmult(quatFromAxisAngle([wx, wy, 0], Math.hypot(wx, wy)), quatRef.current)), true);
+        return;
+      }
+    }
     const qx = (viewX * (x - rect.width / 2)) / patScale.current, qy = -(y - rect.height / 2) / patScale.current;
-    shiftPattern(-qx, -qy, mode !== "kossel", true);
+    if (mode === "kossel") shiftPattern(-qx, -qy, false, true);
+    else shiftPattern(qx, qy, true, true);
   };
 
   // ---- derived geometry ---------------------------------------------------
@@ -294,23 +343,31 @@ function DiffSim() {
   const qual = QUALITY[quality] || QUALITY.medium;
 
   // ---- nanobeam -----------------------------------------------------------
-  const nb = React.useMemo(() => {
-    if (!crystal || mode !== "nanobeam") return { beams: [] as Reflection[], nDyn: 0 };
-    if (dynamical) return hybridBeams(crystal, quat, qMaxDisp, SG_MAX, dragging ? Math.min(qual.nanobeam, 40) : qual.nanobeam);
-    return { beams: [DIRECT, ...labReflections(crystal, quat, qMaxDisp)], nDyn: 0 };
-  }, [crystal, quat, qMaxDisp, mode, dynamical, dragging, qual, SG_MAX]);
-  const nbBeams = nb.beams;
-  const nbSol = React.useMemo(() => (crystal && mode === "nanobeam" && dynamical && nb.nDyn ? blochSolve(crystal, nbBeams.slice(0, nb.nDyn)) : null), [crystal, nbBeams, nb.nDyn, mode, dynamical]);
+  // one Bloch solution per precession node (a single untilted node without precession)
+  const precNodes = React.useMemo(() => {
+    const n = dragging ? Math.max(6, Math.round((nPrecession || 24) / 2)) : nPrecession || 24;
+    return precessionTilts(k0, precession || 0, n);
+  }, [k0, precession, nPrecession, dragging]);
+  const nbSolution = React.useMemo(() => {
+    if (!crystal || mode !== "nanobeam" || !dynamical) return null;
+    return nanobeamSolve(crystal, quat, qMaxDisp, SG_MAX, dragging ? Math.min(qual.nanobeam, 40) : qual.nanobeam, precNodes);
+  }, [crystal, quat, qMaxDisp, mode, dynamical, dragging, qual, SG_MAX, precNodes]);
+  const nbBeams = React.useMemo<Reflection[]>(() => {
+    if (!crystal || mode !== "nanobeam") return [];
+    if (nbSolution) return nbSolution.beams;
+    return [DIRECT, ...labReflections(crystal, quat, qMaxDisp)];
+  }, [crystal, quat, qMaxDisp, mode, nbSolution]);
+  const nb = { beams: nbBeams, nDyn: nbSolution ? Math.round(nbSolution.nDynMean) : 0 };
   const nbInten = React.useMemo(() => {
     if (!crystal || mode !== "nanobeam") return new Float64Array(0);
-    if (dynamical && nbSol) {
-      const out = new Float64Array(nbBeams.length);
-      out.set(blochIntensities(nbSol, thickness));
-      slabIntensities(crystal, nbBeams, nb.nDyn, [0, 0], thickness, out);
-      return out;
+    if (nbSolution) return nanobeamIntensities(crystal, nbSolution, thickness);
+    const out = new Float64Array(nbBeams.length);
+    for (const t of precNodes) {
+      const v = kinematicalTilted(crystal, nbBeams, t, sigma);
+      for (let i = 0; i < out.length; i++) out[i] += v[i] / precNodes.length;
     }
-    return kinematicalTilted(crystal, nbBeams, [0, 0], sigma);
-  }, [crystal, nbBeams, nb.nDyn, nbSol, mode, dynamical, thickness, sigma]);
+    return out;
+  }, [crystal, nbBeams, nbSolution, precNodes, mode, thickness, sigma]);
 
   // ---- CBED ---------------------------------------------------------------
   const alpha = semiconv * 1e-3;
@@ -379,9 +436,22 @@ function DiffSim() {
   // ---- drawing --------------------------------------------------------------
   React.useEffect(() => {
     const canvas = cellRef.current;
-    if (!canvas || !geom) return;
-    drawCell(canvas, geom, quat, S, { dark, showAxes: showCellAxes, showLabels: showLabels, atomScale: 0.45, viewX });
-  }, [geom, quat, S, dark, showCellAxes, showLabels, viewX]);
+    if (!canvas || !geom || !crystal) return;
+    drawCell(canvas, geom, quat, Sc, { dark, showAxes: showCellAxes, showLabels: showLabels, atomScale: 0.45, viewX });
+  }, [geom, quat, Sc, dark, showCellAxes, showLabels, viewX]);
+
+  const ewaldRef = React.useRef<HTMLCanvasElement>(null);
+  React.useEffect(() => {
+    const canvas = ewaldRef.current;
+    if (!canvas || !crystal || !showEwald || Se <= 0) return;
+    const dpr = window.devicePixelRatio || 1;
+    if (canvas.width !== Sc * dpr || canvas.height !== Se * dpr) { canvas.width = Sc * dpr; canvas.height = Se * dpr; }
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const refl = mode === "nanobeam" && nbBeams.length ? nbBeams : labReflections(crystal, quat, qMaxDisp);
+    drawEwaldPanel(ctx, Sc, Se, refl, k0, qMaxDisp, SG_MAX, viewX, dark, mode === "nanobeam" ? precession || 0 : 0);
+  }, [quat, Sc, Se, dark, viewX, showEwald, crystal, mode, nbBeams, qMaxDisp, k0, SG_MAX, precession]);
 
   const patRef = React.useRef<HTMLCanvasElement>(null);
   React.useEffect(() => {
@@ -394,9 +464,12 @@ function DiffSim() {
       const vmax = display.lo + (vmaxPct / 100) * (display.hi - display.lo);
       drawImage(ctx, frame, display.data, cmap, vmin, vmax, dark, mode === "kossel" ? "rad" : "Å⁻¹", mode === "kossel" ? 0.01 : 1);
       if (mode === "nanobeam" && kikuchi) drawKikuchiOverlay(ctx, frame, lines, k0, true);
-      if (mode === "nanobeam" && showLabels) labelBeams(ctx, frame, nbBeams, nbInten, dark, true);
+      if (mode === "nanobeam" && showHkl) labelBeams(ctx, frame, nbBeams, nbInten, dark, true);
+    } else if (mode === "nanobeam" && render === "disks") {
+      drawDisks(ctx, frame, nbBeams, nbInten, dark, showHkl, k0 * Math.sin(alpha), markerPower);
+      if (kikuchi) drawKikuchiOverlay(ctx, frame, lines, k0, dark);
     } else if (mode === "nanobeam") {
-      drawMarkers(ctx, frame, nbBeams, nbInten, dark, showLabels, !dynamical);
+      drawMarkers(ctx, frame, nbBeams, nbInten, dark, showHkl, !dynamical, markerPower, markerSize);
       if (kikuchi) drawKikuchiOverlay(ctx, frame, lines, k0, dark);
     } else if (mode === "kossel") {
       if (render === "pixels" && !kossel) {
@@ -405,16 +478,16 @@ function DiffSim() {
         ctx.fillText("no Kossel reference pattern loaded", S / 2, S / 2 - 10);
         ctx.fillText(standalone ? "(export the page after compute_kossel_reference)" : "press “compute reference” below", S / 2, S / 2 + 10);
       } else {
-        drawKosselLines(ctx, frame, lines, dark, showLabels, 0.02);
+        drawKosselLines(ctx, frame, lines, dark, showHkl, 0.02);
       }
     } else if (mode === "cbed") {
       ctx.fillStyle = dark ? "#000" : "#fff"; ctx.fillRect(0, 0, S, S);
     }
-  }, [crystal, display, frame, mode, render, dark, cmap, vminPct, vmaxPct, nbBeams, nbInten, showLabels, dynamical, kikuchi, lines, k0, kossel, S, standalone]);
+  }, [crystal, display, frame, mode, render, dark, cmap, vminPct, vmaxPct, nbBeams, nbInten, showHkl, dynamical, kikuchi, lines, k0, kossel, S, standalone, markerPower, markerSize, alpha]);
 
   // ---- actions ---------------------------------------------------------------
   const goZoneAxis = () => {
-    const uvw = parseZoneAxis(zoneText);
+    const uvw = parseDirection(zoneText);
     if (!uvw || !crystal) return;
     const c = crystal.cell;
     const d: Vec3 = [
@@ -447,9 +520,9 @@ function DiffSim() {
     const res = await fetch(import.meta.url);
     const bundle = await res.text();
     const keys = ["crystal_json", "presets", "preset", "energy_ev", "k_max", "orientation", "mode", "render", "dynamical", "thickness_A",
-      "semiconv_mrad", "sigma_excitation", "rotation_step_deg", "pattern_range", "field_mrad", "sg_max", "quality", "show_kikuchi", "view_from",
-      "scaling", "power", "cmap", "vmin_pct", "vmax_pct", "show_labels",
-      "show_cell_axes", "n_cells", "polyhedra", "size", "kossel_json", "status", "widget_version"];
+      "semiconv_mrad", "precession_deg", "n_precession", "sigma_excitation", "rotation_step_deg", "pattern_range", "field_mrad", "sg_max", "quality", "show_kikuchi", "view_from",
+      "scaling", "power", "cmap", "marker_power", "marker_size", "vmin_pct", "vmax_pct", "show_labels",
+      "show_cell_axes", "show_hkl", "n_cells", "polyhedra", "show_ewald", "size", "kossel_json", "status", "widget_version"];
     const state: Record<string, unknown> = {};
     for (const k of keys) state[k] = model.get(k);
     state.orientation = [...quatRef.current];
@@ -488,7 +561,6 @@ function DiffSim() {
   };
   const btn = { fontSize: 11, height: 30, color: colors.accent, borderColor: colors.border, textTransform: "none" as const, "&:hover": { borderColor: colors.accent } };
   const sw = { "& .MuiSwitch-track": { bgcolor: dark ? "#777" : undefined } };
-  const panelW = S;
   const nDyn = mode === "nanobeam" ? nb.nDyn : mode === "cbed" && cbed ? cbed.nDyn : 0;
   const nBeams = mode === "nanobeam" ? nbBeams.length : mode === "cbed" && cbed ? cbed.beams.length : lines.length;
 
@@ -512,7 +584,7 @@ function DiffSim() {
             ))}
           </Select>
         </Tooltip>
-        <TextField size="small" placeholder="zone axis, e.g. 1 1 0" value={zoneText} onChange={(e) => setZoneText(e.target.value)}
+        <TextField size="small" placeholder={crystal.hexagonal ? "zone axis, e.g. 0 0 0 1" : "zone axis, e.g. 1 1 0"} value={zoneText} onChange={(e) => setZoneText(e.target.value)}
           onKeyDown={(e) => { if (e.key === "Enter") goZoneAxis(); }}
           sx={{ width: 150, ...tf }} />
         <Button size="small" variant="outlined" onClick={goZoneAxis} sx={{ ...btn, minWidth: 0, px: 1 }}>go</Button>
@@ -521,123 +593,158 @@ function DiffSim() {
         <Button size="small" variant="outlined" onClick={exportHtml} sx={btn}>export HTML</Button>
       </Stack>
 
+      {/* panels: cell (with the Ewald view below it) and the pattern */}
       <Stack direction="row" spacing={1.5} flexWrap="wrap" useFlexGap alignItems="flex-start">
-        {/* left: unit cell */}
-        <Box sx={{ width: panelW }}>
-          <canvas ref={cellRef} style={{ width: S, height: S, touchAction: "none", cursor: dragging ? "grabbing" : "grab", borderRadius: 4, background: dark ? "#141414" : "#fafafa", border: `1px solid ${colors.border}`, display: "block" }}
+        <Box sx={{ width: Sc }}>
+          <canvas ref={cellRef} style={{ width: Sc, height: Sc, touchAction: "none", cursor: dragging ? "grabbing" : "grab", borderRadius: 4, background: dark ? "#141414" : "#fafafa", border: `1px solid ${colors.border}`, display: "block" }}
             onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerUp} onPointerLeave={onPointerUp} />
-          <Stack direction="row" spacing={0.5} alignItems="center" flexWrap="wrap" useFlexGap sx={{ mt: 0.75 }}>
-            {(["x", "y", "z"] as const).map((ax, i) => (
-              <ToggleButtonGroup key={ax} size="small" exclusive value={null} sx={tbg}>
-                <ToggleButton value="-" onClick={() => rotateLab([+(i === 0), +(i === 1), +(i === 2)], -stepDeg)}>{ax} −</ToggleButton>
-                <ToggleButton value="+" onClick={() => rotateLab([+(i === 0), +(i === 1), +(i === 2)], stepDeg)}>{ax} +</ToggleButton>
-              </ToggleButtonGroup>
-            ))}
-            <TextField size="small" type="number" value={stepDeg} onChange={(e) => setStepDeg(Math.max(0.01, Number(e.target.value) || 0.01))}
-              inputProps={{ step: 1, min: 0.01, max: 180, style: { fontSize: 11, padding: "4px 6px", width: 42 } }} sx={tf} />
-            <Typography sx={{ fontSize: 11, opacity: 0.7 }}>°</Typography>
-            <Button size="small" onClick={() => setQuat([1, 0, 0, 0], true)} sx={{ ...btn, height: 26, minWidth: 0, px: 1 }}>reset</Button>
-          </Stack>
-          <Stack direction="row" spacing={1.5} alignItems="center" sx={{ mt: 0.5 }}>
-            <Typography sx={{ fontSize: 11, opacity: 0.75 }}>{crystal.name} · {crystal.spacegroup || crystal.pointgroup}</Typography>
-            <Typography sx={{ fontSize: 11, fontFamily: "monospace" }}>zone axis {fmtIndices(zoneAxis)}</Typography>
-          </Stack>
-          <Stack direction="row" spacing={1} alignItems="center">
-            <Switch size="small" sx={sw} checked={showCellAxes} onChange={(e) => setShowCellAxes(e.target.checked)} />
-            <Typography sx={{ fontSize: 11 }}>cell axes</Typography>
-            <Switch size="small" sx={sw} checked={showLabels} onChange={(e) => setShowLabels(e.target.checked)} />
-            <Typography sx={{ fontSize: 11 }}>labels</Typography>
-            <Switch size="small" sx={sw} checked={polyhedra} onChange={(e) => setPolyhedra(e.target.checked)} />
-            <Typography sx={{ fontSize: 11 }}>polyhedra</Typography>
-          </Stack>
-          <Stack direction="row" spacing={0.5} alignItems="center" sx={{ mt: 0.25 }}>
-            <Typography sx={{ fontSize: 11, mr: 0.5 }}>cells</Typography>
-            {[0, 1, 2].map((i) => (
-              <TextField key={i} size="small" type="number" value={nCellsSafe[i]}
-                onChange={(e) => { const v = [...nCellsSafe]; v[i] = Math.max(1, Math.min(6, Math.round(Number(e.target.value) || 1))); setNCells(v); }}
-                inputProps={{ min: 1, max: 6, step: 1, style: { fontSize: 11, padding: "3px 4px", width: 26 } }} sx={tf} />
-            ))}
-            <Typography sx={{ fontSize: 11, opacity: 0.7 }}>along a, b, c</Typography>
-          </Stack>
-          <Typography sx={{ fontSize: 10.5, opacity: 0.6, mt: 0.5 }}>drag the cell (near face follows) or the pattern (tilt map follows) · double-click a point of the pattern to centre it · two fingers twist · buttons rotate about the screen axes</Typography>
+          {showEwald && Se > 0 && (
+            <canvas ref={ewaldRef} style={{ width: Sc, height: Se, marginTop: GAP, borderRadius: 4, background: dark ? "#141414" : "#fafafa", border: `1px solid ${colors.border}`, display: "block" }} />
+          )}
         </Box>
-
-        {/* right: pattern */}
-        <Box sx={{ width: panelW }}>
+        <Box sx={{ width: S }}>
           <canvas ref={patRef} style={{ width: S, height: S, touchAction: "none", cursor: dragging ? "grabbing" : "grab", borderRadius: 4, border: `1px solid ${colors.border}`, display: "block" }}
             onPointerDown={onPatDown} onPointerMove={onPatMove} onPointerUp={onPatUp} onPointerCancel={onPatUp} onPointerLeave={onPatUp} onDoubleClick={onPatDoubleClick} />
-          <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap sx={{ mt: 0.75 }}>
-            <ToggleButtonGroup size="small" exclusive value={mode} onChange={(_, v) => v && setMode(v)} sx={tbg}>
-              <ToggleButton value="nanobeam">nanobeam</ToggleButton>
-              <ToggleButton value="cbed">CBED</ToggleButton>
-              <ToggleButton value="kossel">Kossel / LACBED</ToggleButton>
+        </Box>
+      </Stack>
+
+      {/* controls, full width under the panels */}
+      <Box sx={{ width: Sc + 12 + S, maxWidth: "100%", mt: 1 }}>
+        {/* crystal row */}
+        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+          <Typography sx={{ fontSize: 11, fontWeight: 600, opacity: 0.8, mr: 0.5 }}>crystal</Typography>
+          {(["x", "y", "z"] as const).map((ax, i) => (
+            <ToggleButtonGroup key={ax} size="small" exclusive value={null} sx={tbg}>
+              <ToggleButton value="-" onClick={() => rotateLab([+(i === 0), +(i === 1), +(i === 2)], -stepDeg)}>{ax} −</ToggleButton>
+              <ToggleButton value="+" onClick={() => rotateLab([+(i === 0), +(i === 1), +(i === 2)], stepDeg)}>{ax} +</ToggleButton>
             </ToggleButtonGroup>
-            {mode !== "cbed" && (
-              <ToggleButtonGroup size="small" exclusive value={render} onChange={(_, v) => v && setRender(v)} sx={tbg}>
-                <ToggleButton value="markers">{mode === "kossel" ? "lines" : "markers"}</ToggleButton>
-                <ToggleButton value="pixels">pixels</ToggleButton>
-              </ToggleButtonGroup>
-            )}
-            {mode !== "kossel" && (
-              <Stack direction="row" alignItems="center">
-                <Switch size="small" sx={sw} checked={dynamical} onChange={(e) => setDynamical(e.target.checked)} />
-                <Typography sx={{ fontSize: 11 }}>dynamical</Typography>
-              </Stack>
-            )}
+          ))}
+          <TextField size="small" type="number" value={stepDeg} onChange={(e) => setStepDeg(Math.max(0.01, Number(e.target.value) || 0.01))}
+            inputProps={{ step: 1, min: 0.01, max: 180, style: { fontSize: 11, padding: "4px 6px", width: 42 } }} sx={tf} />
+          <Typography sx={{ fontSize: 11, opacity: 0.7 }}>°</Typography>
+          <Button size="small" onClick={() => setQuat([1, 0, 0, 0], true)} sx={{ ...btn, height: 26, minWidth: 0, px: 1 }}>reset</Button>
+          <Typography sx={{ fontSize: 11, fontFamily: "monospace", ml: 1 }}>zone axis {fmtIndices(zoneAxis, crystal.hexagonal)}</Typography>
+          <Typography sx={{ fontSize: 11, opacity: 0.75 }}>{crystal.name} · {crystal.spacegroup || crystal.pointgroup}</Typography>
+        </Stack>
+        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap sx={{ mt: 0.25 }}>
+          <Switch size="small" sx={sw} checked={showCellAxes} onChange={(e) => setShowCellAxes(e.target.checked)} />
+          <Typography sx={{ fontSize: 11 }}>cell axes</Typography>
+          <Switch size="small" sx={sw} checked={showLabels} onChange={(e) => setShowLabels(e.target.checked)} />
+          <Typography sx={{ fontSize: 11 }}>axis labels</Typography>
+          <Switch size="small" sx={sw} checked={polyhedra} onChange={(e) => setPolyhedra(e.target.checked)} />
+          <Typography sx={{ fontSize: 11 }}>polyhedra</Typography>
+          <Switch size="small" sx={sw} checked={showEwald} onChange={(e) => setShowEwald(e.target.checked)} />
+          <Typography sx={{ fontSize: 11 }}>Ewald sphere</Typography>
+          <Typography sx={{ fontSize: 11, ml: 1 }}>cells</Typography>
+          {[0, 1, 2].map((i) => (
+            <TextField key={i} size="small" type="number" value={nCellsSafe[i]}
+              onChange={(e) => { const v = [...nCellsSafe]; v[i] = Math.max(1, Math.min(6, Math.round(Number(e.target.value) || 1))); setNCells(v); }}
+              inputProps={{ min: 1, max: 6, step: 1, style: { fontSize: 11, padding: "3px 4px", width: 26 } }} sx={tf} />
+          ))}
+          <Typography sx={{ fontSize: 11, opacity: 0.7 }}>along a, b, c</Typography>
+        </Stack>
+
+        {/* pattern row */}
+        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap sx={{ mt: 1 }}>
+          <Typography sx={{ fontSize: 11, fontWeight: 600, opacity: 0.8, mr: 0.5 }}>pattern</Typography>
+          <ToggleButtonGroup size="small" exclusive value={mode} onChange={(_, v) => v && setMode(v)} sx={tbg}>
+            <ToggleButton value="nanobeam">nanobeam</ToggleButton>
+            <ToggleButton value="cbed">CBED</ToggleButton>
+            <ToggleButton value="kossel">Kossel / LACBED</ToggleButton>
+          </ToggleButtonGroup>
+          {mode !== "cbed" && (
+            <ToggleButtonGroup size="small" exclusive value={render} onChange={(_, v) => v && setRender(v)} sx={tbg}>
+              <ToggleButton value="markers">{mode === "kossel" ? "lines" : "markers"}</ToggleButton>
+              {mode === "nanobeam" && <ToggleButton value="disks">disks</ToggleButton>}
+              <ToggleButton value="pixels">pixels</ToggleButton>
+            </ToggleButtonGroup>
+          )}
+          {mode !== "kossel" && (
+            <Stack direction="row" alignItems="center">
+              <Switch size="small" sx={sw} checked={dynamical} onChange={(e) => setDynamical(e.target.checked)} />
+              <Typography sx={{ fontSize: 11 }}>dynamical</Typography>
+            </Stack>
+          )}
+          <Stack direction="row" alignItems="center">
+            <Switch size="small" sx={sw} checked={showHkl} onChange={(e) => setShowHkl(e.target.checked)} />
+            <Typography sx={{ fontSize: 11 }}>hkl labels</Typography>
           </Stack>
-          <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap sx={{ mt: 0.75 }}>
-            <LabeledSlider label="thickness" value={thickness} onChange={setThickness} min={10} max={2000} step={5} fmt={(v) => `${v.toFixed(0)} Å`}
-              disabled={mode !== "kossel" ? !dynamical : render !== "pixels"} />
-            {mode === "cbed" && <LabeledSlider label="convergence semiangle" value={semiconv} onChange={setSemiconv} min={0.2} max={30} step={0.1} fmt={(v) => `${v.toFixed(1)} mrad`} />}
-            {mode === "kossel" && <LabeledSlider label="field of view (half angle)" value={fieldMrad} onChange={setFieldMrad} min={10} max={250} step={5} fmt={(v) => `${v.toFixed(0)} mrad`} />}
-            {mode !== "kossel" && <LabeledSlider label="pattern range" value={qMaxDisp} onChange={setQMaxDisp} min={0.2} max={crystal.k_max} step={0.05} fmt={(v) => `${v.toFixed(2)} Å⁻¹`} />}
-            {mode !== "kossel" && !dynamical && <LabeledSlider label="excitation error σ" value={sigma} onChange={setSigma} min={0.002} max={0.1} step={0.001} fmt={(v) => `${v.toFixed(3)} Å⁻¹`} />}
-          </Stack>
-          <Stack direction="row" spacing={1.5} alignItems="flex-start" flexWrap="wrap" useFlexGap sx={{ mt: 0.75 }}>
-            {display && (
-              <Histogram bins={display.bins} vminPct={vminPct} vmaxPct={vmaxPct} onRangeChange={(a, b) => { setVminPct(a); setVmaxPct(b); }} dark={dark} lo={display.lo} hi={display.hi} />
-            )}
-            {pixelMode && (
+          {mode === "nanobeam" && (
+            <Stack direction="row" alignItems="center">
+              <Switch size="small" sx={sw} checked={kikuchi} onChange={(e) => setKikuchi(e.target.checked)} />
+              <Typography sx={{ fontSize: 11 }}>Kikuchi lines</Typography>
+            </Stack>
+          )}
+          {mode !== "kossel" && dynamical && (
+            <Stack direction="row" alignItems="center" spacing={0.5}>
+              <Typography sx={{ fontSize: 11, opacity: 0.8 }}>quality</Typography>
+              <Select size="small" value={quality} onChange={(e) => setQuality(e.target.value as string)} sx={{ ...ctl, minWidth: 90 }} MenuProps={menuProps}>
+                {Object.keys(QUALITY).map((n) => <MenuItem key={n} value={n} sx={{ fontSize: 12 }}>{n}</MenuItem>)}
+              </Select>
+            </Stack>
+          )}
+          {mode === "kossel" && render === "pixels" && !kossel && !standalone && (
+            <Button size="small" variant="outlined" onClick={() => model.send({ type: "kossel_reference" })} sx={btn}>compute reference</Button>
+          )}
+        </Stack>
+
+        {/* physics sliders */}
+        <Stack direction="row" spacing={2} flexWrap="wrap" useFlexGap sx={{ mt: 0.75 }}>
+          <LabeledSlider label="thickness" value={thickness} onChange={setThickness} min={10} max={2000} step={5} fmt={(v) => `${v.toFixed(0)} Å`} width={180}
+            disabled={mode !== "kossel" ? !dynamical : render !== "pixels"} />
+          {(mode === "cbed" || (mode === "nanobeam" && render === "disks")) && <LabeledSlider label="convergence semiangle" value={semiconv} onChange={setSemiconv} min={0.2} max={30} step={0.1} fmt={(v) => `${v.toFixed(1)} mrad`} width={180} />}
+          {mode === "nanobeam" && <LabeledSlider label="precession angle" value={precession} onChange={setPrecession} min={0} max={3} step={0.05} fmt={(v) => (v > 0 ? `${v.toFixed(2)}°` : "off")} width={180} />}
+          {mode !== "kossel" && <LabeledSlider label="pattern range" value={qMaxDisp} onChange={setQMaxDisp} min={0.2} max={crystal.k_max} step={0.05} fmt={(v) => `${v.toFixed(2)} Å⁻¹`} width={180} />}
+          {mode === "kossel" && <LabeledSlider label="field of view (half angle)" value={fieldMrad} onChange={setFieldMrad} min={10} max={250} step={5} fmt={(v) => `${v.toFixed(0)} mrad`} width={180} />}
+          {mode !== "kossel" && !dynamical && <LabeledSlider label="excitation error σ" value={sigma} onChange={setSigma} min={0.002} max={0.1} step={0.001} fmt={(v) => `${v.toFixed(3)} Å⁻¹`} width={180} />}
+        </Stack>
+
+        {/* display row */}
+        <Stack direction="row" spacing={2} alignItems="flex-start" flexWrap="wrap" useFlexGap sx={{ mt: 0.75 }}>
+          {mode === "nanobeam" && render === "markers" && (
+            <>
+              <LabeledSlider label="marker area ∝ intensity^p" value={markerPower} onChange={setMarkerPower} min={0.1} max={1} step={0.05} fmt={(v) => `p = ${v.toFixed(2)}`} width={180} />
+              <LabeledSlider label="max marker radius" value={markerSize} onChange={setMarkerSize} min={2} max={40} step={1} fmt={(v) => `${v.toFixed(0)} px`} width={140} />
+            </>
+          )}
+          {mode === "nanobeam" && render === "disks" && (
+            <LabeledSlider label="brightness ∝ intensity^p" value={markerPower} onChange={setMarkerPower} min={0.1} max={1} step={0.05} fmt={(v) => `p = ${v.toFixed(2)}`} width={180} />
+          )}
+          {pixelMode && (
+            <>
               <Stack spacing={0.25}>
-                <Select size="small" value={COLORMAP_NAMES.includes(cmap) ? cmap : COLORMAP_NAMES[0]} onChange={(e) => setCmap(e.target.value as string)} sx={{ ...ctl, minWidth: 110 }} MenuProps={menuProps}>
-                  {COLORMAP_NAMES.map((n) => <MenuItem key={n} value={n} sx={{ fontSize: 12 }}>{n}</MenuItem>)}
-                </Select>
+                <Typography sx={{ fontSize: 11, opacity: 0.8 }}>intensity scaling</Typography>
                 <Select size="small" value={["linear", "power", "log"].includes(scaling) ? scaling : "linear"} onChange={(e) => setScaling(e.target.value as string)} sx={{ ...ctl, minWidth: 110 }} MenuProps={menuProps}>
                   <MenuItem value="linear" sx={{ fontSize: 12 }}>linear</MenuItem>
                   <MenuItem value="power" sx={{ fontSize: 12 }}>power law</MenuItem>
                   <MenuItem value="log" sx={{ fontSize: 12 }}>log</MenuItem>
                 </Select>
-                {scaling === "power" && (
-                  <LabeledSlider label="exponent" value={power} onChange={setPower} min={0.1} max={1} step={0.05} fmt={(v) => v.toFixed(2)} width={110} />
-                )}
               </Stack>
-            )}
-            {mode === "nanobeam" && (
-              <Stack direction="row" alignItems="center">
-                <Switch size="small" sx={sw} checked={kikuchi} onChange={(e) => setKikuchi(e.target.checked)} />
-                <Typography sx={{ fontSize: 11 }}>Kikuchi lines</Typography>
-              </Stack>
-            )}
-            {mode !== "kossel" && dynamical && (
-              <Stack direction="row" alignItems="center" spacing={0.5}>
-                <Typography sx={{ fontSize: 11, opacity: 0.8 }}>quality</Typography>
-                <Select size="small" value={quality} onChange={(e) => setQuality(e.target.value as string)} sx={{ ...ctl, minWidth: 90 }} MenuProps={menuProps}>
-                  {Object.keys(QUALITY).map((n) => <MenuItem key={n} value={n} sx={{ fontSize: 12 }}>{n}</MenuItem>)}
+              {scaling === "power" && (
+                <LabeledSlider label="exponent" value={power} onChange={setPower} min={0.1} max={1} step={0.05} fmt={(v) => v.toFixed(2)} width={110} />
+              )}
+              <Stack spacing={0.25}>
+                <Typography sx={{ fontSize: 11, opacity: 0.8 }}>colormap</Typography>
+                <Select size="small" value={COLORMAP_NAMES.includes(cmap) ? cmap : COLORMAP_NAMES[0]} onChange={(e) => setCmap(e.target.value as string)} sx={{ ...ctl, minWidth: 110 }} MenuProps={menuProps}>
+                  {COLORMAP_NAMES.map((n) => <MenuItem key={n} value={n} sx={{ fontSize: 12 }}>{n}</MenuItem>)}
                 </Select>
               </Stack>
-            )}
-            {mode === "kossel" && render === "pixels" && !kossel && !standalone && (
-              <Button size="small" variant="outlined" onClick={() => model.send({ type: "kossel_reference" })} sx={btn}>compute reference</Button>
-            )}
-          </Stack>
-          <Typography sx={{ fontSize: 10.5, opacity: 0.6, mt: 0.5 }}>
-            {(energy / 1e3).toFixed(0)} keV · λ = {(crystal.wavelength * 100).toFixed(3)} pm · {nBeams} {mode === "kossel" ? "lines" : "beams"}
-            {mode !== "kossel" && dynamical ? ` · ${nDyn} Bloch beams (|s| < ${SG_MAX} Å⁻¹${crystal.absorptive ? ", absorptive" : ""}), thin-slab intensities for the rest` : ""}
-            {mode === "cbed" ? " · disks summed incoherently where they overlap" : ""}
-            {status ? ` · ${status}` : ""}
-          </Typography>
-        </Box>
-      </Stack>
+            </>
+          )}
+          {display && (
+            <Histogram bins={display.bins} vminPct={vminPct} vmaxPct={vmaxPct} onRangeChange={(a, b) => { setVminPct(a); setVmaxPct(b); }} dark={dark} lo={display.lo} hi={display.hi} />
+          )}
+        </Stack>
+
+        <Typography sx={{ fontSize: 10.5, opacity: 0.6, mt: 0.75 }}>
+          {(energy / 1e3).toFixed(0)} keV · λ = {(crystal.wavelength * 100).toFixed(3)} pm · {nBeams} {mode === "kossel" ? "lines" : "beams"}
+          {mode !== "kossel" && dynamical ? ` · ${nDyn} Bloch beams (|s| < ${SG_MAX} Å⁻¹${crystal.absorptive ? ", absorptive" : ""}), thin-slab intensities for the rest` : ""}
+          {mode === "cbed" ? " · disks summed incoherently where they overlap" : ""}
+          {mode === "nanobeam" && precession > 0 ? ` · precession ${precession.toFixed(2)}°, ${precNodes.length} ring nodes` : ""}
+          {status ? ` · ${status}` : ""}
+        </Typography>
+        <Typography sx={{ fontSize: 10.5, opacity: 0.6 }}>drag the cell (near face follows) or the pattern (tilt map follows) · shift-drag or two fingers twist about the beam · double-click a disk for its two-beam condition, or empty space to put the Laue circle centre there · buttons rotate about the screen axes</Typography>
+      </Box>
     </Box>
   );
 }

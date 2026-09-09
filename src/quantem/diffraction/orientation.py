@@ -62,6 +62,75 @@ def fibonacci_hemisphere(n_points: int, dtype=torch.float64) -> torch.Tensor:
     return torch.stack((r * torch.cos(phi), r * torch.sin(phi), z), dim=-1)
 
 
+def _zone_peak_parabolic(
+    za: torch.Tensor,
+    n_pos: torch.Tensor,
+    c_n: torch.Tensor,
+    n_ok: torch.Tensor,
+    step_rad: float,
+) -> torch.Tensor:
+    """Sub-grid zone axis from the correlations of a zone and its neighbors.
+
+    A quadratic surface c(x, y) is fit by least squares to the correlation
+    over the neighborhood in the tangent plane of the best zone (x, y in
+    radians); its vertex is the refined zone axis when it lies within one
+    grid step of the node and the surface is concave. Otherwise the
+    correlation-weighted centroid of the neighbors above 70 % of the best
+    value is used, and the node itself when neither applies.
+
+    Parameters
+    ----------
+    za : (B, 3) best zone axes; n_pos : (B, K, 3) neighbor directions
+    (the best zone included); c_n : (B, K) their correlations; n_ok : (B, K)
+    validity; step_rad : zone grid step.
+    """
+    B, K = c_n.shape
+    # tangent frame at the node
+    ref = torch.where(
+        za[:, 2:3].abs() < 0.9,
+        torch.tensor([0.0, 0.0, 1.0], dtype=za.dtype).expand(B, 3),
+        torch.tensor([1.0, 0.0, 0.0], dtype=za.dtype).expand(B, 3),
+    )
+    e1 = torch.cross(za, ref, dim=-1)
+    e1 = e1 / torch.linalg.norm(e1, dim=-1, keepdim=True).clamp_min(1e-12)
+    e2 = torch.cross(za, e1, dim=-1)
+    d = n_pos - za[:, None, :]
+    x = (d * e1[:, None, :]).sum(-1)
+    y = (d * e2[:, None, :]).sum(-1)
+    c_best = c_n.amax(dim=1, keepdim=True)
+    w = n_ok.to(za.dtype)
+    out = za.clone()
+    # centroid fallback (the previous estimator)
+    wgt = (c_n - 0.7 * c_best).clamp_min(0) * w
+    cen = (wgt[:, :, None] * n_pos).sum(1)
+    cen_ok = torch.linalg.norm(cen, dim=-1) > 1e-12
+    cen = cen / torch.linalg.norm(cen, dim=-1, keepdim=True).clamp_min(1e-12)
+    out[cen_ok] = cen[cen_ok]
+    # quadratic fit where at least 6 valid neighbors exist
+    A = torch.stack([torch.ones_like(x), x, y, x * x, x * y, y * y], dim=-1) * w[:, :, None]
+    b = (c_n - c_best) * w
+    enough = w.sum(1) >= 6
+    if bool(enough.any()):
+        At = A.transpose(1, 2)
+        AtA = At @ A + 1e-12 * torch.eye(6, dtype=za.dtype)
+        coef = torch.linalg.solve(AtA, (At @ b[:, :, None]))[..., 0]  # (B, 6)
+        cb, cc, cd, ce, cf = coef[:, 1], coef[:, 2], coef[:, 3], coef[:, 4], coef[:, 5]
+        H = torch.stack([torch.stack([2 * cd, ce], -1), torch.stack([ce, 2 * cf], -1)], -2)
+        det = 4 * cd * cf - ce * ce
+        concave = (cd < 0) & (cf < 0) & (det > 0)
+        grad = torch.stack([cb, cc], -1)
+        vert = torch.zeros_like(grad)
+        ok = enough & concave
+        if bool(ok.any()):
+            vert[ok] = -torch.linalg.solve(H[ok], grad[ok][..., None])[..., 0]
+        inside = ok & (torch.linalg.norm(vert, dim=-1) <= step_rad)
+        if bool(inside.any()):
+            v = za + vert[:, 0:1] * e1 + vert[:, 1:2] * e2
+            v = v / torch.linalg.norm(v, dim=-1, keepdim=True).clamp_min(1e-12)
+            out[inside] = v[inside]
+    return out
+
+
 class OrientationMap(AutoSerialize):
     """Match crystal orientations to Bragg peaks at every probe position.
 
@@ -555,10 +624,8 @@ class OrientationMap(AutoSerialize):
         subpixel_gamma : bool, default=True
             Parabolic sub-bin refinement of the in-plane angle.
         subpixel_zone : bool, default=True
-            Sub-grid refinement of the zone axis: the correlation-weighted
-            centroid of the best zone and its grid neighbors. Removes the
-            zone-axis quantization of the plan (the in-plane angle is
-            already continuous through subpixel_gamma).
+            Sub-grid zone axis from a quadratic fit of the correlation over
+            the best zone and its grid neighbors (centroid fallback).
         batch_size : int, default=128
             Number of patterns correlated at once.
         """
@@ -694,13 +761,10 @@ class OrientationMap(AutoSerialize):
                     n_pos = self.zone_nbr_pos[zi_cpu]  # (B, K, 3)
                     n_ok = self.zone_nbr_valid[zi_cpu]  # (B, K)
                     c_n = corr_z.gather(1, n_idx)  # (B, K)
-                    c_floor = corr_z.gather(1, zi_cpu[:, None]) * 0.7
-                    wgt = (c_n - c_floor).clamp_min(0) * n_ok
-                    za_ref = (wgt[:, :, None] * n_pos).sum(dim=1)
-                    za_ref = za_ref / torch.linalg.norm(za_ref, dim=-1, keepdim=True).clamp_min(
-                        1e-12
-                    )
                     za_old = self.zone_axes[z_i.cpu()]
+                    za_ref = _zone_peak_parabolic(
+                        za_old, n_pos, c_n, n_ok, np.deg2rad(self.zone_step_deg)
+                    )
                     axis = torch.cross(za_ref, za_old, dim=-1)
                     sin_t = torch.linalg.norm(axis, dim=-1)
                     ang_t = torch.atan2(sin_t, (za_ref * za_old).sum(-1))
@@ -769,6 +833,7 @@ class OrientationMap(AutoSerialize):
         zone_search_deg: float = 1.5,
         sigma_envelope: float | None = None,
         zone_max_total_deg: float | None = None,
+        power_intensity: float | None = None,
         batched: bool = True,
         neighbor_rescue: bool = True,
         rescue_threshold_deg: float = 2.0,
@@ -817,6 +882,11 @@ class OrientationMap(AutoSerialize):
             Half-range of the envelope tilt search, in degrees.
         zone_max_total_deg : float | None
             Trust region: cap on the cumulative envelope tilt applied to
+        power_intensity : float | None
+            Power applied to the measured and predicted intensities in the
+            tilt envelope fit, inherited from the plan (0.25 by default).
+            Linear intensities let the strongest reflections dominate and,
+            on dynamical data, drive the fit to the edge of the search range.
             each orientation, relative to its matched start. The coarse
             match is grid-accurate to about half the zone-axis step, so tilt
             corrections beyond that scale are noise walking the orientation
@@ -850,6 +920,7 @@ class OrientationMap(AutoSerialize):
             refine_zone=bool(refine_zone),
             zone_search_deg=float(zone_search_deg),
             zone_max_total_deg=zone_max_total_deg,
+            power_intensity=power_intensity,
             sigma_envelope=sigma_envelope,
             neighbor_rescue=bool(neighbor_rescue),
             rescue_threshold_deg=float(rescue_threshold_deg),
@@ -861,6 +932,16 @@ class OrientationMap(AutoSerialize):
         g_all = self.crystal.g_vec
         lam = self.wavelength
         sigma_env = sigma_envelope if sigma_envelope is not None else sigma / 2
+        power_env = resolve(
+            power_intensity,
+            "power_intensity",
+            self.metadata.get("plan", {}),
+            default=POWER_INTENSITY,
+        )
+        if power_env <= 0:
+            # a positions-only plan (power 0) carries no intensity weighting;
+            # the envelope fit still needs one
+            power_env = POWER_INTENSITY
         prec_ill = float(self.metadata.get("precession_deg", 0.0) or 0.0)
         conv_ill = float(self.metadata.get("semiconv_mrad", 0.0) or 0.0)
 
@@ -892,7 +973,7 @@ class OrientationMap(AutoSerialize):
         )
         eye3 = torch.eye(3, dtype=torch.float64)
         tilt_cap = np.deg2rad(
-            zone_max_total_deg if zone_max_total_deg is not None else 0.375 * self.zone_step_deg
+            zone_max_total_deg if zone_max_total_deg is not None else 0.75 * self.zone_step_deg
         )
 
         def refine_single(q, q_exp, w_exp):
@@ -957,8 +1038,11 @@ class OrientationMap(AutoSerialize):
                         + tg[None, :, None] * a1[:, None, None]
                         + tg[None, None, :] * a2[:, None, None]
                     )
-                    pred = f_p[:, None, None] * envelope(S, g_sel[pair])
-                    E = (w[:, None, None] * pred).sum(dim=0) / (
+                    pred = (f_p[:, None, None] * envelope(S, g_sel[pair])).clamp_min(
+                        0
+                    ) ** power_env
+                    w_env = w**power_env
+                    E = (w_env[:, None, None] * pred).sum(dim=0) / (
                         (pred**2).sum(dim=0).sqrt().clamp_min(1e-12)
                     )
                     ij = int(E.argmax())
@@ -1021,6 +1105,7 @@ class OrientationMap(AutoSerialize):
                 num_iterations=num_iterations,
                 min_pairs=min_pairs,
                 refine_zone=refine_zone,
+                power_env=power_env,
                 progress_bar=progress_bar,
             )
         else:
@@ -1103,6 +1188,7 @@ class OrientationMap(AutoSerialize):
         refine_zone: bool,
         progress_bar: bool,
         chunk: int = 64,
+        power_env: float = POWER_INTENSITY,
     ) -> None:
         """Chunk-vectorized in-plane + envelope refinement (all positions)."""
         from quantem.diffraction.rotations import quat_to_matrix
@@ -1222,9 +1308,11 @@ class OrientationMap(AutoSerialize):
                             + tg[None, :, None] * gyf[:, None, None]
                             - tg[None, None, :] * gxf[:, None, None]
                         )  # (Np, T, T)
-                        pred = ff[:, None, None] * envelope(S, g[idx_b, idx_g])
+                        pred = (ff[:, None, None] * envelope(S, g[idx_b, idx_g])).clamp_min(
+                            0
+                        ) ** power_env
                         E_num = torch.zeros((B, n_tg, n_tg), dtype=torch.float64).index_add_(
-                            0, idx_b, wf[:, None, None] * pred
+                            0, idx_b, (wf**power_env)[:, None, None] * pred
                         )
                         E_den = torch.zeros((B, n_tg, n_tg), dtype=torch.float64).index_add_(
                             0, idx_b, pred**2

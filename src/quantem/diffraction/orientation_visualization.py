@@ -229,6 +229,8 @@ def plot_orientation_map(
     figax=None,
     legend: bool = True,
     axsize: tuple[float, float] = (9.0, 4.5),
+    crop: tuple[int, int, int, int] | None = None,
+    title: str | None = None,
 ):
     """IPF-colored orientation map with the wedge legend in an adjacent panel.
 
@@ -246,6 +248,10 @@ def plot_orientation_map(
         Real-space scale bar, e.g. {"sampling": 30, "units": "A"}.
     figax : (fig, (ax_map, ax_legend)) | (fig, ax_map) | None
         Existing axes; with a single axis the legend is skipped.
+    crop : (r0, r1, c0, c1) | None
+        Show only this window of the map (rows r0:r1, columns c0:c1).
+    title : str | None
+        Replaces the default title (crystal name and colored direction).
     """
     import matplotlib.pyplot as plt
 
@@ -253,6 +259,9 @@ def plot_orientation_map(
     rgb = ipf_color(om.quats[..., match, :], om.crystal, direction)
     if mask is not None:
         rgb = rgb * np.asarray(mask, dtype=float)[..., None]
+    if crop is not None:
+        r0, r1, c0, c1 = crop
+        rgb = rgb[r0:r1, c0:c1]
 
     ax_leg = None
     if figax is None:
@@ -274,7 +283,9 @@ def plot_orientation_map(
     ax.imshow(rgb, interpolation="nearest")
     ax.set_xticks([])
     ax.set_yticks([])
-    if isinstance(direction, str) and direction == "z":
+    if title is not None:
+        ax.set_title(title)
+    elif isinstance(direction, str) and direction == "z":
         ax.set_title(f"{om.crystal.name}  out-of-plane orientation")
     else:
         # arrow for the colored in-plane direction lives in the title,

@@ -225,9 +225,13 @@ class DiffractionSim(anywidget.AnyWidget):
     thickness_A, semiconv_mrad, sigma_excitation : float
         Initial values of the thickness, convergence semiangle and
         excitation envelope sliders.
+    precession_deg : float, default=0
+        Precession half angle for the nanobeam pattern; intensities are
+        averaged over n_precession incident tilts on the precession ring
+        (24 by default, half of that while dragging).
     pattern_range : float | None
         Scattering vector at the edge of the nanobeam / CBED panel
-        (1/Angstroms); None shows everything out to k_max.
+        (1/Angstroms); None uses 3, or k_max when that is smaller.
     field_mrad : float, default=50
         Half angle of the Kossel / LACBED field of view.
     sg_max : float, default=0.05
@@ -242,6 +246,11 @@ class DiffractionSim(anywidget.AnyWidget):
         intensities to `power` (default 0.5).
     cmap : str
         Colormap of the pixel renderings, e.g. "inferno", "turbo_black", "gray".
+    marker_power : float, default=0.5
+        Marker area scales as intensity**marker_power (0.5: sqrt intensity).
+    marker_size : float, default=20
+        Radius in pixels of the strongest marker (at size 420), capped so
+        the densest net of spots does not merge.
     view_from : {"detector", "gun"}
         Viewpoint shared by both panels (a launch argument, no UI control). "detector" looks up the column from
         the detector side: the exit face of the cell is nearest you and tilts
@@ -250,8 +259,9 @@ class DiffractionSim(anywidget.AnyWidget):
         and tilts opposite to the pattern (the Laue center marks where the
         zone axis exits toward the detector).
     mode : {"nanobeam", "cbed", "kossel"}
-    render : {"markers", "pixels"}
-        Nanobeam: markers sized by intensity, or a pixelated pattern.
+    render : {"markers", "disks", "pixels"}
+        Nanobeam: markers sized by intensity, disks of the convergence
+        semiangle with brightness by intensity, or a pixelated pattern.
         Kossel: vector lines, or the pixel lookup of the reference pattern
         (compute_kossel_reference()).
     n_cells : sequence of 3 int, default=(1, 1, 1)
@@ -260,6 +270,10 @@ class DiffractionSim(anywidget.AnyWidget):
         Draw coordination polyhedra (convex hull of the nearest neighbours)
         around every species except the most numerous one; around every
         atom of an elemental crystal.
+    show_ewald : bool, default=True
+        Side-view inset of the Ewald sphere on the cell panel: the reciprocal
+        lattice points near the x-z plane, the sphere through the origin
+        (z stretched), and the excited reflections in green.
     size : int
         Height of the panels in CSS pixels.
 
@@ -286,9 +300,11 @@ class DiffractionSim(anywidget.AnyWidget):
     dynamical = traitlets.Bool(True).tag(sync=True)
     thickness_A = traitlets.Float(500.0).tag(sync=True)
     semiconv_mrad = traitlets.Float(2.0).tag(sync=True)
+    precession_deg = traitlets.Float(0.0).tag(sync=True)
+    n_precession = traitlets.Int(24).tag(sync=True)
     sigma_excitation = traitlets.Float(0.02).tag(sync=True)
     rotation_step_deg = traitlets.Float(15.0).tag(sync=True)
-    pattern_range = traitlets.Float(4.0).tag(sync=True)
+    pattern_range = traitlets.Float(3.0).tag(sync=True)
     field_mrad = traitlets.Float(50.0).tag(sync=True)
     sg_max = traitlets.Float(0.05).tag(sync=True)
     quality = traitlets.Unicode("medium").tag(sync=True)
@@ -296,13 +312,17 @@ class DiffractionSim(anywidget.AnyWidget):
     view_from = traitlets.Unicode("detector").tag(sync=True)
     scaling = traitlets.Unicode("linear").tag(sync=True)
     power = traitlets.Float(0.5).tag(sync=True)
+    marker_power = traitlets.Float(0.5).tag(sync=True)
+    marker_size = traitlets.Float(20.0).tag(sync=True)
     cmap = traitlets.Unicode("inferno").tag(sync=True)
     vmin_pct = traitlets.Float(0.0).tag(sync=True)
     vmax_pct = traitlets.Float(100.0).tag(sync=True)
     show_labels = traitlets.Bool(True).tag(sync=True)
+    show_hkl = traitlets.Bool(True).tag(sync=True)
     show_cell_axes = traitlets.Bool(True).tag(sync=True)
     n_cells = traitlets.List(trait=traitlets.Int(), default_value=[1, 1, 1]).tag(sync=True)
     polyhedra = traitlets.Bool(False).tag(sync=True)
+    show_ewald = traitlets.Bool(True).tag(sync=True)
     size = traitlets.Int(420).tag(sync=True)
     kossel_json = traitlets.Unicode("{}").tag(sync=True)
     status = traitlets.Unicode("").tag(sync=True)
@@ -312,7 +332,9 @@ class DiffractionSim(anywidget.AnyWidget):
         if "n_cells" in kwargs:
             kwargs["n_cells"] = [int(n) for n in kwargs["n_cells"]]
         super().__init__(**kwargs)
-        self.pattern_range = float(pattern_range) if pattern_range is not None else self.k_max
+        self.pattern_range = (
+            float(pattern_range) if pattern_range is not None else min(3.0, self.k_max)
+        )
         self._crystal = None
         self._kossel_cache: dict = {}
         if crystal is None:
@@ -425,6 +447,8 @@ class DiffractionSim(anywidget.AnyWidget):
             "dynamical",
             "thickness_A",
             "semiconv_mrad",
+            "precession_deg",
+            "n_precession",
             "sigma_excitation",
             "rotation_step_deg",
             "pattern_range",
@@ -435,13 +459,17 @@ class DiffractionSim(anywidget.AnyWidget):
             "view_from",
             "scaling",
             "power",
+            "marker_power",
+            "marker_size",
             "cmap",
             "vmin_pct",
             "vmax_pct",
             "show_labels",
+            "show_hkl",
             "show_cell_axes",
             "n_cells",
             "polyhedra",
+            "show_ewald",
             "size",
             "kossel_json",
             "status",
