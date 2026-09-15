@@ -236,3 +236,20 @@ def test_atomic_model_channels_and_shapes():
         model.set_channel("bar", np.zeros(3))
     with pytest.raises(KeyError):
         model.get_channel("missing")
+
+
+def test_merge_close_sites():
+    xyz, _ = make_lattice("fcc", n=5, noise=0.01)
+    dup = np.vstack([xyz, xyz[:3] + 0.05, xyz[3:4] + np.array([0.02, 0.0, 0.0])])
+    model = AtomicModel.from_array(dup)
+    model.set_channel("intensity", np.r_[np.ones(xyz.shape[0]), 3.0, 3.0, 3.0, 3.0])
+    removed = model.merge_close_sites(min_distance=0.3)
+    assert removed == 4 and model.num_sites == xyz.shape[0]
+    # merged positions are the intensity-weighted mean and the channel is averaged
+    model2 = AtomicModel.from_array(dup)
+    model2.set_channel("intensity", np.r_[np.ones(xyz.shape[0]), 3.0, 3.0, 3.0, 3.0])
+    model2.merge_close_sites(min_distance=0.3, weight_channel="intensity")
+    assert model2["intensity"].max() == pytest.approx(2.5)
+    model3 = AtomicModel.from_array(dup)
+    assert model3.merge_close_sites(min_distance=0.3, mode="remove") == 4
+    assert model3.merge_close_sites(min_distance=0.3) == 0

@@ -16,6 +16,7 @@ from scipy.spatial import ConvexHull
 __all__ = [
     "misorientation",
     "segment_grains",
+    "fill_labels",
     "strain_from_deformation",
     "bond_angles",
     "convex_hull_distance",
@@ -104,6 +105,44 @@ def segment_grains(
     out = rank[labels]
     out[sizes[labels] < min_size] = -1
     return out
+
+
+def fill_labels(
+    labels: NDArray, neighbor_index: NDArray, edge_mask: NDArray, member: NDArray
+) -> NDArray:
+    """Assign unlabelled member sites to the majority label of their neighbors.
+
+    Parameters
+    ----------
+    labels : ndarray
+        ``(N,)`` labels, ``-1`` = unassigned.
+    neighbor_index : ndarray
+        ``(N, K)`` neighbor indices (``-1`` = missing).
+    edge_mask : ndarray
+        ``(N, K)`` votes are only counted along ``True`` edges.
+    member : ndarray
+        ``(N,)`` sites eligible for filling.
+
+    Returns
+    -------
+    ndarray
+        Updated copy of ``labels``.
+    """
+    labels = np.array(labels, copy=True)
+    todo = np.where(member & (labels < 0))[0]
+    if todo.size == 0:
+        return labels
+    safe = np.where(neighbor_index >= 0, neighbor_index, 0)
+    votes = np.where(edge_mask & (neighbor_index >= 0), labels[safe], -1)[todo]
+    n_max = int(labels.max()) + 2
+    counts = np.zeros((todo.size, n_max), dtype=int)
+    rows = np.repeat(np.arange(todo.size), votes.shape[1])
+    valid = votes.ravel() >= 0
+    np.add.at(counts, (rows[valid], votes.ravel()[valid]), 1)
+    best = counts.argmax(axis=1)
+    has_votes = counts.max(axis=1) > 0
+    labels[todo[has_votes]] = best[has_votes]
+    return labels
 
 
 def strain_from_deformation(deformation: NDArray, rotation: NDArray, frame: str = "lab") -> dict:

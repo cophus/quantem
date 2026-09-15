@@ -762,25 +762,42 @@ class AtomicModel(AutoSerialize):
         angle_threshold: float = 5.0,
         min_size: int = 20,
         min_score: float | None = None,
+        fill_iterations: int = 3,
+        fill_angle: float | None = None,
     ) -> NDArray:
         """Cluster sites of one structure into grains by local orientation.
 
         Neighboring sites of the given structure whose disorientation is below
-        ``angle_threshold`` are connected; connected components become grains.
-        Adds channels ``grain`` (``-1`` = none) and ``misorientation`` (largest
-        disorientation to any first-shell neighbor of the same structure).
+        ``angle_threshold`` are connected, and connected components become
+        grains.  Sites of the structure left without a grain (typically sites
+        between two grains, or sites in components smaller than ``min_size``)
+        are then assigned by majority vote of their first-shell neighbors,
+        provided their disorientation to that grain is below ``fill_angle``;
+        the vote is repeated ``fill_iterations`` times so gaps close inward.
+
+        Adds channels ``grain`` (``-1`` = none), ``misorientation`` (largest
+        disorientation to any first-shell neighbor of the same structure) and
+        ``boundary`` (categorical: ``interior``, ``grain_boundary`` for sites
+        with a first-shell neighbor in another grain, ``twin`` for sites of
+        the second matched template such as ``hcp``, and ``surface`` for sites
+        with fewer than 9 first-shell neighbors).
 
         Parameters
         ----------
         structure : str
             Template name to segment (e.g. ``"fcc"``).
         angle_threshold : float
-            Maximum disorientation (degrees) inside a grain.
+            Maximum disorientation (degrees) between connected sites.
         min_size : int
-            Grains with fewer sites are discarded.
+            Components with fewer sites are dissolved and re-filled.
         min_score : float, optional
             Only sites with ``score_<structure>`` above this take part;
             default: sites classified as ``structure``.
+        fill_iterations : int
+            Number of majority-vote passes over unassigned sites (0 disables).
+        fill_angle : float, optional
+            Maximum disorientation for a vote to count; default
+            ``3 * angle_threshold``.
 
         Returns
         -------
@@ -805,10 +822,37 @@ class AtomicModel(AutoSerialize):
         edge = same & (ang < angle_threshold)
         labels = meas.segment_grains(idx, edge, min_size=min_size)
         labels[~member] = -1
+        if fill_angle is None:
+            fill_angle = 3.0 * angle_threshold
+        for _ in range(int(fill_iterations)):
+            labels = meas.fill_labels(labels, idx, same & (ang < fill_angle), member)
+        # relabel by decreasing size
+        if labels.max() >= 0:
+            sizes = np.bincount(labels[labels >= 0])
+            order = np.argsort(-sizes, kind="stable")
+            rank = np.empty_like(order)
+            rank[order] = np.arange(order.size)
+            labels = np.where(labels >= 0, rank[np.clip(labels, 0, None)], -1)
         worst = np.where(same, ang, -1.0).max(axis=1).clip(0.0)
         num_grains = int(labels.max()) + 1 if labels.size else 0
         self.set_channel("grain", labels, categories=[str(i) for i in range(num_grains)])
         self.set_channel("misorientation", worst, "deg")
+        # boundary classification
+        structure_id = self.get_channel("structure").astype(int)
+        nb_labels = np.where(idx >= 0, labels[np.where(idx >= 0, idx, 0)], -2)
+        other_grain = (
+            first & (nb_labels >= 0) & (nb_labels != labels[:, None]) & (labels[:, None] >= 0)
+        )
+        boundary = np.zeros(self.num_sites, dtype=int)
+        boundary[other_grain.any(axis=1)] = 1
+        names = self._structure_names
+        twin_ids = [i for i, n in enumerate(names) if n != structure]
+        if twin_ids:
+            boundary[np.isin(structure_id, twin_ids)] = 2
+        boundary[first.sum(axis=1) < 9] = 3
+        self.set_channel(
+            "boundary", boundary, categories=["interior", "grain_boundary", "twin", "surface"]
+        )
         return labels
 
     def compute_strain(
@@ -897,6 +941,78 @@ class AtomicModel(AutoSerialize):
         c = xyz.mean(0) if about_center else np.zeros(3)
         self.positions_native = (xyz - c) @ rotation.T + c
 
+    def merge_close_sites(
+        self,
+        min_distance: float | None = None,
+        mode: str = "merge",
+        weight_channel: str | None = None,
+    ) -> int:
+        """Merge or remove sites closer than ``min_distance`` (in place).
+
+        Sites are grouped into clusters by connecting every pair closer than
+        ``min_distance``.  With ``mode="merge"`` each cluster is replaced by
+        one site at its (weighted) mean position, with all channels averaged;
+        with ``mode="remove"`` only the site with the largest weight (or the
+        first site) of each cluster is kept.  Neighbor lists, template matches
+        and the RDF are cleared afterwards.
+
+        Parameters
+        ----------
+        min_distance : float, optional
+            Distance threshold in native units.  Default: half the NN distance
+            from the RDF fit.
+        mode : {"merge", "remove"}
+            How to resolve each cluster.
+        weight_channel : str, optional
+            Channel used as weights (e.g. ``"intensity"``); equal weights if
+            omitted.
+
+        Returns
+        -------
+        int
+            Number of sites removed.
+        """
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+        from scipy.spatial import cKDTree
+
+        if min_distance is None:
+            min_distance = 0.5 * self.nn_distance
+        xyz = self.positions_native
+        n = xyz.shape[0]
+        pairs = cKDTree(xyz).query_pairs(float(min_distance), output_type="ndarray")
+        if pairs.shape[0] == 0:
+            return 0
+        graph = coo_matrix((np.ones(pairs.shape[0]), (pairs[:, 0], pairs[:, 1])), shape=(n, n))
+        _, labels = connected_components(graph, directed=False)
+        table = np.array(self._sites.array, dtype=float)
+        weights = (
+            np.ones(n)
+            if weight_channel is None
+            else self.get_channel(weight_channel).astype(float)
+        )
+        weights = np.where(np.isfinite(weights) & (weights > 0), weights, 1e-12)
+        num_clusters = int(labels.max()) + 1
+        if mode == "merge":
+            sums = np.zeros((num_clusters, table.shape[1]))
+            np.add.at(sums, labels, table * weights[:, None])
+            wsum = np.bincount(labels, weights=weights, minlength=num_clusters)
+            new_table = sums / wsum[:, None]
+        elif mode == "remove":
+            order = np.lexsort((-weights, labels))
+            first = np.ones(n, dtype=bool)
+            first[1:] = labels[order][1:] != labels[order][:-1]
+            new_table = table[order][first]
+        else:
+            raise ValueError("mode must be 'merge' or 'remove'")
+        sites = Vector.from_shape(
+            shape=(), fields=list(self._sites.fields), units=list(self._sites.units), name="sites"
+        )
+        sites[...] = np.ascontiguousarray(new_table)
+        self._sites = sites
+        self._invalidate()
+        return int(n - new_table.shape[0])
+
     def select(self, mask: NDArray) -> "AtomicModel":
         """Return a new model containing only the sites where ``mask`` is True."""
         mask = np.asarray(mask, dtype=bool)
@@ -942,9 +1058,19 @@ class AtomicModel(AutoSerialize):
         return fn(self, **kwargs)
 
     def show(self, **kwargs):
-        """Open the interactive 3D viewer (:class:`quantem.atoms.ShowAtoms3D`)."""
-        from quantem.atoms.show_atoms import ShowAtoms3D
+        """Open the interactive 3D viewer ``quantem.widget.ShowAtoms3D``.
 
+        Requires the ``quantem.widget`` package.  Keyword arguments are
+        forwarded to the viewer (``channel``, ``cmap``, ``canvas_size``,
+        ``marker_size``, ``dark_background``, ``title``).
+        """
+        try:
+            from quantem.widget import ShowAtoms3D
+        except ImportError as exc:
+            raise ImportError(
+                "AtomicModel.show() requires the quantem.widget package: "
+                "pip install quantem.widget"
+            ) from exc
         return ShowAtoms3D(self, **kwargs)
 
     def __repr__(self) -> str:

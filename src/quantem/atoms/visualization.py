@@ -127,6 +127,48 @@ def channel_colors(
     return rgb, colormap, (vmin, vmax), None
 
 
+def draw_spheres(ax, x, y, rgb, marker_size, edgecolor="k", num_layers: int = 6):
+    """Draw shaded sphere markers with a stack of offset, brightening discs.
+
+    Parameters
+    ----------
+    ax : Axes
+        Target axes.
+    x, y : ndarray
+        Marker centers (already sorted back-to-front).
+    rgb : ndarray
+        ``(N, 3)`` base colors.
+    marker_size : float
+        Scatter marker area (points^2) of the full sphere.
+    edgecolor : str or None
+        Outline color of the full disc.
+    num_layers : int
+        Number of highlight discs stacked toward the upper-left.
+    """
+    radius_pt = np.sqrt(marker_size) / 2.0
+    # convert an offset in points to data units using the axes transform
+    fig = ax.figure
+    axes_width_pt = ax.get_position().width * fig.get_size_inches()[0] * 72.0
+    xlim = ax.get_xlim() if ax.has_data() else (np.min(x), np.max(x))
+    data_per_pt = (abs(xlim[1] - xlim[0]) or 1.0) / axes_width_pt
+    rgb = np.asarray(rgb)
+    ax.scatter(
+        x, y, s=marker_size, c=rgb * 0.55, edgecolors=edgecolor, linewidths=0.4 if edgecolor else 0
+    )
+    for i in range(1, num_layers + 1):
+        t = i / num_layers
+        scale = 1.0 - 0.75 * t
+        shift = 0.28 * t * radius_pt * data_per_pt
+        color = np.clip(rgb * (0.55 + 0.6 * t) + 0.35 * t**2, 0, 1)
+        ax.scatter(
+            x - shift,
+            y - shift,
+            s=marker_size * scale**2,
+            c=color,
+            edgecolors="none",
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Plots
 # --------------------------------------------------------------------------- #
@@ -224,6 +266,7 @@ def plot_slab(
     depth_cue: float = 0.35,
     hide: tuple[float, float] | None = None,
     edgecolor: str | None = "k",
+    style: str = "spheres",
     ax=None,
     figsize: tuple[float, float] = (7, 7),
     colorbar: bool = True,
@@ -254,6 +297,9 @@ def plot_slab(
         Hide sites whose channel value lies inside this range.
     edgecolor : str or None
         Marker edge color.
+    style : {"spheres", "flat"}
+        ``"spheres"`` draws shaded spheres (a stack of offset, brightening
+        discs per site); ``"flat"`` draws plain scatter markers.
     """
     uvd, keep, _ = _project(model, normal, up, offset, thickness, hide, channel)
     rgb, colormap, (lo, hi), categories = channel_colors(model, channel, cmap, vmin, vmax)
@@ -275,14 +321,17 @@ def plot_slab(
         axes_width_pt = ax.get_position().width * fig.get_size_inches()[0] * 72.0
         diameter_pt = 0.9 * model.bond_length * axes_width_pt / extent
         marker_size = max(diameter_pt**2, 1.0)
-    sc = ax.scatter(
-        uvd[:, 1],
-        uvd[:, 0],
-        s=marker_size,
-        c=rgb,
-        edgecolors=edgecolor,
-        linewidths=0.3 if edgecolor else 0,
-    )
+    if style == "spheres":
+        draw_spheres(ax, uvd[:, 1], uvd[:, 0], rgb, marker_size, edgecolor=edgecolor)
+    else:
+        ax.scatter(
+            uvd[:, 1],
+            uvd[:, 0],
+            s=marker_size,
+            c=rgb,
+            edgecolors=edgecolor,
+            linewidths=0.3 if edgecolor else 0,
+        )
     ax.set_aspect("equal")
     ax.invert_yaxis()
     ax.set_xlabel(f"v [{model.units}]")
@@ -305,7 +354,6 @@ def plot_slab(
         else:
             sm = plt.cm.ScalarMappable(cmap=colormap, norm=plt.Normalize(lo, hi))
             fig.colorbar(sm, ax=ax, fraction=0.04, pad=0.02, label=channel)
-    del sc
     return (fig, ax) if returnfig else None
 
 
