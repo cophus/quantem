@@ -30,6 +30,7 @@ class Dataset3d(Dataset):
         sampling: NDArray | tuple | list | float | int,
         units: list[str] | tuple | list,
         signal_units: str = "arb. units",
+        metadata: dict = {},
         _token: object | None = None,
     ):
         """Initialize a 3D dataset.
@@ -58,6 +59,7 @@ class Dataset3d(Dataset):
             sampling=sampling,
             units=units,
             signal_units=signal_units,
+            metadata=metadata,
             _token=_token,
         )
 
@@ -187,7 +189,7 @@ class Dataset3d(Dataset):
         start: int = 0,
         end: int | None = None,
         step: int = 1,
-        max_indices: int | None = 20,
+        max: int | None = 20,
         ncols: int = 4,
         scalebar: ScalebarConfig | bool = False,
         title_prefix: str | None = None,
@@ -204,10 +206,10 @@ class Dataset3d(Dataset):
         start : int, default 0
             First frame index. Supports negative indexing.
         end : int or None, optional
-            End frame index (exclusive). If None, determined by max_indices.
+            End frame index (exclusive). If None, determined by max.
         step : int, default 1
             Step between frames. Negative step shows frames in reverse order.
-        max_indices : int or None, default 20
+        max : int or None, default 20
             Maximum number of frames to show. Prevents memory issues.
             Set to None to show all frames.
         ncols : int, default 4
@@ -237,7 +239,7 @@ class Dataset3d(Dataset):
         Raises
         ------
         ValueError
-            If step is zero, ncols < 1, max_indices < 1, start is out of bounds,
+            If step is zero, ncols < 1, max < 1, start is out of bounds,
             or the specified range has no frames to display.
 
         Examples
@@ -245,12 +247,12 @@ class Dataset3d(Dataset):
         Basic usage:
 
         >>> data.show()                    # first 20 frames
-        >>> data.show(max_indices=None)    # all frames (use with caution)
+        >>> data.show(max=None)            # all frames (use with caution)
 
         Single frame:
 
-        >>> data.show(start=5, max_indices=1)   # frame 5
-        >>> data.show(start=-1, max_indices=1)  # last frame
+        >>> data.show(start=5, max=1)      # frame 5
+        >>> data.show(start=-1, max=1)     # last frame
 
         Frame range:
 
@@ -262,7 +264,7 @@ class Dataset3d(Dataset):
         Grid layout:
 
         >>> data.show(ncols=2)             # 2 columns
-        >>> data.show(ncols=5, max_indices=10)  # 5x2 grid
+        >>> data.show(ncols=5, max=10)     # 5x2 grid
 
         Titles:
 
@@ -283,8 +285,8 @@ class Dataset3d(Dataset):
             raise ValueError("Step cannot be zero.")
         if ncols < 1:
             raise ValueError(f"ncols must be >= 1, got {ncols}.")
-        if max_indices is not None and max_indices < 1:
-            raise ValueError(f"max_indices must be >= 1 or None, got {max_indices}.")
+        if max is not None and max < 1:
+            raise ValueError(f"max must be >= 1 or None, got {max}.")
         if start < 0:
             start = total_frames + start
         if start < 0 or start >= total_frames:
@@ -304,9 +306,9 @@ class Dataset3d(Dataset):
         if step > 0:
             end_idx = min(end_idx, total_frames)
 
-        # Apply max_indices limit to avoid creating huge list
-        if max_indices is not None:
-            max_end = start + max_indices * step
+        # Apply max limit to avoid creating huge list
+        if max is not None:
+            max_end = start + max * step
             if step > 0:
                 end_idx = min(end_idx, max_end)
             elif max_end > end_idx:
