@@ -304,6 +304,7 @@ class DiffractionSim(anywidget.AnyWidget):
     n_precession = traitlets.Int(24).tag(sync=True)
     sigma_excitation = traitlets.Float(0.02).tag(sync=True)
     rotation_step_deg = traitlets.Float(15.0).tag(sync=True)
+    rotation_speed_deg = traitlets.Float(6.0).tag(sync=True)  # continuous rotation buttons, deg/s
     pattern_range = traitlets.Float(3.0).tag(sync=True)
     field_mrad = traitlets.Float(50.0).tag(sync=True)
     sg_max = traitlets.Float(0.05).tag(sync=True)
@@ -451,6 +452,7 @@ class DiffractionSim(anywidget.AnyWidget):
             "n_precession",
             "sigma_excitation",
             "rotation_step_deg",
+            "rotation_speed_deg",
             "pattern_range",
             "field_mrad",
             "sg_max",

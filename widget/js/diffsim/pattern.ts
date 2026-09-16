@@ -380,8 +380,8 @@ export function drawKosselLines(
     // line p . n = distance, direction t = (-ny, nx); drawn between two lab points
     const [x0, y0] = toPx(f, nx * l.distance - ny * L, ny * l.distance + nx * L);
     const [x1, y1] = toPx(f, nx * l.distance + ny * L, ny * l.distance - nx * L);
-    ctx.strokeStyle = dark ? `rgba(20,20,20,${0.25 + 0.75 * l.strength})` : `rgba(30,30,30,${0.2 + 0.8 * l.strength})`;
-    ctx.lineWidth = Math.max(1, l.width * s);
+    ctx.strokeStyle = dark ? `rgba(20,20,20,${Math.min(1, 0.1 + 0.9 * l.strength)})` : `rgba(30,30,30,${Math.min(1, 0.1 + 0.9 * l.strength)})`;
+    ctx.lineWidth = Math.max(0.6, l.width * s);
     ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
   }
   if (labels) {
@@ -401,22 +401,33 @@ export function drawKosselLines(
   drawScaleBar(ctx, f, s, "rad", dark, 0.01);
 }
 
-/** Kikuchi line pairs overlaid on a nanobeam pattern (deficient dark, excess bright). */
+/**
+ * Kikuchi line pairs overlaid on a nanobeam pattern (deficient blue, excess
+ * red). Opacity and width grow with the cube of the strength relative to the
+ * strongest line of the cell, so only the few major lines read as heavy and
+ * the rest fade into the background; at most the MAX_KIKUCHI strongest pairs
+ * are drawn, weakest first.
+ */
+const MAX_KIKUCHI = 40;
 export function drawKikuchiOverlay(ctx: CanvasRenderingContext2D, f: Frame, lines: KosselLine[], k0: number, dark: boolean) {
   const L = 3 * f.qMax;
-  for (const l of lines) {
-    if (l.strength < 0.25) continue;
+  const shown = lines.filter((l) => l.strength > 0).sort((a, b) => b.strength - a.strength).slice(0, MAX_KIKUCHI).reverse();
+  const sMax = shown.length ? shown[shown.length - 1].strength : 1;
+  for (const l of shown) {
     const d = l.distance * k0; // 1/A
     const [nx, ny] = l.normal;
+    const r3 = (l.strength / sMax) ** 3;
+    const alpha = (0.05 + 0.5 * r3).toFixed(3);
+    const width = 0.5 + 1.3 * r3;
     const draw = (dist: number, color: string) => {
       const [x0, y0] = toPx(f, nx * dist - ny * L, ny * dist + nx * L);
       const [x1, y1] = toPx(f, nx * dist + ny * L, ny * dist - nx * L);
       ctx.strokeStyle = color;
-      ctx.lineWidth = 1;
+      ctx.lineWidth = width;
       ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
     };
-    draw(d, dark ? `rgba(120,170,255,${0.3 + 0.5 * l.strength})` : `rgba(30,90,200,${0.3 + 0.5 * l.strength})`);
-    draw(d + l.gxy, dark ? `rgba(255,140,120,${0.3 + 0.5 * l.strength})` : `rgba(200,60,40,${0.3 + 0.5 * l.strength})`);
+    draw(d, dark ? `rgba(120,170,255,${alpha})` : `rgba(30,90,200,${alpha})`);
+    draw(d + l.gxy, dark ? `rgba(255,140,120,${alpha})` : `rgba(200,60,40,${alpha})`);
   }
 }
 

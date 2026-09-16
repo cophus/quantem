@@ -35,6 +35,7 @@ import {
 } from "./pattern";
 
 const DIRECT: Reflection = { index: -1, hkl: [0, 0, 0], g: [0, 0, 0], gLen: 0, s: 0 };
+const SPIN_FPS = 20; // orientation update rate while spinning
 const QUALITY: Record<string, { grid: number; beams: number; nanobeam: number }> = {
   fast: { grid: 5, beams: 24, nanobeam: 40 },
   medium: { grid: 7, beams: 36, nanobeam: 64 },
@@ -133,6 +134,7 @@ function DiffSim() {
   const [nPrecession] = useModelState<number>("n_precession");
   const [sigma, setSigma] = useModelState<number>("sigma_excitation");
   const [stepDeg, setStepDeg] = useModelState<number>("rotation_step_deg");
+  const [spinSpeed, setSpinSpeed] = useModelState<number>("rotation_speed_deg"); // deg/s for the continuous rotation buttons
   const [scaling, setScaling] = useModelState<string>("scaling");
   const [power, setPower] = useModelState<number>("power");
   const [cmap, setCmap] = useModelState<string>("cmap");
@@ -165,7 +167,11 @@ function DiffSim() {
   const qMaxDisp = Math.min(Math.max(patternRange || 0, 0.2), crystal?.k_max ?? 4);
   const setQMaxDisp = setPatternRange;
   const [zoneText, setZoneText] = React.useState("");
-  const [dragging, setDragging] = React.useState(false);
+  const [ptrDrag, setDragging] = React.useState(false);
+  // continuous slow rotation about the screen axes (toggle buttons next to the step box)
+  const [spin, setSpin] = React.useState<{ x: boolean; y: boolean }>({ x: false, y: false });
+  const spinning = spin.x || spin.y;
+  const dragging = ptrDrag || spinning; // reduced quality while the orientation is changing
   const [winW, setWinW] = React.useState(typeof window !== "undefined" ? window.innerWidth : 1200);
   React.useEffect(() => {
     const f = () => setWinW(window.innerWidth);
@@ -196,6 +202,28 @@ function DiffSim() {
     const dq = quatFromAxisAngle([viewX * axis[0], axis[1], viewX * axis[2]], (deg * Math.PI) / 180);
     setQuat(qnormalize(qmult(dq, quatRef.current)), immediate);
   }, [setQuat, viewX]);
+
+  const spinRef = React.useRef({ ...spin, speed: spinSpeed || 6 });
+  spinRef.current = { ...spin, speed: spinSpeed || 6 };
+  React.useEffect(() => {
+    if (!spinning) return;
+    let raf = 0, last = 0, due = 0, pendX = 0, pendY = 0;
+    const tick = (t: number) => {
+      const dt = last ? Math.min(0.1, (t - last) / 1000) : 0;
+      last = t;
+      if (spinRef.current.y) pendY += spinRef.current.speed * dt;
+      if (spinRef.current.x) pendX += spinRef.current.speed * dt;
+      if (t >= due) {
+        due = t + 1000 / SPIN_FPS;
+        if (pendY) rotateLab([0, 1, 0], pendY, false);
+        if (pendX) rotateLab([1, 0, 0], pendX, false);
+        pendX = pendY = 0;
+      }
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [spinning, rotateLab]);
 
   // ---- pointer handling on the cell canvas (mouse and touch) -------------
   const cellRef = React.useRef<HTMLCanvasElement>(null);
@@ -350,13 +378,14 @@ function DiffSim() {
   }, [k0, precession, nPrecession, dragging]);
   const nbSolution = React.useMemo(() => {
     if (!crystal || mode !== "nanobeam" || !dynamical) return null;
-    return nanobeamSolve(crystal, quat, qMaxDisp, SG_MAX, dragging ? Math.min(qual.nanobeam, 40) : qual.nanobeam, precNodes);
-  }, [crystal, quat, qMaxDisp, mode, dynamical, dragging, qual, SG_MAX, precNodes]);
+    // the physics uses every reflection the crystal carries; the pattern range only crops the drawing
+    return nanobeamSolve(crystal, quat, crystal.k_max, SG_MAX, dragging ? Math.min(qual.nanobeam, 40) : qual.nanobeam, precNodes);
+  }, [crystal, quat, mode, dynamical, dragging, qual, SG_MAX, precNodes]);
   const nbBeams = React.useMemo<Reflection[]>(() => {
     if (!crystal || mode !== "nanobeam") return [];
     if (nbSolution) return nbSolution.beams;
-    return [DIRECT, ...labReflections(crystal, quat, qMaxDisp)];
-  }, [crystal, quat, qMaxDisp, mode, nbSolution]);
+    return [DIRECT, ...labReflections(crystal, quat, crystal.k_max)];
+  }, [crystal, quat, mode, nbSolution]);
   const nb = { beams: nbBeams, nDyn: nbSolution ? Math.round(nbSolution.nDynMean) : 0 };
   const nbInten = React.useMemo(() => {
     if (!crystal || mode !== "nanobeam") return new Float64Array(0);
@@ -375,8 +404,8 @@ function DiffSim() {
     if (!crystal || mode !== "cbed") return null;
     const Rk = k0 * Math.sin(alpha);
     const grid = tiltGrid(Rk, dragging ? 5 : qual.grid);
-    if (!dynamical) return { grid, beams: [DIRECT, ...labReflections(crystal, quat, qMaxDisp)], nDyn: 0, sols: null };
-    const { beams, nDyn } = hybridBeams(crystal, quat, qMaxDisp, SG_MAX, dragging ? Math.min(qual.beams, 24) : qual.beams, Math.sin(alpha));
+    if (!dynamical) return { grid, beams: [DIRECT, ...labReflections(crystal, quat, crystal.k_max)], nDyn: 0, sols: null };
+    const { beams, nDyn } = hybridBeams(crystal, quat, crystal.k_max, SG_MAX, dragging ? Math.min(qual.beams, 24) : qual.beams, Math.sin(alpha));
     const dyn = beams.slice(0, nDyn);
     const sols = grid.tilts.map((t) => blochSolve(crystal, dyn, t));
     return { grid, beams, nDyn, sols };
@@ -449,7 +478,7 @@ function DiffSim() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    const refl = mode === "nanobeam" && nbBeams.length ? nbBeams : labReflections(crystal, quat, qMaxDisp);
+    const refl = mode === "nanobeam" && nbBeams.length ? nbBeams : labReflections(crystal, quat, crystal.k_max);
     drawEwaldPanel(ctx, Sc, Se, refl, k0, qMaxDisp, SG_MAX, viewX, dark, mode === "nanobeam" ? precession || 0 : 0);
   }, [quat, Sc, Se, dark, viewX, showEwald, crystal, mode, nbBeams, qMaxDisp, k0, SG_MAX, precession]);
 
@@ -520,7 +549,7 @@ function DiffSim() {
     const res = await fetch(import.meta.url);
     const bundle = await res.text();
     const keys = ["crystal_json", "presets", "preset", "energy_ev", "k_max", "orientation", "mode", "render", "dynamical", "thickness_A",
-      "semiconv_mrad", "precession_deg", "n_precession", "sigma_excitation", "rotation_step_deg", "pattern_range", "field_mrad", "sg_max", "quality", "show_kikuchi", "view_from",
+      "semiconv_mrad", "precession_deg", "n_precession", "sigma_excitation", "rotation_step_deg", "rotation_speed_deg", "pattern_range", "field_mrad", "sg_max", "quality", "show_kikuchi", "view_from",
       "scaling", "power", "cmap", "marker_power", "marker_size", "vmin_pct", "vmax_pct", "show_labels",
       "show_cell_axes", "show_hkl", "n_cells", "polyhedra", "show_ewald", "size", "kossel_json", "status", "widget_version"];
     const state: Record<string, unknown> = {};
@@ -596,14 +625,14 @@ function DiffSim() {
       {/* panels: cell (with the Ewald view below it) and the pattern */}
       <Stack direction="row" spacing={1.5} flexWrap="wrap" useFlexGap alignItems="flex-start">
         <Box sx={{ width: Sc }}>
-          <canvas ref={cellRef} style={{ width: Sc, height: Sc, touchAction: "none", cursor: dragging ? "grabbing" : "grab", borderRadius: 4, background: dark ? "#141414" : "#fafafa", border: `1px solid ${colors.border}`, display: "block" }}
+          <canvas ref={cellRef} style={{ width: Sc, height: Sc, touchAction: "none", cursor: ptrDrag ? "grabbing" : "grab", borderRadius: 4, background: dark ? "#141414" : "#fafafa", border: `1px solid ${colors.border}`, display: "block" }}
             onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp} onPointerCancel={onPointerUp} onPointerLeave={onPointerUp} />
           {showEwald && Se > 0 && (
             <canvas ref={ewaldRef} style={{ width: Sc, height: Se, marginTop: GAP, borderRadius: 4, background: dark ? "#141414" : "#fafafa", border: `1px solid ${colors.border}`, display: "block" }} />
           )}
         </Box>
         <Box sx={{ width: S }}>
-          <canvas ref={patRef} style={{ width: S, height: S, touchAction: "none", cursor: dragging ? "grabbing" : "grab", borderRadius: 4, border: `1px solid ${colors.border}`, display: "block" }}
+          <canvas ref={patRef} style={{ width: S, height: S, touchAction: "none", cursor: ptrDrag ? "grabbing" : "grab", borderRadius: 4, border: `1px solid ${colors.border}`, display: "block" }}
             onPointerDown={onPatDown} onPointerMove={onPatMove} onPointerUp={onPatUp} onPointerCancel={onPatUp} onPointerLeave={onPatUp} onDoubleClick={onPatDoubleClick} />
         </Box>
       </Stack>
@@ -622,6 +651,15 @@ function DiffSim() {
           <TextField size="small" type="number" value={stepDeg} onChange={(e) => setStepDeg(Math.max(0.01, Number(e.target.value) || 0.01))}
             inputProps={{ step: 1, min: 0.01, max: 180, style: { fontSize: 11, padding: "4px 6px", width: 42 } }} sx={tf} />
           <Typography sx={{ fontSize: 11, opacity: 0.7 }}>°</Typography>
+          <ToggleButtonGroup size="small" value={[spin.y ? "y" : "", spin.x ? "x" : ""]} sx={tbg}>
+            <ToggleButton value="y" title="rotate slowly, horizontally (click again to stop)" onClick={() => setSpin((s) => ({ ...s, y: !s.y }))}>↔</ToggleButton>
+            <ToggleButton value="x" title="rotate slowly, vertically (click again to stop)" onClick={() => setSpin((s) => ({ ...s, x: !s.x }))}>↕</ToggleButton>
+          </ToggleButtonGroup>
+          <Tooltip title="rotation speed of the ↔ ↕ buttons"><Box sx={{ width: 64, px: 0.5 }}>
+            <Slider value={spinSpeed || 6} min={1} max={30} step={1} size="small" onChange={(_, v) => setSpinSpeed(v as number)}
+              sx={{ py: 0.5, "& .MuiSlider-thumb": { width: 12, height: 12 } }} />
+          </Box></Tooltip>
+          <Typography sx={{ fontSize: 11, fontFamily: "monospace", opacity: 0.8 }}>{Math.round(spinSpeed || 6)}°/s</Typography>
           <Button size="small" onClick={() => setQuat([1, 0, 0, 0], true)} sx={{ ...btn, height: 26, minWidth: 0, px: 1 }}>reset</Button>
           <Typography sx={{ fontSize: 11, fontFamily: "monospace", ml: 1 }}>zone axis {fmtIndices(zoneAxis, crystal.hexagonal)}</Typography>
           <Typography sx={{ fontSize: 11, opacity: 0.75 }}>{crystal.name} · {crystal.spacegroup || crystal.pointgroup}</Typography>

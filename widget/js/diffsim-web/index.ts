@@ -29,12 +29,14 @@ import {
   Frame, cbedImage, drawDisks, drawEwaldPanel, drawImage, drawKikuchiOverlay, drawKosselLines, setupCanvas, tiltGrid, toPx,
 } from "../diffsim/pattern";
 import { ENERGY_EV, PRESETS } from "./presets";
+import { ParsedCif, crystalFromCif, parseCif } from "./cif";
 
 const DIRECT: Reflection = { index: -1, hkl: [0, 0, 0], g: [0, 0, 0], gLen: 0, s: 0 };
 const SG_MAX = 0.05;
 const VIEW_X = -1; // detector-side view: cell and pattern move together
 const MAX_BEAMS = 48;
 const MAX_BEAMS_DRAG = 28;
+const SPIN_FPS = 20; // recompute rate while spinning (battery)
 const CBED_GRID = 7;
 const CBED_GRID_DRAG = 5;
 
@@ -76,6 +78,9 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
     fieldMrad: opt("field_mrad", 50) as number,
     patternRange: opt("pattern_range", 3.0) as number,
     stepDeg: 15,
+    spinSpeed: opt("rotation_speed_deg", 6) as number, // deg/s for the continuous rotation buttons
+    spinX: false, // continuous slow rotation about the screen x axis (vertical motion)
+    spinY: false, // ... about the screen y axis (horizontal motion)
     showLabels: opt("show_labels", true) as boolean,
     showHkl: opt("show_hkl", true) as boolean,
     showAppearance: false,
@@ -90,11 +95,18 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
     showEwald: opt("show_ewald", true) as boolean,
     quat: [1, 0, 0, 0] as Quat,
     dragging: false,
+    spinning: false,
   };
   const ENERGIES = [60e3, 80e3, 100e3, 120e3, 200e3, 300e3];
   if (!ENERGIES.includes(state.energy)) ENERGIES.push(state.energy);
   ENERGIES.sort((a, b) => a - b);
-  let crystal: CrystalData = parseCrystal(PRESETS[state.preset], state.energy)!;
+  const cifs = new Map<string, ParsedCif>(); // structures loaded from CIF files, by menu name
+  const loadCrystal = (name: string, energy: number): CrystalData => {
+    const cif = cifs.get(name);
+    if (cif) return crystalFromCif(cif, energy, 3.0);
+    return parseCrystal(PRESETS[name], energy)!;
+  };
+  let crystal: CrystalData = loadCrystal(state.preset, state.energy);
   let geom = cellGeometry(crystal, state.nCells, state.polyhedra);
   const k0 = () => 1 / crystal.wavelength;
 
@@ -118,7 +130,10 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
     .${id}-wrap { background: var(--${id}-bg, #111); color: var(--${id}-fg, #ccc); border: 1px solid var(--${id}-border, #444);
       border-radius: 8px; padding: 10px 14px 8px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       font-size: 13px; max-width: 100%; box-sizing: border-box; }
-    .${id}-title { font-size: 16px; font-weight: 600; color: var(--${id}-title, #ddd); margin-bottom: 6px; text-align: center; }
+    .${id}-titlerow { position: relative; display: flex; align-items: center; justify-content: center; margin-bottom: 6px; min-height: 28px; }
+    .${id}-title { font-size: 16px; font-weight: 600; color: var(--${id}-title, #ddd); text-align: center; }
+    .${id}-titlerow .${id}-btn { position: absolute; right: 0; top: 50%; transform: translateY(-50%); }
+    .${id}-file { display: none; }
     .${id}-top { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; justify-content: center; margin-bottom: 8px; }
     .${id}-panels { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
     .${id}-panel { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 0 0 auto; }
@@ -153,7 +168,11 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
   wrap.className = `${id}-wrap`;
   const presetOptions = names.map((n) => `<option value="${n}"${n === state.preset ? " selected" : ""}>${n}</option>`).join("");
   wrap.innerHTML = `
-    <div class="${id}-title">Electron diffraction simulator</div>
+    <div class="${id}-titlerow">
+      <div class="${id}-title">Electron diffraction simulator</div>
+      <div class="${id}-btn" id="${id}-cifbtn" title="Load a crystal structure from a CIF file">load CIF…</div>
+      <input type="file" class="${id}-file" id="${id}-ciffile" accept=".cif,.CIF,text/plain">
+    </div>
     <div class="${id}-top">
       <label>structure <select id="${id}-preset">${presetOptions}</select></label>
       <label>zone axis <input type="text" id="${id}-zone" size="8" placeholder="1 1 0"></label>
@@ -170,6 +189,8 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
           <div class="${id}-group"><div class="${id}-btn" data-rot="y-">y −</div><div class="${id}-btn" data-rot="y+">y +</div></div>
           <div class="${id}-group"><div class="${id}-btn" data-rot="z-">z −</div><div class="${id}-btn" data-rot="z+">z +</div></div>
           <input type="number" id="${id}-step" value="15" min="0.1" max="180" step="1" style="width:46px"> <span class="${id}-hint">°</span>
+          <div class="${id}-group"><div class="${id}-btn" data-spin="y" title="rotate slowly, horizontally (click again to stop)">↔</div><div class="${id}-btn" data-spin="x" title="rotate slowly, vertically (click again to stop)">↕</div></div>
+          <input type="range" id="${id}-spin" min="1" max="30" step="1" value="${state.spinSpeed}" style="width:64px" title="rotation speed of the ↔ ↕ buttons"> <span class="${id}-hint ${id}-mono" id="${id}-spinv">${state.spinSpeed}°/s</span>
         </div>
         <div class="${id}-row">
           <span id="${id}-info" class="${id}-hint"></span>
@@ -291,25 +312,26 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
     // everything that depends on the orientation (not on thickness)
     const q = state.quat;
     const alpha = state.semiconv * 1e-3;
-    const maxBeams = state.dragging ? dragBeams : MAX_BEAMS;
+    const maxBeams = (state.dragging || state.spinning) ? dragBeams : MAX_BEAMS;
     if (state.mode === "nanobeam") {
-      nbTilts = precessionTilts(k0(), state.precession, state.dragging ? dragNodes : 16);
+      nbTilts = precessionTilts(k0(), state.precession, (state.dragging || state.spinning) ? dragNodes : 16);
       if (state.dynamical) {
-        nbSolution = nanobeamSolve(crystal, q, state.patternRange, SG_MAX, maxBeams, nbTilts);
+        // the physics always uses every reflection the crystal carries; the pattern range only crops the drawing
+        nbSolution = nanobeamSolve(crystal, q, crystal.k_max, SG_MAX, maxBeams, nbTilts);
         nb = { beams: nbSolution.beams, nDyn: Math.round(nbSolution.nDynMean) };
       } else {
-        nb = { beams: [DIRECT, ...labReflections(crystal, q, state.patternRange)], nDyn: 0 };
+        nb = { beams: [DIRECT, ...labReflections(crystal, q, crystal.k_max)], nDyn: 0 };
         nbSolution = null;
       }
     } else if (state.mode === "cbed") {
       const Rk = k0() * Math.sin(alpha);
-      const grid = tiltGrid(Rk, state.dragging ? CBED_GRID_DRAG : CBED_GRID);
+      const grid = tiltGrid(Rk, (state.dragging || state.spinning) ? CBED_GRID_DRAG : CBED_GRID);
       if (state.dynamical) {
-        const { beams, nDyn } = hybridBeams(crystal, q, state.patternRange, SG_MAX, state.dragging ? 20 : 32, Math.sin(alpha));
+        const { beams, nDyn } = hybridBeams(crystal, q, crystal.k_max, SG_MAX, (state.dragging || state.spinning) ? 20 : 32, Math.sin(alpha));
         const dyn = beams.slice(0, nDyn);
         cbed = { grid, beams, nDyn, sols: grid.tilts.map((t) => blochSolve(crystal, dyn, t)) };
       } else {
-        cbed = { grid, beams: [DIRECT, ...labReflections(crystal, q, state.patternRange)], nDyn: 0, sols: null };
+        cbed = { grid, beams: [DIRECT, ...labReflections(crystal, q, crystal.k_max)], nDyn: 0, sols: null };
       }
     }
     if (state.mode === "kossel" || (state.mode === "nanobeam" && state.kikuchi)) {
@@ -339,7 +361,7 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
       const ctx = ewaldCanvas.getContext("2d");
       if (ctx) {
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        const refl = state.mode === "nanobeam" && nb.beams.length ? nb.beams : labReflections(crystal, state.quat, state.patternRange);
+        const refl = state.mode === "nanobeam" && nb.beams.length ? nb.beams : labReflections(crystal, state.quat, crystal.k_max);
         drawEwaldPanel(ctx, Sc, Se, refl, k0(), state.patternRange, SG_MAX, VIEW_X, dark, state.mode === "nanobeam" ? state.precession : 0);
       }
     }
@@ -460,7 +482,7 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
     const t0 = performance.now();
     solveOrientation();
     drawAll();
-    if (state.dragging) {
+    if (state.dragging || state.spinning) {
       // keep dragging responsive: aim for well under 100 ms per recompute
       const dt = performance.now() - t0;
       if (dt > 90) { dragBeams = Math.max(12, Math.round(dragBeams * 0.7)); dragNodes = Math.max(4, dragNodes - 2); }
@@ -595,6 +617,39 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
     });
   });
   $<HTMLInputElement>(`#${id}-step`).addEventListener("change", (e) => { state.stepDeg = Math.max(0.1, +(e.target as HTMLInputElement).value || 15); });
+  // continuous slow rotation (toggle buttons): state.spinSpeed deg/s about the screen
+  // axes, recomputed at drag quality no more than SPIN_FPS times a second
+  let spinRaf = 0, spinLast = 0, spinDue = 0, spinPendX = 0, spinPendY = 0;
+  const spinTick = (t: number) => {
+    spinRaf = 0;
+    if (!state.spinX && !state.spinY) {
+      if (state.spinning) { state.spinning = false; recompute(); } // back to full quality
+      return;
+    }
+    const dt = spinLast ? Math.min(0.1, (t - spinLast) / 1000) : 0;
+    spinLast = t;
+    if (state.spinY) spinPendY += state.spinSpeed * dt;
+    if (state.spinX) spinPendX += state.spinSpeed * dt;
+    if (t >= spinDue) {
+      spinDue = t + 1000 / SPIN_FPS;
+      if (spinPendY) rotateScreen([0, 1, 0], spinPendY);
+      if (spinPendX) rotateScreen([1, 0, 0], spinPendX);
+      spinPendX = spinPendY = 0;
+      recompute();
+    }
+    spinRaf = requestAnimationFrame(spinTick);
+  };
+  $<HTMLInputElement>(`#${id}-spin`).addEventListener("input", (e) => {
+    state.spinSpeed = Math.max(1, +(e.target as HTMLInputElement).value || 6);
+    $(`#${id}-spinv`).textContent = `${state.spinSpeed}°/s`;
+  });
+  wrap.querySelectorAll<HTMLElement>(`[data-spin]`).forEach((b) => {
+    b.addEventListener("click", () => {
+      if (b.dataset.spin === "x") state.spinX = !state.spinX; else state.spinY = !state.spinY;
+      b.classList.toggle("active", b.dataset.spin === "x" ? state.spinX : state.spinY);
+      if ((state.spinX || state.spinY) && !spinRaf) { state.spinning = true; spinLast = 0; spinRaf = requestAnimationFrame(spinTick); }
+    });
+  });
   const goZone = () => {
     const v = parseDirection($<HTMLInputElement>(`#${id}-zone`).value); // 3 or 4 (Miller-Bravais) indices
     if (!v) return;
@@ -604,9 +659,42 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
   $(`#${id}-go`).addEventListener("click", goZone);
   $<HTMLInputElement>(`#${id}-zone`).addEventListener("keydown", (e) => { if (e.key === "Enter") goZone(); });
   $(`#${id}-reset`).addEventListener("click", () => { setZoneAxis(crystal.hexagonal ? [0, 0, 1] : [1, 1, 0]); recompute(); });
+  // CIF upload: parse in the browser, add to the structure menu, select it
+  const fileInput = $<HTMLInputElement>(`#${id}-ciffile`);
+  $(`#${id}-cifbtn`).addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = parseCif(text, file.name.replace(/\.cif$/i, ""));
+      const menuName = `${parsed.name} (CIF)`;
+      cifs.set(menuName, parsed);
+      const sel = $<HTMLSelectElement>(`#${id}-preset`);
+      if (![...sel.options].some((o) => o.value === menuName)) {
+        const opt = document.createElement("option");
+        opt.value = menuName; opt.textContent = menuName;
+        sel.appendChild(opt);
+      }
+      sel.value = menuName;
+      state.preset = menuName;
+      crystal = loadCrystal(menuName, state.energy);
+      const range = $<HTMLInputElement>(`#${id}-range`);
+      range.max = String(crystal.k_max);
+      if (state.patternRange > crystal.k_max) { state.patternRange = crystal.k_max; range.value = String(crystal.k_max); }
+      range.dispatchEvent(new Event("input")); // refresh the slider label
+      geomKey = "";
+      setZoneAxis(crystal.hexagonal ? [0, 0, 1] : [1, 1, 0]);
+      recompute();
+      $(`#${id}-status`).textContent = `${menuName}: ${parsed.symbols.length} atoms in the cell, ${parsed.spacegroup || "symmetry from the file"}, ${crystal.hkl.length} reflections out to ${crystal.k_max.toFixed(2)} Å⁻¹${crystal.k_max < 3 ? " (reduced for this cell size)" : ""}; absorption approximated as 8 % of the potential`;
+    } catch (err) {
+      $(`#${id}-status`).textContent = `could not read ${file.name}: ${(err as Error).message}`;
+    }
+    fileInput.value = "";
+  });
   $<HTMLSelectElement>(`#${id}-preset`).addEventListener("change", (e) => {
     state.preset = (e.target as HTMLSelectElement).value;
-    crystal = parseCrystal(PRESETS[state.preset], state.energy)!;
+    crystal = loadCrystal(state.preset, state.energy);
     const range = $<HTMLInputElement>(`#${id}-range`);
     range.max = String(crystal.k_max);
     if (state.patternRange > crystal.k_max) { state.patternRange = crystal.k_max; range.value = String(crystal.k_max); }
@@ -642,7 +730,7 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
   $<HTMLInputElement>(`#${id}-ewald`).addEventListener("change", (e) => { state.showEwald = (e.target as HTMLInputElement).checked; computeSize(); drawAll(); });
   $<HTMLSelectElement>(`#${id}-energy`).addEventListener("change", (e) => {
     state.energy = +(e.target as HTMLSelectElement).value;
-    crystal = parseCrystal(PRESETS[state.preset], state.energy)!;
+    crystal = loadCrystal(state.preset, state.energy);
     recompute();
   });
   $<HTMLInputElement>(`#${id}-ncell`).addEventListener("change", (e) => {

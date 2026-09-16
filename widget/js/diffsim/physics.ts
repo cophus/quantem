@@ -407,13 +407,19 @@ export interface KosselLine {
  * g_xy . theta = g_z - lambda |g|^2 / 2, a straight line at small angles.
  * The width is the two-beam rocking width |U_g| / (k0 |g_xy|).
  */
+/** Coupling of a strong reflection (Si 111 at 200 keV is 0.05 1/A^2): line darkness is measured against it. */
+export const U_REF_LINES = 0.04;
+const MAX_LINES = 200; // strongest lines kept: enough for the rosettes of small cells, readable for large ones
+
 export function kosselLines(c: CrystalData, q: Quat, kMax: number, fieldRad: number): KosselLine[] {
   const R = quatToMatrix(q);
   const lam = c.wavelength;
   const k0 = 1 / lam;
   const lines: KosselLine[] = [];
-  let uMax = 1e-12;
-  for (let i = 0; i < c.hkl.length; i++) uMax = Math.max(uMax, Math.hypot(c.U_re[i], c.U_im[i]));
+  // strength is ABSOLUTE (|U_g| / U_REF_LINES, capped at 1): a weakly
+  // scattering cell gives faint lines, and only the strongest MAX_LINES are
+  // kept so a large cell does not draw a hundred thousand of them
+  const uMin = 0.02 * U_REF_LINES;
   for (let i = 0; i < c.hkl.length; i++) {
     const gc: Vec3 = [c.g[3 * i], c.g[3 * i + 1], c.g[3 * i + 2]];
     const gLen = Math.hypot(gc[0], gc[1], gc[2]);
@@ -424,8 +430,12 @@ export function kosselLines(c: CrystalData, q: Quat, kMax: number, fieldRad: num
     const dist = (g[2] - (lam * gLen * gLen) / 2) / gxy;
     if (Math.abs(dist) > fieldRad * 1.5) continue;
     const u = Math.hypot(c.U_re[i], c.U_im[i]);
-    if (u < 1e-4 * uMax) continue;
-    lines.push({ hkl: c.hkl[i], normal: [g[0] / gxy, g[1] / gxy], distance: dist, width: u / (k0 * gxy), strength: u / uMax, gxy });
+    if (u < uMin) continue;
+    lines.push({ hkl: c.hkl[i], normal: [g[0] / gxy, g[1] / gxy], distance: dist, width: u / (k0 * gxy), strength: Math.min(1, u / U_REF_LINES), gxy });
+  }
+  if (lines.length > MAX_LINES) {
+    lines.sort((a, b) => b.strength - a.strength);
+    lines.length = MAX_LINES;
   }
   return lines;
 }

@@ -9,6 +9,9 @@ const watch = process.argv.includes("--watch");
 const widgets = [
   { name: "show2d" },
   { name: "show4dstem" },
+  { name: "diffsim" },
+  // framework-free build of the diffraction simulator for web pages (MyST anywidget directive)
+  { name: "diffsim-web", entry: "js/diffsim-web/index.ts", outfile: "dist/diffraction-sim.js" },
 ];
 
 rmSync("src/quantem/widget/static", { recursive: true, force: true });
@@ -29,8 +32,8 @@ const baseOpts = {
 for (const w of widgets) {
   const opts = {
     ...baseOpts,
-    entryPoints: [`js/${w.name}/index.tsx`],
-    outfile: `src/quantem/widget/static/${w.name}.js`,
+    entryPoints: [w.entry || `js/${w.name}/index.tsx`],
+    outfile: w.outfile || `src/quantem/widget/static/${w.name}.js`,
   };
   if (watch) {
     const ctx = await context(opts);
