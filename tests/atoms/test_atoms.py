@@ -323,3 +323,24 @@ def test_attached_icosahedra_and_growth_steps():
     steps = st.growth_steps(d)
     # the upper half only appears once the front crosses the mid-plane at 2.5 bonds
     assert steps[d.positions[:, 2] > 0.1].min() >= 3
+
+
+def test_species_mixture_keeps_unassigned():
+    rng = np.random.default_rng(0)
+    xyz = rng.random((4001, 3)) * 30
+    model = AtomicModel.from_array(xyz)
+    # two equal components and one site exactly midway, which is ambiguous by symmetry
+    intensity = np.r_[rng.normal(1.0, 0.1, 2000), rng.normal(2.0, 0.1, 2000), 1.5]
+    model.set_channel("intensity", intensity)
+    labels = model.classify_species(names=["Ni", "Pd"], min_posterior=0.9)
+    info = model.metadata["species_model"]
+    assert abs(info["means"][0] - 1.0) < 0.05 and abs(info["means"][1] - 2.0) < 0.05
+    assert 0.4 < info["weights"][0] < 0.6
+    assert (labels[:2000] == 0).mean() > 0.95 and (labels[2000:4000] == 1).mean() > 0.95
+    assert model.categories["species"] == ["Ni", "Pd"]
+    assert labels[-1] == -1 and model["species_posterior"][-1] < 0.9
+    labels = model.classify_species(method="kmeans")
+    assert labels.min() >= 0
+    mask = np.arange(model.num_sites) < 3000
+    labels = model.classify_species(names=["Ni", "Pd"], mask=mask)
+    assert np.all(labels[~mask] == -1) and labels[:2000].max() == 0

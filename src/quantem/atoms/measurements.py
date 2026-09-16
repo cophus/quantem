@@ -24,6 +24,7 @@ __all__ = [
     "convex_hull_distance",
     "sample_volume",
     "kmeans_1d",
+    "gaussian_mixture_1d",
     "rotation_to_quaternion",
 ]
 
@@ -295,6 +296,55 @@ def kmeans_1d(
     remap = np.empty_like(order)
     remap[order] = np.arange(num_clusters)
     return remap[labels], centers[order]
+
+
+def gaussian_mixture_1d(
+    values: NDArray, num_components: int = 2, num_iter: int = 200, tol: float = 1e-8
+) -> tuple[NDArray, NDArray, NDArray, NDArray]:
+    """Fit a one-dimensional Gaussian mixture by expectation maximization.
+
+    Components are initialized from k-means and sorted by increasing mean.
+
+    Returns
+    -------
+    means, sigmas, weights, responsibilities : ndarray
+        Component parameters ``(K,)`` and the ``(N, K)`` posterior
+        probabilities of each site (rows sum to 1; non-finite values give
+        uniform rows).
+    """
+    v = np.asarray(values, dtype=float)
+    finite = np.isfinite(v)
+    x = v[finite]
+    labels, means = kmeans_1d(x, num_components)
+    sigmas = np.array(
+        [x[labels == k].std() if np.any(labels == k) else x.std() for k in range(num_components)]
+    )
+    sigmas = np.maximum(sigmas, 1e-6 * (x.std() + 1e-12))
+    weights = np.bincount(labels, minlength=num_components) / x.size
+    prev = -np.inf
+    for _ in range(num_iter):
+        log_p = (
+            np.log(weights + 1e-300)[None, :]
+            - 0.5 * ((x[:, None] - means[None, :]) / sigmas[None, :]) ** 2
+            - np.log(sigmas[None, :])
+            - 0.5 * np.log(2 * np.pi)
+        )
+        log_norm = np.logaddexp.reduce(log_p, axis=1)
+        resp = np.exp(log_p - log_norm[:, None])
+        ll = float(log_norm.sum())
+        nk = resp.sum(0) + 1e-12
+        means = (resp * x[:, None]).sum(0) / nk
+        sigmas = np.sqrt((resp * (x[:, None] - means[None, :]) ** 2).sum(0) / nk)
+        sigmas = np.maximum(sigmas, 1e-6 * (x.std() + 1e-12))
+        weights = nk / x.size
+        if ll - prev < tol * max(1.0, abs(ll)):
+            break
+        prev = ll
+    order = np.argsort(means)
+    means, sigmas, weights, resp = means[order], sigmas[order], weights[order], resp[:, order]
+    out = np.full((v.size, num_components), 1.0 / num_components)
+    out[finite] = resp
+    return means, sigmas, weights, out
 
 
 def rotation_to_quaternion(rotation: NDArray) -> NDArray:

@@ -159,72 +159,6 @@ class AtomicModel(AutoSerialize):
         return model
 
     @classmethod
-    def from_mat(
-        cls,
-        path: str | Path,
-        key: str | None = None,
-        sampling: float | Sequence[float] = 1.0,
-        units: str = "voxels",
-        name: str | None = None,
-        one_based: bool = False,
-    ) -> "AtomicModel":
-        """Load coordinates from a MATLAB ``.mat`` file.
-
-        Parameters
-        ----------
-        path : str or Path
-            File path (v5/v7 or v7.3 HDF5).
-        key : str, optional
-            Variable name.  If omitted, the first numeric ``(N, 3)`` / ``(3, N)``
-            array is used.
-        sampling, units, name
-            See :meth:`from_array`.
-        one_based : bool
-            Subtract 1 from the coordinates (MATLAB 1-based voxel indices).
-        """
-        path = Path(path)
-        arrays: dict[str, NDArray] = {}
-        try:
-            import scipy.io as sio
-
-            raw = sio.loadmat(path)
-            arrays = {
-                k: np.asarray(v)
-                for k, v in raw.items()
-                if not k.startswith("__") and isinstance(v, np.ndarray) and v.dtype.kind in "fiu"
-            }
-        except NotImplementedError:  # v7.3
-            import h5py
-
-            with h5py.File(path, "r") as f:
-
-                def _collect(g, prefix=""):
-                    for k, v in g.items():
-                        if isinstance(v, h5py.Dataset) and v.dtype.kind in "fiu":
-                            arrays[prefix + k] = np.asarray(v[()]).T
-                        elif isinstance(v, h5py.Group):
-                            _collect(v, prefix + k + "/")
-
-                _collect(f)
-        if key is None:
-            candidates = [k for k, v in arrays.items() if v.ndim == 2 and 3 in v.shape]
-            if not candidates:
-                raise ValueError(
-                    f"No (N, 3) coordinate array found in {path.name}: {list(arrays)}"
-                )
-            key = candidates[0]
-        xyz = arrays[key].astype(float)
-        if one_based:
-            xyz = xyz - 1.0
-        return cls.from_array(
-            xyz,
-            sampling=sampling,
-            units=units,
-            name=name or path.stem,
-            metadata={"source": str(path), "key": key},
-        )
-
-    @classmethod
     def from_xyz(
         cls,
         path: str | Path,
@@ -578,7 +512,10 @@ class AtomicModel(AutoSerialize):
         first = dist <= cutoff
         scale = float(self._sampling.mean())
         d_first = np.where(first, dist, np.nan) * scale
-        with np.errstate(invalid="ignore"):
+        import warnings
+
+        with warnings.catch_warnings(), np.errstate(invalid="ignore"):
+            warnings.simplefilter("ignore", RuntimeWarning)
             self.set_channel("num_neighbors", first.sum(1))
             self.set_channel("bond_mean", np.nanmean(d_first, axis=1), self._units)
             self.set_channel("bond_std", np.nanstd(d_first, axis=1), self._units)
@@ -922,13 +859,74 @@ class AtomicModel(AutoSerialize):
         channel: str = "intensity",
         num_species: int = 2,
         names: Sequence[str] | None = None,
+        method: str = "gmm",
+        min_posterior: float = 0.8,
+        mask: NDArray | None = None,
     ) -> NDArray:
-        """Split a channel (e.g. intensity) into species with 1D k-means; channel ``species``."""
-        labels, centers = meas.kmeans_1d(self.get_channel(channel), num_species)
+        """Assign species from a per-site channel such as the traced intensity.
+
+        With ``method="gmm"`` a one-dimensional Gaussian mixture with
+        ``num_species`` components is fit by expectation maximization and each
+        site takes the component with the largest posterior probability; sites
+        whose largest posterior is below ``min_posterior`` are left unassigned
+        (code ``-1``, label ``unassigned``) so that ambiguous candidates stay in
+        the model without being counted as either species.  ``method="kmeans"``
+        assigns every site to the nearest cluster center.
+
+        Adds channels ``species`` (categorical) and, for the mixture, ``species_posterior``.
+        The fitted means, widths and fractions are stored in
+        ``metadata["species_model"]``.
+
+        Parameters
+        ----------
+        channel : str
+            Channel to split (``"intensity"`` from tracing or volume sampling).
+        num_species : int
+            Number of species.
+        names : sequence of str, optional
+            Species names in order of increasing channel value.
+        method : {"gmm", "kmeans"}
+            Classifier.
+        min_posterior : float
+            Minimum posterior probability for an assignment (``"gmm"`` only).
+        mask : ndarray, optional
+            ``(N,)`` boolean; only these sites take part in the fit and receive
+            a species, all others are unassigned.  Use it to exclude surface
+            sites, whose intensities are reduced by the missing neighbors.
+
+        Returns
+        -------
+        ndarray
+            ``(N,)`` species codes, ``-1`` for unassigned sites.
+        """
+        values = self.get_channel(channel).astype(float)
+        use = np.ones(self.num_sites, dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+        fit_values = np.where(use, values, np.nan)
         if names is None:
             names = [f"species_{i}" for i in range(num_species)]
-        self.set_channel("species", labels, categories=names)
-        self._metadata["species_centers"] = centers.tolist()
+        if method == "kmeans":
+            labels, centers = meas.kmeans_1d(fit_values, num_species)
+            posterior = np.ones(self.num_sites)
+            model_info = {"method": "kmeans", "centers": centers.tolist()}
+        elif method == "gmm":
+            means, sigmas, weights, resp = meas.gaussian_mixture_1d(fit_values, num_species)
+            labels = resp.argmax(1)
+            posterior = resp.max(1)
+            labels = np.where(posterior >= min_posterior, labels, -1)
+            model_info = {
+                "method": "gmm",
+                "means": means.tolist(),
+                "sigmas": sigmas.tolist(),
+                "weights": weights.tolist(),
+                "min_posterior": float(min_posterior),
+            }
+        else:
+            raise ValueError("method must be 'gmm' or 'kmeans'")
+        labels = np.where(use, labels, -1)
+        posterior = np.where(use, posterior, 0.0)
+        self.set_channel("species", labels, categories=list(names))
+        self.set_channel("species_posterior", posterior)
+        self._metadata["species_model"] = model_info
         return labels
 
     # ------------------------------------------------------------------ #
