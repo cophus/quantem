@@ -366,6 +366,7 @@ def plot_slices(
     thickness: float | None = None,
     start: float | None = None,
     end: float | None = None,
+    positions: NDArray | None = None,
     ncols: int = 3,
     figsize_per: float = 4.0,
     returnfig: bool = False,
@@ -376,24 +377,34 @@ def plot_slices(
     Parameters
     ----------
     num_slices : int
-        Number of slabs.
+        Number of slabs (ignored when ``positions`` is given).
     thickness : float, optional
         Slab thickness; default is the step between slabs.
     start, end : float, optional
         Range of slab centers along ``normal`` (relative to the model center);
         default spans the model.
+    positions : array, optional
+        Explicit slab centers along ``normal``, e.g. the atomic layers from
+        ``model.layer_positions(normal)``.
     **kwargs
         Forwarded to :func:`plot_slab`.
     """
     v = view_matrix(normal, kwargs.get("up"))
     depth = (model.positions - model.center[None, :]) @ v[2]
-    if start is None:
-        start = float(depth.min()) + 0.05 * np.ptp(depth)
-    if end is None:
-        end = float(depth.max()) - 0.05 * np.ptp(depth)
-    centers = np.linspace(start, end, num_slices)
+    if positions is not None:
+        centers = np.asarray(positions, dtype=float)
+        num_slices = centers.size
+    else:
+        if start is None:
+            start = float(depth.min()) + 0.05 * np.ptp(depth)
+        if end is None:
+            end = float(depth.max()) - 0.05 * np.ptp(depth)
+        centers = np.linspace(start, end, num_slices)
     if thickness is None:
-        thickness = float(centers[1] - centers[0]) if num_slices > 1 else np.ptp(depth)
+        if positions is not None and num_slices > 1:
+            thickness = 0.8 * float(np.median(np.diff(centers)))
+        else:
+            thickness = float(centers[1] - centers[0]) if num_slices > 1 else np.ptp(depth)
     nrows = int(np.ceil(num_slices / ncols))
     fig, axes = plt.subplots(
         nrows, ncols, figsize=(figsize_per * ncols, figsize_per * nrows), squeeze=False

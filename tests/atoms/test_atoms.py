@@ -253,3 +253,73 @@ def test_merge_close_sites():
     model3 = AtomicModel.from_array(dup)
     assert model3.merge_close_sites(min_distance=0.3, mode="remove") == 4
     assert model3.merge_close_sites(min_distance=0.3) == 0
+
+
+def test_ideal_structures():
+    from quantem.atoms import structures as st
+
+    assert st.icosahedron(3).num_sites == 147
+    assert st.cuboctahedron(3).num_sites == 147
+    assert st.double_icosahedron(1).num_sites == 19
+    d = st.double_icosahedron(4, bond_length=2.7, separation=5)
+    xyz = d.positions_native
+    from scipy.spatial import cKDTree
+
+    assert cKDTree(xyz).query(xyz, k=2)[0][:, 1].min() > 0.99 * 2.7
+    # mirror symmetry through z = 0
+    mirrored = xyz * np.array([1, 1, -1])
+    assert cKDTree(xyz).query(mirrored)[0].max() < 1e-6
+    deca = st.decahedron(3)
+    assert deca.num_sites > 100 and len(np.unique(deca["sector"])) == 5
+
+
+def test_fit_icosahedral_centers_and_layers():
+    from quantem.atoms import structures as st
+
+    model = st.double_icosahedron(7, bond_length=2.75, separation=5)
+    rng = np.random.default_rng(0)
+    model.positions_native = model.positions_native + rng.normal(0, 0.05, (model.num_sites, 3))
+    model.compute_pdf()
+    model.find_neighbors(20)
+    model.match_templates(["fcc", "hcp"], progress=False, device="cpu")
+    fit = model.fit_icosahedral_centers()
+    assert abs(fit["separation"] / model.bond_length - 5.0) < 0.3
+    assert abs(abs(fit["axis"][2]) - 1.0) < 0.02
+    centers = fit["centers"] + model.center
+    assert np.allclose(np.sort(centers[:, 2]), [-2.5 * 2.75, 2.5 * 2.75], atol=0.6)
+    layers = model.layer_positions("z")
+    assert layers.size > 10
+    assert np.all(np.diff(layers) > 0.4 * model.bond_length)
+
+
+def test_explode_grains():
+    xyz, above = make_twinned_fcc()
+    model = AtomicModel.from_array(xyz * 7.2, units="voxels")
+    model.compute_pdf()
+    model.find_neighbors(20)
+    model.match_templates(["fcc", "hcp"], progress=False, device="cpu")
+    model.segment_grains("fcc", angle_threshold=5.0, min_size=20)
+    ex = model.explode_grains(distance=10.0)
+    labels = ex["grain"].astype(int)
+    assert set(np.unique(labels)) <= {0, 1, 2}
+    assert ex.categories["grain"][2] == "shared"
+    # each grain moved rigidly by 10 units
+    for g in (0, 1):
+        src = ex["source_index"][labels == g].astype(int)
+        d = ex.positions[labels == g] - model.positions[src]
+        assert np.allclose(np.linalg.norm(d, axis=1), 10.0, atol=1e-6)
+    assert (labels == 2).sum() > 0
+    assert ex.num_sites > (model["grain"] >= 0).sum()
+
+
+def test_attached_icosahedra_and_growth_steps():
+    from quantem.atoms import structures as st
+
+    a = st.attached_icosahedra(3, bond_length=2.0)
+    assert a.num_sites == 2 * 147 - 1
+    steps = st.growth_steps(a)
+    assert steps.min() == 0 and steps.max() == 9
+    d = st.double_icosahedron(4, bond_length=2.0, separation=5)
+    steps = st.growth_steps(d)
+    # the upper half only appears once the front crosses the mid-plane at 2.5 bonds
+    assert steps[d.positions[:, 2] > 0.1].min() >= 3

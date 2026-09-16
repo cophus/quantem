@@ -932,6 +932,283 @@ class AtomicModel(AutoSerialize):
         return labels
 
     # ------------------------------------------------------------------ #
+    # Multiply twinned particle geometry
+    # ------------------------------------------------------------------ #
+    def twin_plane_normals(self, structure: str = "hcp") -> NDArray:
+        """``(N, 3)`` twin-plane normal at every site from the ``hcp`` template fit.
+
+        The hexagonal ``c`` axis of the fitted HCP template is the normal of
+        the close-packed plane, which for a site on a coherent twin boundary
+        is the twin plane.  Values are only meaningful at sites classified as
+        ``structure``.
+        """
+        return self._matches[structure]["rotation"][:, :, 2].copy()
+
+    def fit_icosahedral_centers(
+        self,
+        num_centers: int = 2,
+        min_score: float = 0.6,
+        max_residual: float = 2.0,
+        axial_tolerance: float = 0.35,
+        num_iterations: int = 10,
+    ) -> dict[str, Any]:
+        """Locate the centers of two icosahedra that share a 5-fold axis.
+
+        All twin planes of one Mackay icosahedron pass through its center, so
+        the center is the least-squares intersection of the planes carried by
+        its twin (``hcp``) sites.  Planes that contain the shared axis pass
+        through both centers and are excluded; the remaining sites are
+        assigned to the center whose planes they fit best, outliers beyond
+        ``max_residual`` are dropped, and the fit is iterated.  The result
+        is stored in ``metadata["icosahedral_centers"]``.
+
+        Parameters
+        ----------
+        num_centers : int
+            Only ``2`` is supported at present.
+        min_score : float
+            Minimum ``score_hcp`` of the twin sites used.
+        max_residual : float
+            Plane-distance cutoff (calibrated units) for keeping a site.
+        axial_tolerance : float
+            Planes whose normal has ``|n . axis|`` below this are treated as
+            containing the axis and excluded.
+        num_iterations : int
+            Outer iterations of the assignment.
+
+        Returns
+        -------
+        dict
+            ``centers`` (2, 3) relative to the model center, ``axis`` unit
+            vector from center 0 to center 1, ``separation`` in calibrated
+            units, ``rms`` plane residual per center, ``num_sites`` per
+            center, and ``assignment`` (``(N,)`` with ``-1`` = unused).
+        """
+        if num_centers != 2:
+            raise NotImplementedError("Only two centers are supported.")
+        if "hcp" not in self._matches:
+            raise RuntimeError("Match the 'hcp' template first (match_templates(['fcc', 'hcp'])).")
+        xyz = self.positions - self.center[None, :]
+        normals = self.twin_plane_normals("hcp")
+        first_shell = (self.neighbor_distances <= self.first_shell_cutoff).sum(1)
+        twin = self.get_channel("structure").astype(int) == self._structure_names.index("hcp")
+        twin &= (self._matches["hcp"]["score"] >= min_score) & (first_shell >= 12)
+        center0, res = meas.fit_plane_intersection(xyz[twin], normals[twin])
+        # the shared axis is the direction most perpendicular to the well-fitting planes
+        good = np.abs(res) < 1.5 * max_residual
+        cov = np.einsum("ni,nj->ij", normals[twin][good], normals[twin][good])
+        axis = np.linalg.eigh(cov)[1][:, 0]
+        c1, c2 = center0 - 0.5 * axis, center0 + 0.5 * axis
+        assign = np.full(self.num_sites, -1)
+        for _ in range(num_iterations):
+            non_axial = np.abs(normals @ axis) > axial_tolerance
+            usable = twin & non_axial
+            r1 = np.abs(np.einsum("ni,ni->n", normals, xyz - c1))
+            r2 = np.abs(np.einsum("ni,ni->n", normals, xyz - c2))
+            a1 = usable & (r1 <= r2) & (r1 < max_residual)
+            a2 = usable & (r2 < r1) & (r2 < max_residual)
+            if a1.sum() < 10 or a2.sum() < 10:
+                h = (xyz - center0) @ axis
+                a1 = usable & (h < 0)
+                a2 = usable & (h >= 0)
+            c1n, _ = meas.fit_plane_intersection(xyz[a1], normals[a1])
+            c2n, _ = meas.fit_plane_intersection(xyz[a2], normals[a2])
+            shift = np.linalg.norm(c1n - c1) + np.linalg.norm(c2n - c2)
+            c1, c2 = c1n, c2n
+            axis = (c2 - c1) / np.linalg.norm(c2 - c1)
+            if shift < 1e-4:
+                break
+        assign[a1] = 0
+        assign[a2] = 1
+        rms = [
+            float(np.sqrt(np.mean(np.einsum("ni,ni->n", normals[a], xyz[a] - c) ** 2)))
+            for a, c in ((a1, c1), (a2, c2))
+        ]
+        result = {
+            "centers": np.stack([c1, c2]),
+            "axis": axis,
+            "separation": float(np.linalg.norm(c2 - c1)),
+            "rms": np.array(rms),
+            "num_sites": np.array([int(a1.sum()), int(a2.sum())]),
+            "assignment": assign,
+        }
+        self._metadata["icosahedral_centers"] = {
+            "centers": result["centers"].tolist(),
+            "axis": axis.tolist(),
+            "separation": result["separation"],
+        }
+        return result
+
+    def layer_positions(
+        self,
+        normal: str | NDArray,
+        bin_width: float | None = None,
+        sigma: float | None = None,
+        min_fraction: float = 0.25,
+    ) -> NDArray:
+        """Positions of the atomic layers perpendicular to ``normal``.
+
+        Sites are projected onto ``normal`` (measured from the model center),
+        the projected density is histogrammed and smoothed, and its peaks are
+        returned.  The result can be passed as ``positions`` to
+        ``plot("slices", ...)`` to step through the model one layer at a time.
+
+        Parameters
+        ----------
+        normal : str or array
+            Layer normal (``"x"``, ``"y"``, ``"z"`` or a 3-vector).
+        bin_width : float, optional
+            Histogram bin (default: bond length / 40).
+        sigma : float, optional
+            Smoothing (default: bond length / 12).
+        min_fraction : float
+            Peaks below this fraction of the highest peak are ignored.
+
+        Returns
+        -------
+        ndarray
+            Layer offsets along ``normal`` relative to the model center.
+        """
+        from quantem.atoms.visualization import view_matrix
+
+        n = view_matrix(normal)[2]
+        h = (self.positions - self.center[None, :]) @ n
+        bond = self.bond_length
+        pos, _, _ = meas.layer_positions(
+            h,
+            bin_width=bond / 40.0 if bin_width is None else bin_width,
+            sigma=bond / 12.0 if sigma is None else sigma,
+            min_fraction=min_fraction,
+        )
+        return pos
+
+    def explode_grains(
+        self,
+        distance: float | None = None,
+        origin: str | NDArray | None = None,
+        include_shared: bool = True,
+        keep_other: bool = False,
+        structure: str = "fcc",
+    ) -> "AtomicModel":
+        """Return a copy with every grain displaced away from its origin.
+
+        Each grain (sector) moves rigidly by ``distance`` along the direction
+        from ``origin`` to its centroid, so the grains separate and their
+        boundaries become visible.  Twin sites and other boundary sites that
+        touch several grains are copied into every adjacent grain, displaced
+        with it, and labelled ``shared`` in the new categorical ``grain``
+        channel; sites classified as neither ``structure`` nor a twin are
+        labelled ``other`` and kept in place when ``keep_other`` is True.
+
+        Parameters
+        ----------
+        distance : float, optional
+            Displacement per grain (calibrated units); default 2 bond lengths.
+        origin : {"center", "icosahedral"} or array, optional
+            Point the grains move away from: the model center (default), the
+            nearest of the fitted icosahedral centers (after
+            :meth:`fit_icosahedral_centers`), or an explicit ``(3,)`` point.
+        include_shared : bool
+            Copy boundary sites into each adjacent grain.
+        keep_other : bool
+            Keep unclassified sites (``other``) at their original positions.
+        structure : str
+            Template name of the grains (``"fcc"``).
+
+        Returns
+        -------
+        AtomicModel
+            New model with channels ``grain`` (categorical), ``source_index``
+            (index in this model) and copies of all other channels.
+        """
+        if "grain" not in self.channels:
+            raise RuntimeError("Call segment_grains() first.")
+        if distance is None:
+            distance = 2.0 * self.bond_length
+        xyz = self.positions
+        grain = self.get_channel("grain").astype(int)
+        struct = self.get_channel("structure").astype(int)
+        num_grains = int(grain.max()) + 1
+        centroids = np.array([xyz[grain == g].mean(0) for g in range(num_grains)])
+        if origin is None or origin == "center":
+            origins = np.tile(self.center, (num_grains, 1))
+        elif isinstance(origin, str) and origin == "icosahedral":
+            info = self._metadata.get("icosahedral_centers")
+            if info is None:
+                raise RuntimeError(
+                    "Call fit_icosahedral_centers() first for origin='icosahedral'."
+                )
+            cents = np.asarray(info["centers"]) + self.center[None, :]
+            nearest = np.argmin(
+                np.linalg.norm(centroids[:, None, :] - cents[None, :, :], axis=2), axis=1
+            )
+            origins = cents[nearest]
+        else:
+            origins = np.tile(np.asarray(origin, dtype=float).reshape(3), (num_grains, 1))
+        direction = centroids - origins
+        norm = np.linalg.norm(direction, axis=1, keepdims=True)
+        shift = distance * direction / np.where(norm > 1e-9, norm, 1.0)
+
+        table = np.array(self._sites.array, dtype=float)
+        pos_cols = [self._sites.fields.index(f) for f in _POSITION_FIELDS]
+        scale = self._sampling[None, :]
+        rows, labels, source = [], [], []
+        # grain members
+        member = grain >= 0
+        idx = np.where(member)[0]
+        t = table[idx].copy()
+        t[:, pos_cols] += shift[grain[idx]] / scale
+        rows.append(t)
+        labels.append(grain[idx])
+        source.append(idx)
+        # shared boundary sites: copied into each adjacent grain
+        twin_id = [i for i, n in enumerate(self._structure_names) if n != structure]
+        boundary = (~member) & (
+            np.isin(struct, twin_id) | (struct == self._structure_names.index(structure))
+        )
+        if include_shared and boundary.any():
+            nb_idx = self.neighbor_indices
+            first = self.neighbor_distances <= self.first_shell_cutoff
+            nb_grain = np.where(first & (nb_idx >= 0), grain[np.where(nb_idx >= 0, nb_idx, 0)], -1)
+            for i in np.where(boundary)[0]:
+                adjacent = np.unique(nb_grain[i][nb_grain[i] >= 0])
+                for g in adjacent:
+                    r = table[i].copy()
+                    r[pos_cols] += shift[g] / scale[0]
+                    rows.append(r[None, :])
+                    labels.append(np.array([num_grains]))
+                    source.append(np.array([i]))
+        other = (~member) & ~boundary
+        if keep_other and other.any():
+            idx = np.where(other)[0]
+            rows.append(table[idx])
+            labels.append(np.full(idx.size, num_grains + 1))
+            source.append(idx)
+        new_table = np.vstack(rows)
+        sites = Vector.from_shape(
+            shape=(), fields=list(self._sites.fields), units=list(self._sites.units), name="sites"
+        )
+        sites[...] = np.ascontiguousarray(new_table)
+        out = AtomicModel(
+            sites=sites,
+            sampling=self._sampling.copy(),
+            units=self._units,
+            name=f"{self._name} (exploded)",
+            metadata={"exploded_distance": float(distance)},
+            _token=self._token,
+        )
+        out._categories = {k: v for k, v in self._categories.items() if k != "grain"}
+        out._structure_names = list(self._structure_names)
+        out._nn_fit = None if self._nn_fit is None else dict(self._nn_fit)
+        out.set_channel(
+            "grain",
+            np.concatenate(labels),
+            categories=[str(g) for g in range(num_grains)] + ["shared", "other"],
+        )
+        out.set_channel("source_index", np.concatenate(source))
+        return out
+
+    # ------------------------------------------------------------------ #
     # Geometry helpers
     # ------------------------------------------------------------------ #
     def rotate(self, rotation: NDArray, about_center: bool = True) -> None:

@@ -18,6 +18,8 @@ __all__ = [
     "segment_grains",
     "fill_labels",
     "strain_from_deformation",
+    "fit_plane_intersection",
+    "layer_positions",
     "bond_angles",
     "convex_hull_distance",
     "sample_volume",
@@ -303,3 +305,81 @@ def rotation_to_quaternion(rotation: NDArray) -> NDArray:
     q = np.roll(q, 1, axis=1)
     q[q[:, 0] < 0] *= -1
     return q
+
+
+def fit_plane_intersection(points: NDArray, normals: NDArray) -> tuple[NDArray, NDArray]:
+    """Least-squares point closest to a set of planes.
+
+    Each plane passes through ``points[i]`` with unit normal ``normals[i]``;
+    the returned point minimizes the sum of squared plane distances.
+
+    Returns
+    -------
+    center, residuals : ndarray
+        ``(3,)`` point and ``(N,)`` signed distances of the point to each plane.
+    """
+    n = np.asarray(normals, dtype=float)
+    p = np.asarray(points, dtype=float)
+    a = np.einsum("ni,nj->ij", n, n)
+    b = np.einsum("ni,ni,nj->j", n, p, n)
+    center = np.linalg.solve(a + 1e-9 * np.eye(3), b)
+    return center, np.einsum("ni,ni->n", n, center[None, :] - p)
+
+
+def layer_positions(
+    heights: NDArray,
+    bin_width: float,
+    sigma: float,
+    min_fraction: float = 0.25,
+) -> tuple[NDArray, NDArray, NDArray]:
+    """Peaks of the site density along one direction (atomic layers).
+
+    Parameters
+    ----------
+    heights : ndarray
+        ``(N,)`` coordinates of the sites along the direction.
+    bin_width : float
+        Histogram bin width.
+    sigma : float
+        Gaussian smoothing of the histogram (same units as ``heights``).
+    min_fraction : float
+        Peaks lower than this fraction of the highest peak are ignored.
+
+    Returns
+    -------
+    positions, centers, density : ndarray
+        Peak positions, and the smoothed histogram (bin centers and counts)
+        for plotting.
+    """
+    from scipy.ndimage import gaussian_filter1d
+
+    h = np.asarray(heights, dtype=float)
+    edges = np.arange(h.min() - 2 * sigma, h.max() + 2 * sigma + bin_width, bin_width)
+    counts = np.histogram(h, edges)[0].astype(float)
+    smooth = gaussian_filter1d(counts, sigma / bin_width) if sigma > 0 else counts
+    centers = 0.5 * (edges[1:] + edges[:-1])
+    inner = smooth[1:-1]
+    peaks = (
+        np.where(
+            (inner > smooth[:-2]) & (inner >= smooth[2:]) & (inner > min_fraction * smooth.max())
+        )[0]
+        + 1
+    )
+    # refine each peak with a parabola through its three bins
+    pos, height = [], []
+    for k in peaks:
+        y0, y1, y2 = smooth[k - 1], smooth[k], smooth[k + 1]
+        denom = y0 - 2 * y1 + y2
+        delta = 0.5 * (y0 - y2) / denom if abs(denom) > 1e-12 else 0.0
+        pos.append(centers[k] + delta * bin_width)
+        height.append(y1)
+    pos, height = np.asarray(pos), np.asarray(height)
+    # drop the weaker of any two peaks closer than half the median spacing
+    if pos.size > 2:
+        spacing = np.median(np.diff(pos))
+        keep = np.ones(pos.size, dtype=bool)
+        for k in range(1, pos.size):
+            if pos[k] - pos[k - 1] < 0.5 * spacing:
+                keep[k if height[k] < height[k - 1] else k - 1] = False
+        pos = pos[keep]
+    return pos, centers, smooth
