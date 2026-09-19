@@ -350,6 +350,47 @@ def _closest(cands: torch.Tensor, prefer: torch.Tensor) -> torch.Tensor:
     return signed[int(torch.argmax(key))]
 
 
+def sample_zone_axis_cap(
+    axis: torch.Tensor,
+    half_angle_deg: float,
+    step_deg: float,
+) -> torch.Tensor:
+    """Near-uniform sampling of a spherical cap of directions, (N, 3).
+
+    The fiber-texture case: the zone axis is known to lie within
+    `half_angle_deg` of `axis` (a fiber axis normal to a 2D material, or a
+    textured film), and only that cap needs a library. A half angle of zero
+    returns the axis itself, so the match is over the in-plane angle alone.
+
+    Points are placed on a Fibonacci spiral restricted to the cap, which
+    gives an equal-area covering; the count follows the cap area divided by
+    `step_deg` squared.
+    """
+    axis = torch.as_tensor(axis, dtype=torch.float64)
+    axis = axis / torch.linalg.norm(axis).clamp_min(1e-12)
+    half = np.deg2rad(float(half_angle_deg))
+    if half <= 0:
+        return axis[None, :]
+    step = np.deg2rad(float(step_deg))
+    n = max(1, int(np.ceil(2 * np.pi * (1 - np.cos(half)) / step**2)))
+    i = torch.arange(n, dtype=torch.float64) + 0.5
+    z = 1.0 - (1.0 - np.cos(half)) * i / n
+    r = torch.sqrt((1 - z**2).clamp_min(0))
+    phi = i * (np.pi * (3 - np.sqrt(5)))
+    pts = torch.stack([r * torch.cos(phi), r * torch.sin(phi), z], dim=1)
+    # rotate the +z pole onto `axis`
+    zhat = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
+    v = torch.linalg.cross(zhat, axis)
+    c = float(torch.dot(zhat, axis))
+    if float(torch.linalg.norm(v)) < 1e-12:
+        return pts if c > 0 else -pts
+    vx = torch.tensor(
+        [[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]], dtype=torch.float64
+    )
+    R = torch.eye(3, dtype=torch.float64) + vx + vx @ vx / (1 + c)
+    return pts @ R.T
+
+
 def fundamental_zone_axis_wedge(sym_quats: torch.Tensor) -> torch.Tensor | None:
     """Fundamental zone-axis wedge of a Laue group from its proper rotations.
 

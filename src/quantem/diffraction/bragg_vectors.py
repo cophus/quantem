@@ -358,7 +358,12 @@ class BraggVectors(AutoSerialize):
         return torch.fft.fftshift(self._template).detach().cpu().numpy()
 
     def correlation_map(
-        self, row: int, col: int, background_sigma: float | str | None = None
+        self,
+        row: int,
+        col: int,
+        background_sigma: float | str | None = None,
+        corr_power: float = 1.0,
+        sigma_cc: float | None = None,
     ) -> np.ndarray:
         """Cross-correlation map of one diffraction pattern with the template (numpy).
 
@@ -371,6 +376,9 @@ class BraggVectors(AutoSerialize):
             Scan row of the diffraction pattern to correlate.
         col : int
             Scan column of the diffraction pattern to correlate.
+        background_sigma, corr_power, sigma_cc
+            Correlation options, as for :meth:`detect_disks`; pass the same
+            values to see the map the detection actually searches.
 
         Returns
         -------
@@ -383,7 +391,11 @@ class BraggVectors(AutoSerialize):
             np.asarray(self.dataset.array[row, col]), dtype=torch.float, device=self.device
         )
         corr, _ = cross_correlation(
-            dp, self._template_ft, self._resolve_background_sigma(background_sigma)
+            dp,
+            self._template_ft,
+            self._resolve_background_sigma(background_sigma),
+            corr_power,
+            sigma_cc,
         )
         return corr.detach().cpu().numpy()
 
@@ -398,6 +410,8 @@ class BraggVectors(AutoSerialize):
         upsample_factor: int = 16,
         max_num_peaks: int = 1000,
         background_sigma: float | str | None = None,
+        corr_power: float = 1.0,
+        sigma_cc: float | None = None,
         batch_size: int | None = None,
         progressbar: bool = True,
     ) -> Vector:
@@ -431,6 +445,26 @@ class BraggVectors(AutoSerialize):
             Upsampling factor for the ``"upsample"`` subpixel refinement.
         max_num_peaks : int, default=1000
             Maximum number of peaks to keep per pattern.
+        background_sigma : float | "auto" | None, default=None
+            Width in pixels of a Fourier high-pass applied to the
+            cross-correlation before peak finding: a copy of the correlation
+            map smoothed by a Gaussian of this width is subtracted from it.
+            The filter is isotropic in the Fourier domain and needs no origin,
+            so it is not a radial background fit. Its purpose is the negative
+            moat a zero-sum template leaves around the bright unscattered
+            beam, which pushes weak disk peaks below zero where the
+            correlation clamp erases them. Set it a little wider than a disk
+            so the disk-scale peaks pass untouched; "auto" uses twice the
+            central beam radius.
+        corr_power : float, default=1.0
+            Correlation type: 1 is the plain cross-correlation, 0 the phase
+            correlation, and values in between the hybrid correlation. Lowering
+            it equalizes weak and strong disks, which finds many more weak
+            reflections on a bright background; the reported intensities are
+            then compressed, so check the effect before using them as weights.
+        sigma_cc : float | None
+            Gaussian smoothing of the correlation map (pixels) before peak
+            finding; merges the speckle of a noisy disk into one maximum.
         batch_size : int, optional
             Number of patterns per batch. ``None`` (default) picks a size from the
             detector dimensions.
@@ -454,6 +488,8 @@ class BraggVectors(AutoSerialize):
             upsample_factor=upsample_factor,
             max_num_peaks=max_num_peaks,
             background_sigma=self._resolve_background_sigma(background_sigma),
+            corr_power=corr_power,
+            sigma_cc=sigma_cc,
         )
 
         if positions is not None:
@@ -1173,6 +1209,8 @@ class BraggVectors(AutoSerialize):
         upsample_factor: int = 16,
         max_num_peaks: int = 1000,
         background_sigma: float | str | None = None,
+        corr_power: float = 1.0,
+        sigma_cc: float | None = None,
         image: np.ndarray | None = None,
         peak_radius: float = 6.0,
         marker_radius: float | None = None,
@@ -1206,6 +1244,26 @@ class BraggVectors(AutoSerialize):
             Upsampling factor for the ``"upsample"`` subpixel refinement.
         max_num_peaks : int, default=1000
             Maximum number of peaks to keep per pattern.
+        background_sigma : float | "auto" | None, default=None
+            Width in pixels of a Fourier high-pass applied to the
+            cross-correlation before peak finding: a copy of the correlation
+            map smoothed by a Gaussian of this width is subtracted from it.
+            The filter is isotropic in the Fourier domain and needs no origin,
+            so it is not a radial background fit. Its purpose is the negative
+            moat a zero-sum template leaves around the bright unscattered
+            beam, which pushes weak disk peaks below zero where the
+            correlation clamp erases them. Set it a little wider than a disk
+            so the disk-scale peaks pass untouched; "auto" uses twice the
+            central beam radius.
+        corr_power : float, default=1.0
+            Correlation type: 1 is the plain cross-correlation, 0 the phase
+            correlation, and values in between the hybrid correlation. Lowering
+            it equalizes weak and strong disks, which finds many more weak
+            reflections on a bright background; the reported intensities are
+            then compressed, so check the effect before using them as weights.
+        sigma_cc : float | None
+            Gaussian smoothing of the correlation map (pixels) before peak
+            finding; merges the speckle of a noisy disk into one maximum.
         image : np.ndarray or Dataset2d, optional
             Real-space navigation image (e.g. a virtual dark-field image) shown on
             the left with the chosen positions marked. ``None`` (default) shows only
@@ -1245,6 +1303,8 @@ class BraggVectors(AutoSerialize):
             upsample_factor=upsample_factor,
             max_num_peaks=max_num_peaks,
             background_sigma=background_sigma,
+            corr_power=corr_power,
+            sigma_cc=sigma_cc,
             progressbar=False,
         )
         if image is None:
@@ -1303,9 +1363,7 @@ class BraggVectors(AutoSerialize):
 
     # ---- helpers ----
 
-    def _resolve_background_sigma(
-        self, background_sigma: float | str | None
-    ) -> float | None:
+    def _resolve_background_sigma(self, background_sigma: float | str | None) -> float | None:
         """Resolve the ``background_sigma`` argument to a value in pixels.
 
         ``"auto"`` (the default everywhere) maps to twice the central-beam

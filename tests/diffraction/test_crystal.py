@@ -207,3 +207,142 @@ def test_pseudo_symmetry_dimensionless_and_intensity_check():
     assert strict.pseudo_symmetry_report.get("rejected") is True
     assert strict.pointgroup_matching == strict.pointgroup
     assert "rejected" in strict.symmetry_summary()
+
+
+def _l10(other: str, a: float = 3.58) -> Atoms:
+    """Two species ordered in alternating (001) layers of an fcc lattice.
+
+    The lattice stays cubic and every atom sits exactly on its site, so no
+    relaxation of the positions recovers the cubic parent: only the
+    diffracted intensities can say whether the ordering is visible.
+    """
+    at = Atoms(
+        "Ni4",
+        scaled_positions=[[0, 0, 0], [0.5, 0.5, 0], [0.5, 0, 0.5], [0, 0.5, 0.5]],
+        cell=[a, a, a],
+        pbc=True,
+    )
+    at.symbols = ["Ni", "Ni", other, other]
+    return at
+
+
+def test_pseudo_symmetry_from_weak_ordering():
+    """Ordering of species that scatter alike is found through the lattice.
+
+    Transition metals next to each other in the periodic table (the Ni, Co,
+    Mn of a cathode) give superlattice reflections far too weak to index, so
+    the orientation library must fold the variants together. The relaxed
+    position search cannot find this: the atoms are already where they
+    belong and only the species differ.
+    """
+    weak = Crystal.from_ase(_l10("Co"), verbose=False)
+    assert weak.pointgroup == "4/mmm"
+    assert weak.pointgroup_matching == "m-3m"
+    assert weak.sym_quats_matching.shape[0] == 3 * weak.sym_quats.shape[0]
+    assert weak.pseudo_symmetry_report["route"] == "lattice"
+    assert weak.pseudo_symmetry_report["intensity_mismatch"] < 0.01
+
+    # a light partner makes the same ordering plainly visible, and the
+    # candidate is rejected
+    strong = Crystal.from_ase(_l10("Li"), verbose=False)
+    assert strong.pointgroup_matching == strong.pointgroup
+    assert strong.pseudo_symmetry_report["rejected"] is True
+    assert strong.pseudo_symmetry_report["intensity_mismatch"] > 0.1
+
+    # the intensity tolerance is the decision, and it is the user's
+    borderline = Crystal.from_ase(_l10("Al"), verbose=False)
+    assert borderline.pointgroup_matching == borderline.pointgroup
+    loose = Crystal.from_ase(_l10("Al"), pseudo_symmetry_intensity_tol=0.1, verbose=False)
+    assert loose.pointgroup_matching == "m-3m"
+
+
+def test_true_symmetry_cells_are_unchanged():
+    """The lattice route must not disturb cells that are already at their
+    lattice's symmetry, nor accept a lattice symmetry the structure breaks."""
+    from ase.build import bulk
+
+    for atoms, pg in (
+        (bulk("Si", "diamond", a=5.43), "m-3m"),
+        (bulk("Ti", "hcp", a=2.95, c=4.686), "6/mmm"),
+        (bulk("Ti", "bcc", a=3.26, cubic=True), "m-3m"),
+    ):
+        xtl = Crystal.from_ase(atoms, verbose=False)
+        assert xtl.pointgroup_matching == pg
+        assert xtl.sym_quats_matching.shape[0] == xtl.sym_quats.shape[0]
+
+    # corundum sits on a hexagonal lattice but its structure is only -3m;
+    # the lattice route proposes 6/mmm and the intensities reject it
+    from ase.spacegroup import crystal as ase_crystal
+
+    al2o3 = ase_crystal(
+        ("Al", "O"),
+        basis=[(0, 0, 0.3522), (0.3064, 0, 0.25)],
+        spacegroup=167,
+        cellpar=[4.7607, 4.7607, 12.9947, 90, 90, 120],
+    )
+    xtl = Crystal.from_ase(al2o3, verbose=False)
+    assert xtl.pointgroup_matching == "-3m"
+    assert xtl.pseudo_symmetry_report["candidate"] == "6/mmm"
+    assert xtl.pseudo_symmetry_report["rejected"] is True
+
+
+def test_projected_rotation_order():
+    """Apparent zero-layer symmetry, which limits in-plane indexing."""
+    bcc = Crystal.from_ase(
+        bulk("Ti", "bcc", a=3.26, cubic=True), verbose=False
+    ).calculate_structure_factors(k_max=1.5)
+    hcp = Crystal.from_ase(
+        bulk("Ti", "hcp", a=2.95, c=4.686), verbose=False
+    ).calculate_structure_factors(k_max=1.5)
+
+    def cartesian(xtl, uvw):
+        d = torch.as_tensor(np.asarray(uvw, dtype=float), dtype=torch.float64) @ xtl.lat_real
+        return (d / torch.linalg.norm(d)).numpy()
+
+    # the zero-layer net of {110} along <111> is hexagonal, so the pattern
+    # repeats every 60 degrees while the crystal repeats every 120
+    assert bcc.projected_rotation_order(cartesian(bcc, (1, 1, 1))) == 6
+    assert bcc.projected_rotation_order(cartesian(bcc, (0, 0, 1))) == 4
+    assert bcc.projected_rotation_order(cartesian(bcc, (0, 1, 1))) == 2
+    # a general zone axis keeps the two-fold that Friedel's law provides
+    assert bcc.projected_rotation_order(cartesian(bcc, (1, 2, 3))) == 2
+    assert hcp.projected_rotation_order(cartesian(hcp, (0, 0, 1))) == 6
+    assert hcp.projected_rotation_order(cartesian(hcp, (1, 0, 0))) == 2
+
+    # vectorized over a stack
+    axes = np.stack([cartesian(bcc, u) for u in ((1, 1, 1), (0, 0, 1), (0, 1, 1))])
+    assert list(bcc.projected_rotation_order(axes)) == [6, 4, 2]
+
+
+def test_projected_order_matches_pattern_degeneracy():
+    """The reported order is the rotation that leaves the pattern unchanged."""
+    from quantem.diffraction.rotations import (
+        qmult,
+        qnormalize,
+        quat_from_axis_angle,
+        quat_from_zone_axis,
+    )
+
+    bcc = Crystal.from_ase(
+        bulk("Ti", "bcc", a=3.26, cubic=True), verbose=False
+    ).calculate_structure_factors(k_max=1.5)
+    d = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float64) @ bcc.lat_real
+    axis = d / torch.linalg.norm(d)
+    n = bcc.projected_rotation_order(axis.numpy())
+    q = quat_from_zone_axis(axis)
+    beam = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
+    spun = qnormalize(
+        qmult(quat_from_axis_angle(beam, torch.tensor(2 * np.pi / n)), q)
+    )
+
+    a = bcc.generate_pattern(q, energy_ev=200e3, sigma_excitation=0.02)
+    b = bcc.generate_pattern(spun, energy_ev=200e3, sigma_excitation=0.02)
+    pa = torch.stack([a["qx"], a["qy"]], dim=1)
+    pb = torch.stack([b["qx"], b["qy"]], dim=1)
+    assert pa.shape == pb.shape
+    # every peak of one pattern sits on a peak of the other, same intensity
+    dist = torch.cdist(pa, pb)
+    dmin, j = dist.min(dim=1)
+    assert float(dmin.max()) < 1e-6
+    rel = (a["intensity"] - b["intensity"][j]).abs().max() / a["intensity"].max()
+    assert float(rel) < 1e-6

@@ -295,8 +295,6 @@ class Crystal:
         """
         import spglib
 
-        from quantem.diffraction.rotations import quat_to_matrix
-
         cell = (
             self.lat_real.numpy(),
             self.positions_frac.numpy(),
@@ -319,43 +317,213 @@ class Crystal:
         self.pseudo_symmetry_report = {"distance_A": symprec_pseudo}
         if symprec_pseudo <= symprec:
             return
-        try:
-            ds_pseudo = spglib.get_symmetry_dataset(cell, symprec=symprec_pseudo)
-        except Exception:
-            ds_pseudo = None
-        if ds_pseudo is None:
-            return
-        pg_pseudo = spglib.get_pointgroup(ds_pseudo.rotations)[0].strip()
-        quats_pseudo = symmetry_quaternions(ds_pseudo.rotations, self.lat_real.numpy())
-        if quats_pseudo.shape[0] <= self.sym_quats.shape[0]:
-            return
 
-        # intensity check on the extra operations: |F|^2 of every reflection
-        # against |F|^2 of its image, relative to the strongest reflection
+        # Two independent routes to a higher matching symmetry.
+        #
+        # "relaxed positions": the group spglib finds when every atom is
+        # allowed to move by symprec_pseudo, which catches a cell that is a
+        # slightly distorted child of a higher-symmetry parent.
+        #
+        # "lattice": the point group of the lattice alone, ignoring the
+        # basis. A structure whose symmetry is broken only by weakly
+        # scattering atoms (lithium and oxygen against a transition metal)
+        # or by a faint superstructure sits exactly here: no relaxation of
+        # the positions recovers the parent, because the atoms are already
+        # where they belong, but the diffraction still has the symmetry of
+        # the heavy sublattice. Both candidate sets are filtered by the same
+        # intensity test, so an operation is adopted only when it leaves the
+        # kinematical pattern unchanged.
+        candidates: list[tuple[str, np.ndarray]] = []
+        try:
+            ds_relaxed = spglib.get_symmetry_dataset(cell, symprec=symprec_pseudo)
+        except Exception:
+            ds_relaxed = None
+        if ds_relaxed is not None:
+            candidates.append(("relaxed positions", ds_relaxed.rotations))
+        lattice_cell = (
+            self.lat_real.numpy(),
+            np.zeros((1, 3)),
+            np.ones(1, dtype=int),
+        )
+        try:
+            ds_lattice = spglib.get_symmetry_dataset(lattice_cell, symprec=symprec_pseudo)
+        except Exception:
+            ds_lattice = None
+        if ds_lattice is not None:
+            candidates.append(("lattice", ds_lattice.rotations))
+
+        best = None
+        for route, rotations in candidates:
+            quats = symmetry_quaternions(rotations, self.lat_real.numpy())
+            if quats.shape[0] <= self.sym_quats.shape[0]:
+                continue
+            pg_cand = spglib.get_pointgroup(rotations)[0].strip()
+            accepted, worst = self._intensity_preserving_subgroup(quats, intensity_tol)
+            if self.pseudo_symmetry_report.get("candidate") is None or accepted is not None:
+                self.pseudo_symmetry_report.setdefault("candidate", pg_cand)
+                self.pseudo_symmetry_report.setdefault("intensity_mismatch", worst)
+            if accepted is None:
+                continue
+            if best is None or accepted.shape[0] > best[1].shape[0]:
+                best = (route, accepted, pg_cand, worst, quats.shape[0])
+
+        if best is None:
+            if "candidate" in self.pseudo_symmetry_report:
+                self.pseudo_symmetry_report["rejected"] = True
+            return
+        route, accepted, pg_cand, worst, n_cand = best
+        self.pseudo_symmetry_report.update(
+            candidate=pg_cand, intensity_mismatch=worst, route=route, rejected=False
+        )
+        self.sym_quats_matching = accepted
+        # name the accepted group by the candidate symbol when every one of
+        # its rotations survived the intensity test, otherwise by its size
+        if accepted.shape[0] == n_cand:
+            self.pointgroup_matching = pg_cand
+            self.laue_group_matching = _LAUE_CLASS.get(pg_cand, self.laue_group)
+        else:
+            self.pointgroup_matching = f"{accepted.shape[0]} rotations"
+            self.laue_group_matching = self.laue_group
+
+    def _intensity_preserving_subgroup(
+        self, quats: torch.Tensor, intensity_tol: float
+    ) -> tuple[torch.Tensor | None, float]:
+        """Largest subgroup of `quats` that leaves the kinematical intensities
+        invariant, or None when nothing beyond the true symmetry survives.
+
+        Every candidate operation is applied to the reflection list and the
+        intensity of each reflection compared with the intensity of its
+        image, relative to the strongest reflection. Operations that pass
+        are kept; the survivors are then closed under composition (dropping
+        the worst offender until they are), because a set of operations that
+        is not a group cannot be used to fold orientations.
+
+        Returns the accepted quaternions and the worst mismatch among the
+        operations that were tested.
+        """
+        from quantem.diffraction.rotations import quat_to_matrix
+
         hkl, inten = self._quick_intensities()
         lut = {tuple(h): i for i, h in enumerate(hkl.tolist())}
         g = hkl.to(torch.float64) @ self.lat_recip
         i_max = float(inten.max())
-        Rs = quat_to_matrix(quats_pseudo)
+        Rs = quat_to_matrix(quats)
         Rs_true = quat_to_matrix(self.sym_quats)
+
+        def is_true(R):
+            return any(float((R - Rt).abs().max()) < 1e-6 for Rt in Rs_true)
+
+        mismatch = torch.zeros(quats.shape[0], dtype=torch.float64)
         worst = 0.0
-        for R in Rs:
-            if any(float((R - Rt).abs().max()) < 1e-6 for Rt in Rs_true):
+        for i, R in enumerate(Rs):
+            if is_true(R):
                 continue
             g_img = g @ R.T
             hkl_img = torch.round(g_img @ self.lat_real.T).to(torch.long)
             idx = torch.tensor([lut.get(tuple(h), -1) for h in hkl_img.tolist()])
             ok = idx >= 0
-            diff = (inten[ok] - inten[idx[ok]]).abs() / i_max
-            worst = max(worst, float(diff.max()) if ok.any() else 0.0)
-        self.pseudo_symmetry_report["intensity_mismatch"] = worst
-        self.pseudo_symmetry_report["candidate"] = pg_pseudo
-        if worst > intensity_tol:
-            self.pseudo_symmetry_report["rejected"] = True
-            return
-        self.pointgroup_matching = pg_pseudo
-        self.laue_group_matching = _LAUE_CLASS.get(pg_pseudo, "-1")
-        self.sym_quats_matching = quats_pseudo
+            m = float((inten[ok] - inten[idx[ok]]).abs().max()) / i_max if bool(ok.any()) else 0.0
+            mismatch[i] = m
+            worst = max(worst, m)
+
+        keep = mismatch <= intensity_tol
+        # close under composition: a product of kept operations must also be
+        # kept, or the set is not a group
+        for _ in range(quats.shape[0]):
+            idx = torch.nonzero(keep).squeeze(1)
+            if idx.numel() <= self.sym_quats.shape[0]:
+                return None, worst
+            R_keep = Rs[idx]
+            prod = torch.einsum("aij,bjk->abik", R_keep, R_keep).reshape(-1, 3, 3)
+            d = (prod[:, None] - R_keep[None]).abs().amax(dim=(-1, -2))
+            closed = bool((d.min(dim=1).values < 1e-6).all())
+            if closed:
+                return quats[idx], worst
+            drop = idx[int(torch.argmax(mismatch[idx]))]
+            keep[drop] = False
+        return None, worst
+
+    def projected_rotation_order(
+        self,
+        zone_axis,
+        k_max: float | None = None,
+        tol_zone: float = 0.02,
+        intensity_tol: float = 0.05,
+    ):
+        """Apparent rotational symmetry of the zero-layer pattern, per zone axis.
+
+        A zone-layer pattern can be more symmetric about the beam than the
+        crystal is, and where it is, the in-plane orientation cannot be
+        indexed. Body-centered cubic along <111> is the standard case: the
+        zero-layer net of {110} reflections is hexagonal, so the pattern
+        repeats every 60 degrees while the crystal repeats every 120, and the
+        two orientations 60 degrees apart give the same peak positions and the
+        same kinematical intensities. Only the higher-order Laue zones or the
+        dynamical intensities separate them.
+
+        Returned is the largest n in (6, 4, 3, 2, 1) for which rotating the
+        zero-layer reflections by 360/n about the zone axis reproduces the
+        set, in position and in kinematical intensity. Fold an in-plane angle
+        or color by 360/n to get a map that is continuous across the
+        ambiguity, and use `n` against the crystal's own rotational order
+        about the same axis to see where indexing is degenerate.
+
+        Parameters
+        ----------
+        zone_axis : array-like
+            Cartesian zone axis (3,), or a stack of them (..., 3); need not
+            be normalized.
+        k_max : float | None
+            Only reflections within this scattering vector are tested;
+            defaults to the crystal's own k_max.
+        tol_zone : float, default=0.02
+            Half-thickness of the zero layer (1/Angstroms): reflections with
+            |g . zone_axis| below this count as zero layer.
+        intensity_tol : float, default=0.05
+            A reflection and its image must agree in |F|^2 to within this
+            fraction of the strongest zero-layer reflection.
+
+        Returns
+        -------
+        int | np.ndarray
+            The order n, scalar for a single zone axis.
+        """
+        if self.g_vec is None:
+            raise RuntimeError("Run calculate_structure_factors() first.")
+        axes = torch.as_tensor(np.asarray(zone_axis, dtype=float), dtype=torch.float64)
+        single = axes.ndim == 1
+        axes = axes.reshape(-1, 3)
+        axes = axes / torch.linalg.norm(axes, dim=1, keepdim=True).clamp_min(1e-12)
+
+        g = self.g_vec
+        inten = self.struct_factors_int.to(torch.float64)
+        if k_max is not None:
+            sel = self.g_len <= float(k_max)
+            g, inten = g[sel], inten[sel]
+
+        out = np.ones(axes.shape[0], dtype=int)
+        eye = torch.eye(3, dtype=torch.float64)
+        for i, u in enumerate(axes):
+            zol = torch.abs(g @ u) <= tol_zone
+            gz, iz = g[zol], inten[zol]
+            if gz.shape[0] < 3:
+                continue
+            i_max = float(iz.max()).__abs__() or 1.0
+            ux = torch.tensor(
+                [[0.0, -u[2], u[1]], [u[2], 0.0, -u[0]], [-u[1], u[0], 0.0]],
+                dtype=torch.float64,
+            )
+            for n in (6, 4, 3, 2):
+                th = 2 * np.pi / n
+                R = eye + np.sin(th) * ux + (1 - np.cos(th)) * (ux @ ux)  # Rodrigues
+                d = torch.cdist(gz @ R.T, gz)
+                dmin, j = d.min(dim=1)
+                if float(dmin.max()) > tol_zone:
+                    continue
+                if float((iz - iz[j]).abs().max()) / i_max <= intensity_tol:
+                    out[i] = n
+                    break
+        return int(out[0]) if single else out
 
     def zone_axis_wedge(self) -> torch.Tensor | None:
         """Fundamental zone-axis wedge corners (3, 3) Cartesian, or None.

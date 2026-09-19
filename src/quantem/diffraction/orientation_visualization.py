@@ -333,6 +333,8 @@ def plot_pattern_matches(
     scalebar: bool = True,
     show_measured: bool = True,
     marker_scale: float = 250.0,
+    marker: str | None = None,
+    transpose: bool = False,
     axsize: tuple[float, float] = (3.1, 3.1),
 ):
     """Candidate matches side by side, py4DSTEM style.
@@ -362,6 +364,14 @@ def plot_pattern_matches(
         Match indices per crystal.
     colors : list | None
         One color per crystal; defaults to red, blue, green, purple.
+    marker : str | None
+        Matplotlib marker for the simulated peaks. The default is an open
+        circle over a diffraction pattern, which leaves the measured disk
+        visible inside it, and a plus over the gray measured peaks.
+    transpose : bool, default=False
+        By default rows are probe positions and columns are candidates.
+        True swaps them, giving one row per candidate across the positions,
+        which fits a few candidates and many positions on a page.
     """
     import matplotlib.pyplot as plt
 
@@ -382,13 +392,17 @@ def plot_pattern_matches(
     rot_back = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
 
     panels = [(i, m) for i in range(len(oms)) for m in matches]
-    n_r, n_c = len(positions), len(panels)
+    n_pos, n_pan = len(positions), len(panels)
+    n_r, n_c = (n_pan, n_pos) if transpose else (n_pos, n_pan)
     fig, axs = plt.subplots(
         n_r,
         n_c,
         figsize=(axsize[0] * n_c, axsize[1] * n_r + 0.2),
         squeeze=False,
     )
+    over_image = dataset is not None and pixel_size is not None
+    if marker is None:
+        marker = "o" if over_image else "+"
     ordinal = ["1st", "2nd", "3rd"] + [f"{k + 1}th" for k in range(3, 9)]
     for pi, (rx, ry) in enumerate(positions):
         data = peaks[rx, ry].array.copy()
@@ -407,8 +421,8 @@ def plot_pattern_matches(
             q_lim = q_max_plot
         for ci, (i_om, m) in enumerate(panels):
             om = oms[i_om]
-            ax = axs[pi, ci]
-            if dataset is not None and pixel_size is not None:
+            ax = axs[ci, pi] if transpose else axs[pi, ci]
+            if over_image:
                 H, W = dataset.shape[-2], dataset.shape[-1]
                 if origins is not None:
                     o_r, o_c = origins[rx, ry]
@@ -438,24 +452,41 @@ def plot_pattern_matches(
             inten = sim["intensity"].numpy()
             sim_rc = np.stack([sim["qx"].numpy(), sim["qy"].numpy()], axis=1) @ rot_back.T
             if inten.size:
-                ax.scatter(
-                    sim_rc[:, 1],
-                    sim_rc[:, 0],
-                    s=marker_scale * inten / inten.max(),
-                    marker="+",
-                    color=colors[i_om % len(colors)],
-                    lw=1.8,
-                )
+                size = marker_scale * inten / inten.max()
+                color = colors[i_om % len(colors)]
+                if marker == "o":
+                    # open circles leave the measured disk visible inside
+                    ax.scatter(
+                        sim_rc[:, 1],
+                        sim_rc[:, 0],
+                        s=size,
+                        marker="o",
+                        facecolors="none",
+                        edgecolors=color,
+                        lw=1.4,
+                    )
+                else:
+                    ax.scatter(
+                        sim_rc[:, 1],
+                        sim_rc[:, 0],
+                        s=size,
+                        marker=marker,
+                        color=color,
+                        lw=1.8,
+                    )
             ax.set_xlim(-q_lim, q_lim)
             ax.set_ylim(q_lim, -q_lim)
             ax.set_xticks([])
             ax.set_yticks([])
             ax.set_aspect("equal")
             ax.set_title(
-                "%s %s\ncorr = %.2f" % (om.crystal.name, ordinal[m], float(om.corr[rx, ry, m])),
+                "%s %s\n(%d, %d)   corr = %.2f"
+                % (om.crystal.name, ordinal[m], rx, ry, float(om.corr[rx, ry, m])),
                 fontsize=9,
             )
-            if scalebar and pi == n_r - 1 and ci == 0:
+            last_row = (ci == n_r - 1) if transpose else (pi == n_r - 1)
+            first_col = (pi == 0) if transpose else (ci == 0)
+            if scalebar and last_row and first_col:
                 add_scalebar_to_ax(
                     ax,
                     array_size=2 * q_lim,

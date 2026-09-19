@@ -34,7 +34,7 @@ from quantem.diffraction.defaults import (
     POWER_INTENSITY,
     resolve,
 )
-from quantem.diffraction.orientation import OrientationMap
+from quantem.diffraction.orientation import OrientationMap, position_mask
 
 
 class PhaseMap(AutoSerialize):
@@ -86,6 +86,7 @@ class PhaseMap(AutoSerialize):
 
     def fit(
         self,
+        positions=None,
         pair_distance: float | None = None,
         power_intensity: float | None = None,
         max_patterns: int = 2,
@@ -106,6 +107,11 @@ class PhaseMap(AutoSerialize):
 
         Parameters
         ----------
+        positions : list[tuple[int, int]] | np.ndarray | None
+            Scan positions to fit: a list of (row, col) or an (R, C)
+            boolean mask. None (default) fits every position matched by
+            all of the orientation maps, so a staged test run on a few
+            positions carries through without repeating the list.
         pair_distance : float | None
             Pairing distance delta (1/Angstroms) between simulated and
             measured peaks; inherits the plan's correlation kernel.
@@ -151,6 +157,7 @@ class PhaseMap(AutoSerialize):
             min_number_peaks, "min_number_peaks", match_md, default=MIN_NUMBER_PEAKS
         )
         self.metadata["fit"] = dict(
+            positions=None if positions is None else "subset",
             pair_distance=float(pair_distance),
             power_intensity=float(power_intensity),
             max_patterns=int(max_patterns),
@@ -178,7 +185,11 @@ class PhaseMap(AutoSerialize):
         reliability = torch.zeros((R, C), dtype=torch.float64)
         best_subset = torch.full((R, C), -1, dtype=torch.long)
 
-        iterator = list(np.ndindex(R, C))
+        active = position_mask(positions, (R, C))
+        for om in oms:
+            if om.computed is not None:
+                active = active & om.computed
+        iterator = [(rx, ry) for rx, ry in np.ndindex(R, C) if active[rx, ry]]
         if progress_bar:
             iterator = tqdm(iterator, desc="phase mapping")
         for rx, ry in iterator:

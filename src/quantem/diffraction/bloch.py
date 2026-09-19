@@ -2231,7 +2231,10 @@ def refine_dynamical(
         deformation is applied to the tilted cell in the Bloch calculation
         and the rotation folded into the orientation.
     mask : np.ndarray | None
-        (R, C) boolean; only these positions are refined.
+        Positions to refine: an (R, C) boolean mask or a list of
+        (row, col), as for OrientationMap.match_orientations. None
+        (default) refines every position the orientation maps reached, so
+        a staged test run on a few positions carries through.
     fast_absorption : bool, default=True
         First-order treatment of absorption during the search (Hermitian
         eigh, ~4x faster, 0.5% rms intensity error); the final evaluation
@@ -2548,9 +2551,13 @@ def refine_dynamical(
         im = torch.as_tensor(data[:, ix[2]], dtype=torch.float64).clamp_min(0) ** power_intensity
         return qxy, im, im / im.max().clamp_min(1e-12)
 
-    iterator = list(np.ndindex(R, C))
-    if mask is not None:
-        iterator = [(r, c) for r, c in iterator if mask[r, c]]
+    from quantem.diffraction.orientation import position_mask
+
+    mask_rc = position_mask(mask, (R, C))
+    for om in oms:
+        if om.computed is not None:
+            mask_rc = mask_rc & om.computed
+    iterator = [(r, c) for r, c in np.ndindex(R, C) if mask_rc[r, c]]
     if progress_bar:
         iterator = tqdm(iterator, desc="dynamical refinement")
     for rx, ry in iterator:
@@ -3246,9 +3253,10 @@ def refine_dynamical_image(
     quat_out[..., 0] = 1.0
     cost_out = torch.full((R, C), torch.nan, dtype=torch.float64)
 
-    iterator = list(np.ndindex(R, C))
-    if mask is not None:
-        iterator = [(r, c) for r, c in iterator if mask[r, c]]
+    from quantem.diffraction.orientation import position_mask
+
+    mask_rc = position_mask(mask, (R, C))
+    iterator = [(r, c) for r, c in np.ndindex(R, C) if mask_rc[r, c]]
     if progress_bar:
         iterator = tqdm(iterator, desc="image refinement")
     for rx, ry in iterator:

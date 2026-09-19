@@ -227,9 +227,14 @@ def gaussian_envelope_ring_torch(c: torch.Tensor, a: torch.Tensor, sigma: float)
     v_safe = torch.where(smallv, torch.ones_like(v), v)
     i2v = torch.where(smallv, v * v / 8, i0v - 2 * i1v / v_safe)
     out = torch.exp(-0.5 * (c / sigma) ** 2 - v) * (i0u * i0v - 2 * i2u * i1v + 2 * i4u * i2v)
-    big = v > 0.3
+    # v follows the shape of a, which may be narrower than the output: the
+    # fallback mask has to be taken in the broadcast shape or it indexes the
+    # wrong elements (a narrow sigma or a large sweep reaches this branch)
+    big = torch.broadcast_to(v > 0.3, out.shape)
     if bool(big.any()):
         out = out.clone()
-        ref = gaussian_envelope_ring_series(c[big], torch.broadcast_to(a, c.shape)[big], sigma)
+        c_b = torch.broadcast_to(c, out.shape)
+        a_b = torch.broadcast_to(a, out.shape)
+        ref = gaussian_envelope_ring_series(c_b[big], a_b[big], sigma)
         out[big] = ref.to(out.dtype)
     return out.clamp(0.0, 1.0)

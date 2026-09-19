@@ -53,6 +53,33 @@ from quantem.diffraction.rotations import (
 )
 
 
+def position_mask(positions, shape: tuple[int, int]) -> torch.Tensor:
+    """Normalize a `positions` argument into an (R, C) boolean mask.
+
+    Accepts None (every position), a list of (row, col) scan positions, or
+    an (R, C) boolean array. Used by the staged workflow: run matching or
+    refinement on a handful of positions, look at the fits, then run the
+    whole scan with the same arguments.
+    """
+    R, C = shape
+    if positions is None:
+        return torch.ones((R, C), dtype=torch.bool)
+    arr = np.asarray(positions)
+    if arr.dtype == bool:
+        if arr.shape != (R, C):
+            raise ValueError(f"boolean positions mask must have shape {(R, C)}, got {arr.shape}")
+        return torch.as_tensor(arr, dtype=torch.bool)
+    arr = np.atleast_2d(arr)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        raise ValueError("positions must be None, an (R, C) boolean mask, or a list of (row, col)")
+    mask = torch.zeros((R, C), dtype=torch.bool)
+    for r, c in arr.astype(int):
+        if not (0 <= r < R and 0 <= c < C):
+            raise ValueError(f"position ({r}, {c}) is outside the scan {(R, C)}")
+        mask[r, c] = True
+    return mask
+
+
 def fibonacci_hemisphere(n_points: int, dtype=torch.float64) -> torch.Tensor:
     """Spherical Fibonacci sampling of the upper hemisphere, (N, 3)."""
     i = torch.arange(n_points, dtype=dtype) + 0.5
@@ -180,6 +207,8 @@ class OrientationMap(AutoSerialize):
         self.corr_second: torch.Tensor | None = None
         self.reliability: torch.Tensor | None = None
         self.mirror: torch.Tensor | None = None
+        # positions carrying a result; a subset after a staged test run
+        self.computed: torch.Tensor | None = None
 
     @classmethod
     def from_vectors(
@@ -221,10 +250,14 @@ class OrientationMap(AutoSerialize):
         self,
         angle_step_zone_axis_deg: float = 1.0,
         angle_step_in_plane_deg: float = 5.0,
+        zone_axis_range="auto",
+        fiber_axis=None,
+        fiber_angle_deg: float = 0.0,
         corr_kernel_size: float = PAIR_DISTANCE,
         sigma_excitation: float = SIGMA_EXCITATION,
         power_radial: float = 1.0,
         power_intensity: float = POWER_INTENSITY,
+        power_intensity_experiment: float | None = None,
         tol_shell_distance: float = 0.01,
         detector_q_max: float | tuple[float, float] | str | None = "auto",
         device: str | torch.device = "cpu",
@@ -245,6 +278,34 @@ class OrientationMap(AutoSerialize):
             continuously (parabolic sub-bin interpolation, then least
             squares on the paired peaks in refine_orientations), so a
             coarse step costs little accuracy and keeps the library small.
+        zone_axis_range : {"auto", "full", "fiber"} | array-like, default="auto"
+            Which zone axes the library covers.
+
+            - "auto": the fundamental wedge of the matching point group
+              (the pseudo-symmetry group when one was detected), falling
+              back to the hemisphere for triclinic and monoclinic cells.
+              This is the right choice for an unknown texture.
+            - "full": the whole hemisphere, whatever the symmetry. Use when
+              the symmetry the cell reports is not the symmetry of its
+              diffraction, so the wedge would fold distinct orientations
+              onto each other.
+            - "fiber": a cap of half angle `fiber_angle_deg` about
+              `fiber_axis`, for a known texture (a 2D material or a
+              textured film). `fiber_angle_deg=0` samples the fiber axis
+              alone, so the match is over the in-plane angle only, which
+              makes the library tiny and the match far more robust.
+            - an array of 2 or 3 lattice directions [uvw] (or [uvtw] for a
+              hexagonal cell): the spherical triangle they span. With two
+              rows the wedge runs from [001] through both.
+
+            The in-plane angle is always searched over the full 360 degrees;
+            the correlation is circular in it, so restricting it saves
+            nothing.
+        fiber_axis : array-like | None
+            Lattice direction [uvw] (or [uvtw]) of the fiber axis, required
+            by zone_axis_range="fiber".
+        fiber_angle_deg : float, default=0.0
+            Half angle of the fiber cap, degrees.
         corr_kernel_size : float, default=0.05
             Correlation kernel size delta (1/Angstroms): azimuthal extent of
             each reference peak and radial tolerance for shell assignment.
@@ -261,6 +322,11 @@ class OrientationMap(AutoSerialize):
             Weighting prefactor q^power_radial * |V_g|^power_intensity for
             library peaks. power_intensity=0 matches on positions only
             (best for strongly dynamical data).
+        power_intensity_experiment : float | None
+            Exponent applied to the *measured* peak intensities; defaults to
+            `power_intensity`. Lower it than the library exponent when the
+            measured intensities are less trustworthy than the simulated
+            ones (saturation, a beam stop, strong dynamical transfer).
         tol_shell_distance : float, default=0.01
             Reciprocal lattice radii closer than this merge into one shell.
         detector_q_max : float | tuple | "auto" | None, default="auto"
@@ -293,17 +359,16 @@ class OrientationMap(AutoSerialize):
         self.sigma_excitation = float(sigma_excitation)
         self.power_radial = float(power_radial)
         self.power_intensity = float(power_intensity)
+        self.power_intensity_experiment = float(
+            power_intensity if power_intensity_experiment is None else power_intensity_experiment
+        )
 
-        # zone axis sampling over the matching (pseudo-symmetry-reduced) wedge
-        msg = crystal.matching_symmetry_warning()
-        if msg is not None:
-            warnings.warn(msg, stacklevel=2)
-        wedge = crystal.zone_axis_wedge()
-        if wedge is None:
-            n_zones = int(np.ceil(2 * np.pi / np.deg2rad(angle_step_zone_axis_deg) ** 2))
-            za = fibonacci_hemisphere(n_zones)
-        else:
-            za, _ = sample_zone_axes(wedge, angle_step_zone_axis_deg)
+        # zone axis sampling: the symmetry wedge, the hemisphere, a fiber
+        # cap, or an explicit spherical triangle of lattice directions
+        za = self._sample_zone_axes(
+            zone_axis_range, fiber_axis, fiber_angle_deg, angle_step_zone_axis_deg
+        )
+        self.zone_axis_range = zone_axis_range
         self.zone_axes = za
         self.zone_quats = quat_from_zone_axis(za)
         self.zone_step_deg = float(angle_step_zone_axis_deg)
@@ -414,11 +479,17 @@ class OrientationMap(AutoSerialize):
             semiconv_mrad=float(self.metadata.get("semiconv_mrad", 0.0) or 0.0),
             angle_step_zone_axis_deg=float(angle_step_zone_axis_deg),
             angle_step_in_plane_deg=float(angle_step_in_plane_deg),
+            zone_axis_range=zone_axis_range
+            if isinstance(zone_axis_range, str)
+            else np.asarray(zone_axis_range).tolist(),
+            fiber_axis=None if fiber_axis is None else np.asarray(fiber_axis).tolist(),
+            fiber_angle_deg=float(fiber_angle_deg),
             corr_kernel_size=self.corr_kernel_size,
             pair_distance=self.corr_kernel_size,
             sigma_excitation=self.sigma_excitation,
             power_radial=self.power_radial,
             power_intensity=self.power_intensity,
+            power_intensity_experiment=self.power_intensity_experiment,
             tol_shell_distance=float(tol_shell_distance),
             detector_q_max=None
             if detector_q_max is None
@@ -436,6 +507,61 @@ class OrientationMap(AutoSerialize):
                 )
             )
         return self
+
+    def _sample_zone_axes(
+        self,
+        zone_axis_range,
+        fiber_axis,
+        fiber_angle_deg: float,
+        step_deg: float,
+    ) -> torch.Tensor:
+        """Zone-axis sampling requested by build_plan, (Z, 3) Cartesian."""
+        from quantem.diffraction.rotations import sample_zone_axis_cap
+
+        crystal = self.crystal
+
+        def cartesian(uvw) -> torch.Tensor:
+            v = np.asarray(uvw, dtype=float).reshape(-1)
+            if v.shape[0] == 4:  # Miller-Bravais [uvtw]
+                from quantem.diffraction.crystal import miller_bravais_to_miller
+
+                v = np.asarray(miller_bravais_to_miller(v)).reshape(-1)
+            if v.shape[0] != 3:
+                raise ValueError("a direction must have 3 indices [uvw] or 4 [uvtw]")
+            d = torch.as_tensor(v, dtype=torch.float64) @ crystal.lat_real
+            return d / torch.linalg.norm(d).clamp_min(1e-12)
+
+        if isinstance(zone_axis_range, str):
+            mode = zone_axis_range.lower()
+            if mode == "fiber":
+                if fiber_axis is None:
+                    raise ValueError('zone_axis_range="fiber" needs a fiber_axis')
+                return sample_zone_axis_cap(cartesian(fiber_axis), fiber_angle_deg, step_deg)
+            if mode in ("full", "hemisphere"):
+                n_zones = int(np.ceil(2 * np.pi / np.deg2rad(step_deg) ** 2))
+                return fibonacci_hemisphere(n_zones)
+            if mode != "auto":
+                raise ValueError(
+                    'zone_axis_range must be "auto", "full", "fiber", or an array of directions'
+                )
+            msg = crystal.matching_symmetry_warning()
+            if msg is not None:
+                warnings.warn(msg, stacklevel=3)
+            wedge = crystal.zone_axis_wedge()
+            if wedge is None:  # triclinic / monoclinic: not a spherical triangle
+                n_zones = int(np.ceil(2 * np.pi / np.deg2rad(step_deg) ** 2))
+                return fibonacci_hemisphere(n_zones)
+            za, _ = sample_zone_axes(wedge, step_deg)
+            return za
+
+        rows = np.atleast_2d(np.asarray(zone_axis_range, dtype=float))
+        dirs = [cartesian(r) for r in rows]
+        if len(dirs) == 2:
+            dirs = [cartesian([0, 0, 1]), *dirs]
+        if len(dirs) != 3:
+            raise ValueError("zone_axis_range as an array needs 2 or 3 directions")
+        za, _ = sample_zone_axes(torch.stack(dirs), step_deg)
+        return za
 
     def _deposit_polar(
         self,
@@ -552,7 +678,7 @@ class OrientationMap(AutoSerialize):
         """Sparse polar image (S, G) of one measured pattern."""
         qr = torch.hypot(qx, qy)
         qphi = torch.atan2(qy, qx)
-        amp = intensity.clamp_min(0) ** (self.power_intensity) * qr**self.power_radial
+        amp = intensity.clamp_min(0) ** self.power_intensity_experiment * qr**self.power_radial
         out = torch.zeros((self.shell_radii.shape[0], self.num_gamma), dtype=torch.float64)
         return self._deposit_polar(qr, qphi, amp, out)
 
@@ -568,7 +694,7 @@ class OrientationMap(AutoSerialize):
         intensity = torch.as_tensor(data[:, 2], dtype=torch.float64)
         qr = torch.hypot(qx, qy)
         qphi = torch.atan2(qy, qx)
-        amp = intensity.clamp_min(0) ** (self.power_intensity) * qr**self.power_radial
+        amp = intensity.clamp_min(0) ** self.power_intensity_experiment * qr**self.power_radial
         out = torch.zeros(
             (len(arrays), self.shell_radii.shape[0], self.num_gamma), dtype=torch.float64
         )
@@ -581,6 +707,7 @@ class OrientationMap(AutoSerialize):
     def match_orientations(
         self,
         num_matches: int = 1,
+        positions=None,
         include_mirror: bool = True,
         min_number_peaks: int | None = None,
         min_angle_between_matches_deg: float = 15.0,
@@ -590,7 +717,7 @@ class OrientationMap(AutoSerialize):
         batch_size: int = 128,
         progress_bar: bool = True,
     ) -> "OrientationMap":
-        """Match all probe positions against the orientation plan.
+        """Match probe positions against the orientation plan.
 
         Patterns are processed in batches: the polar images are stacked, and
         the correlation over all zones and in-plane angles reduces to one
@@ -610,6 +737,13 @@ class OrientationMap(AutoSerialize):
             Number of orientations to return per probe position; matches
             after the first suppress zones within
             `min_angle_between_matches_deg` of earlier matches.
+        positions : list[tuple[int, int]] | np.ndarray | None
+            Scan positions to match: a list of (row, col), or an (R, C)
+            boolean mask. None (default) matches the whole scan. Pass a
+            handful of positions to check the plan and these parameters
+            with `plot_pattern_matches` before committing to the full
+            scan; the positions carrying a result are recorded in
+            `computed`, which the refinements and the phase fit follow.
         include_mirror : bool, default=True
             Also correlate against the in-plane mirrored pattern, testing
             inversion-related (opposite hemisphere) zone axes at no library
@@ -634,6 +768,7 @@ class OrientationMap(AutoSerialize):
         min_number_peaks = resolve(min_number_peaks, "min_number_peaks", default=MIN_NUMBER_PEAKS)
         self.metadata["match"] = dict(
             num_matches=int(num_matches),
+            positions=None if positions is None else "subset",
             include_mirror=bool(include_mirror),
             min_number_peaks=int(min_number_peaks),
             min_angle_between_matches_deg=float(min_angle_between_matches_deg),
@@ -670,11 +805,21 @@ class OrientationMap(AutoSerialize):
         )  # (Z, Z)
 
         plan_fft = self.plan_fft  # (Z, S, G) complex
+        wanted = position_mask(positions, (R, C))
         valid_rc = [
             (rx, ry)
             for rx, ry in np.ndindex(R, C)
-            if peaks[rx, ry].array.shape[0] >= min_number_peaks
+            if wanted[rx, ry] and peaks[rx, ry].array.shape[0] >= min_number_peaks
         ]
+        if not valid_rc:
+            raise RuntimeError(
+                "no requested scan position has at least min_number_peaks = %d detected peaks"
+                % min_number_peaks
+            )
+        computed = torch.zeros((R, C), dtype=torch.bool)
+        for rx, ry in valid_rc:
+            computed[rx, ry] = True
+        self.computed = computed
         batches = [valid_rc[i : i + batch_size] for i in range(0, len(valid_rc), batch_size)]
         if progress_bar:
             batches = tqdm(batches, desc=f"matching {self.crystal.name}")
@@ -825,6 +970,7 @@ class OrientationMap(AutoSerialize):
     def refine_orientations(
         self,
         num_iterations: int = 5,
+        positions=None,
         pair_distance: float | None = None,
         sigma_excitation: float | None = None,
         min_pairs: int | None = None,
@@ -861,6 +1007,11 @@ class OrientationMap(AutoSerialize):
         ----------
         num_iterations : int, default=5
             Pairing + rotation solve rounds.
+        positions : list[tuple[int, int]] | np.ndarray | None
+            Scan positions to refine, as for `match_orientations`. None
+            (default) refines every position that carries a match, so a
+            staged test run on a few positions is refined without repeating
+            the position list.
         pair_distance : float | None
             Maximum pairing distance (1/Angstroms); defaults to the plan's
             corr_kernel_size.
@@ -913,6 +1064,7 @@ class OrientationMap(AutoSerialize):
         min_pairs = resolve(min_pairs, "min_pairs", default=MIN_PAIRS)
         self.metadata["refine"] = dict(
             num_iterations=int(num_iterations),
+            positions=None if positions is None else "subset",
             pair_distance=float(delta),
             sigma_excitation=float(sigma),
             min_pairs=int(min_pairs),
@@ -1094,9 +1246,14 @@ class OrientationMap(AutoSerialize):
             return q_exp, w_exp
 
         scores = torch.zeros((R, C), dtype=torch.float64)
+        # positions to refine: those requested, or everything matched
+        active = position_mask(positions, (R, C))
+        if self.computed is not None:
+            active = active & self.computed
         if batched and not refine_tilt:
             self._refine_batched(
                 scores,
+                active=active,
                 delta=delta,
                 sigma=sigma,
                 sigma_env=sigma_env,
@@ -1109,7 +1266,7 @@ class OrientationMap(AutoSerialize):
                 progress_bar=progress_bar,
             )
         else:
-            iterator = list(np.ndindex(R, C))
+            iterator = [(rx, ry) for rx, ry in np.ndindex(R, C) if active[rx, ry]]
             if progress_bar:
                 iterator = tqdm(iterator, desc="refining orientations")
             for rx, ry in iterator:
@@ -1138,7 +1295,7 @@ class OrientationMap(AutoSerialize):
                 ).reshape(R - dr, C - dc)
                 miso_min[: R - dr, : C - dc] = torch.minimum(miso_min[: R - dr, : C - dc], mm)
                 miso_min[dr:, dc:] = torch.minimum(miso_min[dr:, dc:], mm)
-            retry = torch.nonzero(miso_min > rescue_threshold_deg)
+            retry = torch.nonzero((miso_min > rescue_threshold_deg) & active)
             it2 = retry.tolist()
             if progress_bar and len(it2):
                 it2 = tqdm(it2, desc="neighbor rescue")
@@ -1155,6 +1312,8 @@ class OrientationMap(AutoSerialize):
                         nr, nc = rx + dr, ry + dc
                         if (dr == 0 and dc == 0) or not (0 <= nr < R and 0 <= nc < C):
                             continue
+                        if self.corr[nr, nc, 0] <= 0:
+                            continue  # neighbour carries no match (never run, or skipped)
                         qn = self.quats[nr, nc, 0]
                         if all(
                             float(misorientation_angle_deg(qn, c, self.crystal.sym_quats)) > 0.5
@@ -1178,6 +1337,7 @@ class OrientationMap(AutoSerialize):
     def _refine_batched(
         self,
         scores: torch.Tensor,
+        active: torch.Tensor,
         delta: float,
         sigma: float,
         sigma_env: float,
@@ -1190,7 +1350,7 @@ class OrientationMap(AutoSerialize):
         chunk: int = 64,
         power_env: float = POWER_INTENSITY,
     ) -> None:
-        """Chunk-vectorized in-plane + envelope refinement (all positions)."""
+        """Chunk-vectorized in-plane + envelope refinement of the active positions."""
         from quantem.diffraction.rotations import quat_to_matrix
 
         peaks = self.peaks
@@ -1243,9 +1403,9 @@ class OrientationMap(AutoSerialize):
 
         quats = self.quats.reshape(N, M, 4)
         corr = self.corr.reshape(N, M)
-        valid_pos = torch.as_tensor(counts >= min_pairs)
+        valid_pos = torch.as_tensor(counts >= min_pairs) & active.reshape(N)
 
-        chunks = range(0, N, chunk)
+        chunks = [i for i in range(0, N, chunk) if bool(valid_pos[i : i + chunk].any())]
         if progress_bar:
             chunks = tqdm(chunks, desc="refining orientations (batched)")
         for i0 in chunks:
@@ -1665,13 +1825,24 @@ class OrientationMap(AutoSerialize):
         sm.num_pairs = num_pairs
         return sm
 
-    def in_plane_angle_deg(self, match: int = 0, mod_deg: float | None = None) -> torch.Tensor:
+    def in_plane_angle_deg(
+        self, match: int = 0, mod_deg: float | str | None = "auto"
+    ) -> torch.Tensor:
         """In-plane angle of the crystal a-axis at every position (degrees).
 
         The angle of the projected crystal [100] Cartesian axis, measured
-        from the scan column axis toward the row axis. `mod_deg` wraps the
-        angle by the crystal's in-plane symmetry (60 for hexagonal basal, 90
-        for cubic <100> zones); None returns the full range.
+        from the scan column axis toward the row axis.
+
+        `mod_deg` wraps the angle, which is what makes the map continuous
+        where the in-plane orientation is not uniquely indexable. The default
+        "auto" wraps each position by 360 / n with n the apparent rotational
+        symmetry of its own zero-layer pattern
+        (`Crystal.projected_rotation_order`), so the map folds by exactly the
+        ambiguity the data carry and no more. For a body-centered cubic
+        crystal near <111> that is 60 degrees, where the crystal itself
+        repeats only every 120, and folding removes the 60 degree jumps
+        between two variants no zero-layer pattern can separate. A float
+        wraps everywhere by that value, and None returns the full range.
         """
         from quantem.diffraction.rotations import quat_to_matrix
 
@@ -1679,21 +1850,41 @@ class OrientationMap(AutoSerialize):
         R = quat_to_matrix(self.quats[..., match, :])
         a_lab = R[..., :, 0]  # crystal x-axis in the lab frame
         ang = torch.rad2deg(torch.atan2(a_lab[..., 0], a_lab[..., 1]))
+        if isinstance(mod_deg, str):
+            if mod_deg != "auto":
+                raise ValueError('mod_deg must be a number, None, or "auto"')
+            # beam direction in crystal coordinates, deduplicated on a coarse
+            # grid: the projected order is piecewise constant in the zone axis
+            zone_c = R[..., 2, :]
+            key = torch.round(zone_c.reshape(-1, 3) * 200) / 200
+            uniq, inv = torch.unique(key, dim=0, return_inverse=True)
+            order = self.crystal.projected_rotation_order(uniq.numpy())
+            n = torch.as_tensor(np.asarray(order), dtype=torch.float64)[inv]
+            return ang % (360.0 / n.reshape(ang.shape))
         if mod_deg is not None:
             ang = ang % mod_deg
         return ang
+
+    def _default_mask(self, kwargs: dict) -> dict:
+        """After a staged run on a subset of positions, plot only those."""
+        if kwargs.get("mask") is None and self.computed is not None:
+            if not bool(self.computed.all()):
+                kwargs["mask"] = self.computed.numpy().astype(float)
+        return kwargs
 
     def plot_orientation(self, direction: str = "z", match: int = 0, **kwargs):
         """IPF-colored orientation map; see orientation_visualization."""
         from quantem.diffraction.orientation_visualization import plot_orientation_map
 
-        return plot_orientation_map(self, direction=direction, match=match, **kwargs)
+        return plot_orientation_map(
+            self, direction=direction, match=match, **self._default_mask(kwargs)
+        )
 
     def plot_pole_figure(self, pole=(0, 0, 1), match: int = 0, **kwargs):
         """Stereographic pole figure; see orientation_visualization."""
         from quantem.diffraction.orientation_visualization import plot_pole_figure
 
-        return plot_pole_figure(self, pole=pole, match=match, **kwargs)
+        return plot_pole_figure(self, pole=pole, match=match, **self._default_mask(kwargs))
 
     def misorientation_map(self, reference: torch.Tensor | None = None) -> torch.Tensor:
         """Misorientation angle (deg) of match 0 to a reference orientation."""

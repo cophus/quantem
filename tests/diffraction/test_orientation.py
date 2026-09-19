@@ -323,3 +323,162 @@ def test_roundtrip_with_precession():
     assert np.median(err) < 0.3
     assert (err < 1.5).mean() >= 0.75
     assert om.metadata["precession_deg"] == 0.7
+
+
+def test_staged_positions_subset():
+    """Matching a few positions leaves the rest untouched, and the later
+    stages follow the subset without repeating it."""
+    torch.manual_seed(5)
+    xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True))
+    xtl.calculate_structure_factors(k_max=1.5)
+    N = 6
+    q_true = qnormalize(torch.randn(N, 4, dtype=torch.float64))
+    peaks = _make_peaks(xtl, q_true)
+
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om.build_plan(angle_step_zone_axis_deg=2.0, angle_step_in_plane_deg=2.0, power_intensity=0.0)
+
+    test_pos = [(0, 1), (0, 4)]
+    om.match_orientations(positions=test_pos, progress_bar=False)
+    assert om.computed.sum() == len(test_pos)
+    assert bool(om.computed[0, 1]) and bool(om.computed[0, 4])
+    assert float(om.corr[0, 0, 0]) == 0.0  # not requested, untouched
+    assert float(om.corr[0, 1, 0]) > 0.5
+
+    # refinement follows `computed` with no position list of its own
+    before = om.quats.clone()
+    om.refine_orientations(progress_bar=False, zone_max_total_deg=1.5)
+    untouched = torch.allclose(before[0, 0], om.quats[0, 0])
+    assert untouched
+    err = misorientation_angle_deg(q_true[[1, 4]], om.quats[0, [1, 4], 0], xtl.sym_quats).numpy()
+    assert np.all(err < 1.0)
+
+    # the full run then covers everything
+    om.match_orientations(progress_bar=False)
+    assert bool(om.computed.all())
+    assert float(om.corr[0, 0, 0]) > 0.5
+
+
+def test_fiber_zone_axis_range():
+    """A fiber plan of zero half angle samples one zone axis and still
+    recovers the in-plane angle exactly."""
+    torch.manual_seed(7)
+    xtl = Crystal.from_ase(bulk("Ti", "hcp", a=2.9505, c=4.6855))
+    xtl.calculate_structure_factors(k_max=1.5)
+    N = 6
+    gam = torch.rand(N, dtype=torch.float64) * 2 * np.pi
+    q_true = qnormalize(
+        torch.stack(
+            [torch.cos(gam / 2), torch.zeros(N), torch.zeros(N), torch.sin(gam / 2)], dim=1
+        )
+    )
+    peaks = _make_peaks(xtl, q_true)
+
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om.build_plan(
+        zone_axis_range="fiber",
+        fiber_axis=[0, 0, 0, 1],  # Miller-Bravais [0001]
+        fiber_angle_deg=0.0,
+        angle_step_in_plane_deg=2.0,
+        power_intensity=0.0,
+        verbose=False,
+    )
+    assert om.zone_axes.shape[0] == 1
+    om.match_orientations(progress_bar=False)
+    om.refine_orientations(progress_bar=False, zone_max_total_deg=0.5)
+    err = misorientation_angle_deg(q_true, om.quats[0, :, 0], xtl.sym_quats).numpy()
+    assert np.all(err < 0.2)
+
+    # a cap of a few degrees covers a spread of tilts, and the hemisphere
+    # fallback and the symmetry wedge both stay available
+    om2 = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om2.build_plan(
+        zone_axis_range="fiber", fiber_axis=[0, 0, 1], fiber_angle_deg=5.0, verbose=False
+    )
+    assert om2.zone_axes.shape[0] > 1
+    om3 = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om3.build_plan(zone_axis_range="full", angle_step_zone_axis_deg=4.0, verbose=False)
+    om4 = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om4.build_plan(angle_step_zone_axis_deg=4.0, verbose=False)
+    assert om3.zone_axes.shape[0] > om4.zone_axes.shape[0]
+
+
+def test_power_intensity_experiment_is_separate():
+    """The measured-intensity exponent defaults to the library one and can
+    be set independently."""
+    torch.manual_seed(11)
+    xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True))
+    xtl.calculate_structure_factors(k_max=1.5)
+    q_true = qnormalize(torch.randn(3, 4, dtype=torch.float64))
+    peaks = _make_peaks(xtl, q_true)
+
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om.build_plan(angle_step_zone_axis_deg=3.0, power_intensity=0.25, verbose=False)
+    assert om.power_intensity_experiment == 0.25
+
+    om2 = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om2.build_plan(
+        angle_step_zone_axis_deg=3.0,
+        power_intensity=0.25,
+        power_intensity_experiment=0.0,
+        verbose=False,
+    )
+    assert om2.power_intensity_experiment == 0.0
+    assert om2.metadata["plan"]["power_intensity_experiment"] == 0.0
+    om2.match_orientations(progress_bar=False)
+    assert float(om2.corr[0, 0, 0]) > 0.3
+
+
+def test_in_plane_angle_auto_fold():
+    """The automatic fold removes the in-plane ambiguity of a <111> zone.
+
+    Two orientations 60 degrees apart about a body-centered cubic <111> beam
+    give the same zero-layer pattern, so matching returns one or the other at
+    random. Folding by the projected order makes the reported angle the same
+    for both, which is what keeps an in-plane map continuous.
+    """
+    from quantem.diffraction.rotations import (
+        qmult,
+        quat_from_axis_angle,
+        quat_from_zone_axis,
+    )
+
+    torch.manual_seed(2)
+    xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.26, cubic=True))
+    xtl.calculate_structure_factors(k_max=1.5)
+    d = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float64) @ xtl.lat_real
+    q0 = quat_from_zone_axis(d / torch.linalg.norm(d))
+    beam = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
+
+    # N in-plane angles, each also present as its 60 degree twin
+    N = 5
+    spin = torch.linspace(0.0, 1.0, N, dtype=torch.float64)
+    q_a = qnormalize(qmult(quat_from_axis_angle(beam, spin), q0))
+    q_b = qnormalize(qmult(quat_from_axis_angle(beam, torch.tensor(np.deg2rad(60.0))), q_a))
+    q_true = torch.stack([q_a, q_b], dim=0)  # (2, N, 4)
+
+    peaks = Vector.from_shape(
+        (2, N), fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t"
+    )
+    for i in range(2):
+        for j in range(N):
+            p = xtl.generate_pattern(q_true[i, j], energy_ev=200e3, sigma_excitation=0.02)
+            peaks[i, j] = np.stack(
+                [p["qx"].numpy(), p["qy"].numpy(), p["intensity"].numpy()], axis=1
+            )
+
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om.build_plan(angle_step_zone_axis_deg=2.0, angle_step_in_plane_deg=2.0, power_intensity=0.0)
+    om.match_orientations(progress_bar=False)
+    om.refine_orientations(progress_bar=False, zone_max_total_deg=1.5)
+
+    assert xtl.projected_rotation_order((d / torch.linalg.norm(d)).numpy()) == 6
+    folded = om.in_plane_angle_deg(mod_deg="auto").numpy()
+    assert folded.max() <= 60.0 + 1e-6
+    # the twin rows must agree once folded, to well under the library step
+    delta = np.abs(folded[0] - folded[1]) % 60.0
+    delta = np.minimum(delta, 60.0 - delta)
+    assert np.all(delta < 1.0), delta
+    # explicit values and None still behave as before
+    assert om.in_plane_angle_deg(mod_deg=90.0).max() <= 90.0
+    assert om.in_plane_angle_deg(mod_deg=None).max() > 60.0
