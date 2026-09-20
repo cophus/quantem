@@ -350,6 +350,28 @@ def _closest(cands: torch.Tensor, prefer: torch.Tensor) -> torch.Tensor:
     return signed[int(torch.argmax(key))]
 
 
+def symmetry_aligned(
+    reference: torch.Tensor,
+    quats: torch.Tensor,
+    sym_quats: torch.Tensor,
+) -> torch.Tensor:
+    """Symmetry images of `quats` that lie nearest to `reference`, (N, 4).
+
+    Two quaternions can describe the same crystal orientation while being far
+    apart as quaternions, so any average over orientations has to bring them
+    into a common symmetry branch first. For each input this returns the
+    symmetry-equivalent quaternion whose misorientation to the reference is
+    smallest, which makes a weighted quaternion mean well defined.
+    """
+    ref = torch.as_tensor(reference, dtype=torch.float64).reshape(4)
+    q = torch.as_tensor(quats, dtype=torch.float64).reshape(-1, 4)
+    sym = torch.as_tensor(sym_quats, dtype=torch.float64).reshape(-1, 4)
+    cand = qmult(q[:, None, :], sym[None, :, :])  # (N, S, 4)
+    dots = torch.abs(torch.einsum("nsi,i->ns", cand, ref))
+    best = dots.argmax(dim=1)
+    return qnormalize(cand[torch.arange(q.shape[0]), best])
+
+
 def sample_zone_axis_cap(
     axis: torch.Tensor,
     half_angle_deg: float,

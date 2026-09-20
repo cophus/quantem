@@ -449,6 +449,8 @@ class Crystal:
         k_max: float | None = None,
         tol_zone: float = 0.02,
         intensity_tol: float = 0.05,
+        snap_deg: float = 4.0,
+        max_index: int = 3,
     ):
         """Apparent rotational symmetry of the zero-layer pattern, per zone axis.
 
@@ -482,6 +484,17 @@ class Crystal:
         intensity_tol : float, default=0.05
             A reflection and its image must agree in |F|^2 to within this
             fraction of the strongest zero-layer reflection.
+        snap_deg : float, default=4.0
+            Zone axes within this angle of a low-index lattice direction are
+            evaluated at that direction. The extra symmetry is exact only on
+            the pole and decays away from it, but a beam a degree or two off
+            still produces a pattern whose positions carry it, which is
+            where a measured orientation normally sits; testing the exact
+            tilted axis would report no symmetry at all and miss the
+            ambiguity the indexing actually suffers. Set to 0 to test the
+            axis as given.
+        max_index : int, default=3
+            Largest |u|, |v|, |w| considered when snapping.
 
         Returns
         -------
@@ -500,6 +513,21 @@ class Crystal:
         if k_max is not None:
             sel = self.g_len <= float(k_max)
             g, inten = g[sel], inten[sel]
+
+        if snap_deg > 0:
+            rng = torch.arange(-max_index, max_index + 1, dtype=torch.float64)
+            uvw = torch.cartesian_prod(rng, rng, rng)
+            uvw = uvw[uvw.abs().sum(dim=1) > 0]
+            cart = uvw @ self.lat_real
+            cart = cart / torch.linalg.norm(cart, dim=1, keepdim=True).clamp_min(1e-12)
+            dots = torch.abs(axes @ cart.T)
+            best = dots.max(dim=1)
+            near = best.values > np.cos(np.deg2rad(snap_deg))
+            snapped = cart[best.indices]
+            # keep the original sense so the returned axis still points along
+            # the beam, and only replace the ones close enough to snap
+            sign = torch.sign(torch.einsum("ni,ni->n", snapped, axes)).unsqueeze(1)
+            axes = torch.where(near.unsqueeze(1), snapped * sign, axes)
 
         out = np.ones(axes.shape[0], dtype=int)
         eye = torch.eye(3, dtype=torch.float64)

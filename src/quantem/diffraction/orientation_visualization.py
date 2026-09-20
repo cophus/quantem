@@ -145,6 +145,69 @@ def ipf_color(
     return _bary_to_rgb(w.numpy())
 
 
+def fold_in_plane(quats: torch.Tensor, crystal: Crystal, strict: bool = False) -> torch.Tensor:
+    """Fold the in-plane angle of each orientation by its projected symmetry.
+
+    The zero-layer pattern of a zone axis can repeat more often under
+    rotation about the beam than the crystal does, and where it does, two
+    orientations produce the same measured pattern and the match returns one
+    of them arbitrarily. Rotating each orientation about the beam into the
+    first such sector makes those two identical, so any map colored from the
+    result is continuous across the ambiguity.
+
+    Positions whose pattern is no more symmetric than the crystal itself are
+    returned unchanged, unless `strict`, which folds by the projected order
+    everywhere.
+    """
+    from quantem.diffraction.rotations import (
+        qmult,
+        qnormalize,
+        quat_from_axis_angle,
+        quat_to_matrix,
+    )
+
+    q = torch.as_tensor(quats, dtype=torch.float64)
+    shape = q.shape[:-1]
+    flat = q.reshape(-1, 4)
+    R = quat_to_matrix(flat)
+    zone = R[:, 2, :]  # beam direction in crystal coordinates
+    # the projected order is piecewise constant in the zone axis: evaluate it
+    # once per distinct axis on a coarse grid
+    key = torch.round(zone * 200) / 200
+    uniq, inv = torch.unique(key, dim=0, return_inverse=True)
+    n_proj = torch.as_tensor(
+        np.asarray(crystal.projected_rotation_order(uniq.numpy())), dtype=torch.float64
+    )[inv]
+    if not strict:
+        # only fold where the pattern is more symmetric than the crystal is
+        # about that same axis, which is where the indexing is degenerate
+        n_cryst = _crystal_rotation_order(uniq, crystal)[inv].to(torch.float64)
+        n_proj = torch.where(n_proj > n_cryst, n_proj, torch.ones_like(n_proj))
+    if bool((n_proj <= 1).all()):
+        return q
+    a_lab = R[:, :, 0]
+    ang = torch.rad2deg(torch.atan2(a_lab[:, 0], a_lab[:, 1]))
+    sector = 360.0 / n_proj
+    delta = ang - (ang % sector)
+    # the in-plane angle is measured from the column axis toward the row
+    # axis, which runs opposite to a right-handed rotation about the beam
+    beam = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
+    dq = quat_from_axis_angle(beam, torch.deg2rad(delta))
+    return qnormalize(qmult(dq, flat)).reshape(*shape, 4)
+
+
+def _crystal_rotation_order(axes: torch.Tensor, crystal: Crystal) -> torch.Tensor:
+    """Order of the crystal's own rotation axis along each direction, (N,)."""
+    from quantem.diffraction.rotations import quat_to_matrix
+
+    Rs = quat_to_matrix(crystal.sym_quats)  # (S, 3, 3)
+    u = axes / torch.linalg.norm(axes, dim=1, keepdim=True).clamp_min(1e-12)
+    # an operation is a rotation about u when it leaves u fixed
+    fixed = torch.einsum("sij,nj->nsi", Rs, u)
+    keeps = (fixed - u[:, None, :]).norm(dim=-1) < 1e-6
+    return keeps.sum(dim=1)
+
+
 def wedge_legend(
     crystal: Crystal,
     ax,
@@ -231,6 +294,8 @@ def plot_orientation_map(
     axsize: tuple[float, float] = (9.0, 4.5),
     crop: tuple[int, int, int, int] | None = None,
     title: str | None = None,
+    fold: bool | str = "auto",
+    smooth: dict | bool | None = None,
 ):
     """IPF-colored orientation map with the wedge legend in an adjacent panel.
 
@@ -244,6 +309,26 @@ def plot_orientation_map(
         Which match index to plot.
     mask : np.ndarray | None
         Multiplied into the RGB image (e.g. a phase or reliability mask).
+    fold : bool | "auto", default="auto"
+        Fold the in-plane part of each orientation by the apparent
+        rotational symmetry of its own zero-layer pattern
+        (`Crystal.projected_rotation_order`) before coloring. Where that
+        symmetry exceeds the crystal's own, as for a cubic crystal near
+        <111>, two orientations give the same pattern and the match picks
+        between them at random; folding gives them the same color, which
+        removes jumps that no refinement can. It changes nothing for
+        direction="z", whose color depends only on the zone axis, and
+        nothing where the pattern is no more symmetric than the crystal.
+        "auto" folds only when some position needs it.
+    smooth : dict | bool | None
+        Smooth the orientations for display only, leaving the stored ones at
+        the fit to their own pattern. The average is bilateral and needs two
+        widths, not one: `sigma_px` over probe positions and `sigma_deg` over
+        misorientation, with `max_angle_deg` excluding anything further. The
+        angular pair is what stops the average at a grain boundary, so pass
+        a dict naming the values you want, such as
+        {"sigma_px": 1.0, "sigma_deg": 1.0, "max_angle_deg": 5.0}, which is
+        also what True uses.
     scalebar : dict | None
         Real-space scale bar, e.g. {"sampling": 30, "units": "A"}.
     figax : (fig, (ax_map, ax_legend)) | (fig, ax_map) | None
@@ -256,7 +341,18 @@ def plot_orientation_map(
     import matplotlib.pyplot as plt
 
     assert om.quats is not None
-    rgb = ipf_color(om.quats[..., match, :], om.crystal, direction)
+    quats = om.quats[..., match, :]
+    if smooth is not None and smooth is not False:
+        if not isinstance(smooth, (dict, bool)):
+            raise TypeError(
+                "smooth must be a dict of widths or True; a bare number would set the "
+                "spatial width and leave the angular tolerance at its default, which "
+                "is the argument that keeps the average inside one grain"
+            )
+        quats = om.smoothed_quats(match=match, **(smooth if isinstance(smooth, dict) else {}))
+    if fold:
+        quats = fold_in_plane(quats, om.crystal, strict=fold != "auto")
+    rgb = ipf_color(quats, om.crystal, direction)
     if mask is not None:
         rgb = rgb * np.asarray(mask, dtype=float)[..., None]
     if crop is not None:

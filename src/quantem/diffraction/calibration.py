@@ -204,8 +204,12 @@ def peaks_to_calibrated(
         units=["A^-1", "A^-1", "counts"],
         name=name,
     )
+    # carry the scan calibration through, so maps keep their scale bar, and
     # record the detector-to-scan rotation so pattern-overlay plots can put
     # peaks back into the raw detector frame
+    for key in ("scan_sampling", "scan_units"):
+        if key in (peaks_px.metadata or {}):
+            out.metadata[key] = peaks_px.metadata[key]
     out.metadata["rotation_ccw_deg"] = float(rotation_ccw_deg)
     return out
 

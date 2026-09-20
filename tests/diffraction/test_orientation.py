@@ -482,3 +482,129 @@ def test_in_plane_angle_auto_fold():
     # explicit values and None still behave as before
     assert om.in_plane_angle_deg(mod_deg=90.0).max() <= 90.0
     assert om.in_plane_angle_deg(mod_deg=None).max() > 60.0
+
+
+def test_fold_in_plane_collapses_degenerate_variants():
+    """Two orientations with the same zero-layer pattern get the same color."""
+    from quantem.diffraction.orientation_visualization import fold_in_plane, ipf_color
+    from quantem.diffraction.rotations import (
+        qmult,
+        quat_from_axis_angle,
+        quat_from_zone_axis,
+    )
+
+    xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.26, cubic=True), verbose=False)
+    xtl.calculate_structure_factors(k_max=1.5)
+    d = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float64) @ xtl.lat_real
+    q0 = quat_from_zone_axis(d / torch.linalg.norm(d))
+    beam = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
+    tilt_axis = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64)
+
+    torch.manual_seed(4)
+    for tilt in (0.0, 1.8, 3.0):
+        base = qnormalize(
+            qmult(quat_from_axis_angle(tilt_axis, torch.tensor(np.deg2rad(tilt))), q0)
+        )
+        spin = torch.rand(8, dtype=torch.float64) * 2 * np.pi
+        q_a = qnormalize(qmult(quat_from_axis_angle(beam, spin), base))
+        q_b = qnormalize(qmult(quat_from_axis_angle(beam, torch.tensor(np.deg2rad(60.0))), q_a))
+        folded_a = fold_in_plane(q_a, xtl)
+        folded_b = fold_in_plane(q_b, xtl)
+        assert torch.allclose(torch.abs(folded_a), torch.abs(folded_b), atol=1e-8)
+        c_a = ipf_color(folded_a, xtl, "r")
+        c_b = ipf_color(folded_b, xtl, "r")
+        assert np.abs(c_a - c_b).max() < 1e-6, tilt
+        # the out-of-plane color never depended on the in-plane angle
+        assert np.abs(ipf_color(q_a, xtl, "z") - ipf_color(q_b, xtl, "z")).max() < 1e-6
+
+    # far from the pole the ambiguity is gone and nothing is folded
+    far = qnormalize(qmult(quat_from_axis_angle(tilt_axis, torch.tensor(np.deg2rad(20.0))), q0))
+    assert torch.allclose(fold_in_plane(far[None], xtl)[0], far, atol=1e-12)
+
+
+def test_smooth_orientations():
+    """Bilateral smoothing averages noise inside a grain, not across variants."""
+    from quantem.diffraction.rotations import qmult, quat_from_axis_angle
+
+    torch.manual_seed(6)
+    xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True))
+    xtl.calculate_structure_factors(k_max=1.5)
+
+    # a 6 x 6 patch of one orientation with half a degree of scatter, plus a
+    # second grain 30 degrees away filling the right-hand columns
+    R, C = 6, 6
+    base = qnormalize(torch.randn(4, dtype=torch.float64))
+    axis = torch.randn(R, C, 3, dtype=torch.float64)
+    axis = axis / axis.norm(dim=-1, keepdim=True)
+    noise = quat_from_axis_angle(axis.reshape(-1, 3), torch.deg2rad(0.5 * torch.randn(R * C)))
+    q = qnormalize(qmult(noise, base)).reshape(R, C, 4)
+    other = qnormalize(
+        qmult(
+            quat_from_axis_angle(torch.tensor([0.0, 0.0, 1.0]), torch.tensor(np.deg2rad(30.0))),
+            base,
+        )
+    )
+    q[:, 4:] = other
+
+    peaks = Vector.from_shape(
+        (R, C), fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t"
+    )
+    for i in range(R):
+        for j in range(C):
+            p = xtl.generate_pattern(q[i, j], energy_ev=200e3, sigma_excitation=0.02)
+            peaks[i, j] = np.stack(
+                [p["qx"].numpy(), p["qy"].numpy(), p["intensity"].numpy()], axis=1
+            )
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om.build_plan(angle_step_zone_axis_deg=3.0, verbose=False)
+    om.quats = q.clone()[..., None, :]
+    om.corr = torch.ones((R, C, 1), dtype=torch.float64)
+    om.computed = torch.ones((R, C), dtype=torch.bool)
+
+    before = misorientation_angle_deg(base, om.quats[:, :4, 0].reshape(-1, 4), xtl.sym_quats)
+    om.smooth_orientations(sigma_px=1.0, sigma_deg=1.0, max_angle_deg=5.0)
+    after = misorientation_angle_deg(base, om.quats[:, :4, 0].reshape(-1, 4), xtl.sym_quats)
+    assert float(after.mean()) < float(before.mean()), (float(before.mean()), float(after.mean()))
+
+    # the second grain is 30 degrees away, beyond max_angle_deg, so it is
+    # neither pulled toward the first nor allowed to pull on it
+    kept = misorientation_angle_deg(other, om.quats[:, 5, 0], xtl.sym_quats)
+    assert float(kept.max()) < 1e-6
+
+
+def test_display_smoothing_needs_both_widths():
+    """A bare number is refused: the angular tolerance must not default silently."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    torch.manual_seed(8)
+    xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True))
+    xtl.calculate_structure_factors(k_max=1.5)
+    R, C = 4, 4
+    q = qnormalize(torch.randn(4, dtype=torch.float64)).expand(R, C, 4).clone()
+    peaks = Vector.from_shape(
+        (R, C), fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t"
+    )
+    for i in range(R):
+        for j in range(C):
+            p = xtl.generate_pattern(q[i, j], energy_ev=200e3, sigma_excitation=0.02)
+            peaks[i, j] = np.stack(
+                [p["qx"].numpy(), p["qy"].numpy(), p["intensity"].numpy()], axis=1
+            )
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om.build_plan(angle_step_zone_axis_deg=4.0, verbose=False)
+    om.quats = q.clone()[..., None, :]
+    om.corr = torch.ones((R, C, 1), dtype=torch.float64)
+    om.computed = torch.ones((R, C), dtype=torch.bool)
+
+    with pytest.raises(TypeError, match="angular tolerance"):
+        om.plot_orientation(smooth=1.0)
+
+    before = om.quats.clone()
+    om.plot_orientation(smooth={"sigma_px": 1.0, "sigma_deg": 1.0, "max_angle_deg": 5.0})
+    om.plot_orientation(smooth=True)
+    plt.close("all")
+    # smoothing for display must never touch the stored orientations
+    assert torch.equal(before, om.quats)

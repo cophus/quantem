@@ -510,6 +510,7 @@ class BraggVectors(AutoSerialize):
         # detection. from_data stacks all cells with one _replace_cells call.
         nested = [results[r * scan_c : (r + 1) * scan_c] for r in range(scan_r)]
         peaks = Vector.from_data(nested, fields=PEAK_FIELDS, name="bragg_peaks")
+        peaks.metadata.update(self._scan_calibration())
 
         self.peaks = peaks
         self.metadata["detect"] = detect_kwargs
@@ -1362,6 +1363,20 @@ class BraggVectors(AutoSerialize):
             return fig, ax
 
     # ---- helpers ----
+
+    def _scan_calibration(self) -> dict:
+        """Scan step and units of the dataset, to travel with the peaks.
+
+        Everything downstream draws its real-space scale bar from this, so
+        the step size is set once on the dataset rather than passed to every
+        plot. A dataset still in pixels records nothing.
+        """
+        sampling = np.atleast_1d(np.asarray(self.dataset.sampling, dtype=float))[:2]
+        units = list(self.dataset.units)[:2]
+        unit = str(units[0]).strip("b'\"") if units else ""
+        if unit.lower() in ("pixels", "px", "pixel", ""):
+            return {}
+        return {"scan_sampling": tuple(float(v) for v in sampling), "scan_units": unit}
 
     def _resolve_background_sigma(self, background_sigma: float | str | None) -> float | None:
         """Resolve the ``background_sigma`` argument to a value in pixels.

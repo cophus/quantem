@@ -49,6 +49,7 @@ from quantem.diffraction.rotations import (
     quat_from_axis_angle,
     quat_from_zone_axis,
     sample_zone_axes,
+    symmetry_aligned,
     symmetry_reduced_zone_angles,
 )
 
@@ -78,6 +79,75 @@ def position_mask(positions, shape: tuple[int, int]) -> torch.Tensor:
             raise ValueError(f"position ({r}, {c}) is outside the scan {(R, C)}")
         mask[r, c] = True
     return mask
+
+
+def scan_scalebar(metadata: dict) -> dict | None:
+    """Scale bar arguments from the scan calibration recorded on the peaks.
+
+    Returns {"sampling": step, "units": units} when the scan was calibrated,
+    or None when it is still in pixels, which is the signal that a plot
+    should draw no scale bar.
+    """
+    step = (metadata or {}).get("scan_sampling")
+    units = (metadata or {}).get("scan_units")
+    if step is None or units is None:
+        return None
+    step = float(np.mean(np.atleast_1d(np.asarray(step, dtype=float))))
+    units = str(units)
+    if not np.isfinite(step) or step <= 0 or units.lower() in ("pixels", "px", "pixel"):
+        return None
+    return {"sampling": step, "units": units}
+
+
+def smooth_quaternions(
+    quats: torch.Tensor,
+    active: torch.Tensor,
+    sym_quats: torch.Tensor,
+    sigma_px: float = 1.0,
+    sigma_deg: float = 1.0,
+    max_angle_deg: float = 5.0,
+) -> torch.Tensor:
+    """Bilateral average of an orientation field, (R, C, 4).
+
+    Each position is replaced by the weighted mean of the orientations around
+    it, with weight exp(-r^2 / 2 sigma_px^2) * exp(-theta^2 / 2 sigma_deg^2)
+    for a neighbour r probe positions away and theta degrees misoriented, and
+    with neighbours beyond `max_angle_deg` dropped. The angular term is what
+    keeps a grain boundary or a second variant out of the average.
+
+    This is an average, not a fit: it moves each orientation away from the one
+    that best explains its own pattern. Use it to display a map, not to
+    produce the orientations a later step will measure from.
+    """
+    q = torch.as_tensor(quats, dtype=torch.float64)
+    R, C = q.shape[:2]
+    active = torch.as_tensor(active, dtype=torch.bool)
+    rad = max(1, int(np.ceil(3 * sigma_px)))
+    out = q.clone()
+    w_ang = 2.0 * sigma_deg**2
+    for rx in range(R):
+        for ry in range(C):
+            if not bool(active[rx, ry]):
+                continue
+            r0, r1 = max(0, rx - rad), min(R, rx + rad + 1)
+            c0, c1 = max(0, ry - rad), min(C, ry + rad + 1)
+            sel = active[r0:r1, c0:c1]
+            if int(sel.sum()) < 2:
+                continue
+            rr, cc = torch.nonzero(sel, as_tuple=True)
+            qn = q[r0:r1, c0:c1][sel]
+            d2 = ((rr + r0 - rx) ** 2 + (cc + c0 - ry) ** 2).to(torch.float64)
+            ang = misorientation_angle_deg(q[rx, ry], qn, sym_quats)
+            keep = ang <= max_angle_deg
+            if int(keep.sum()) < 2:
+                continue
+            w = torch.exp(-d2[keep] / (2 * sigma_px**2)) * torch.exp(-(ang[keep] ** 2) / w_ang)
+            qk = symmetry_aligned(q[rx, ry], qn[keep], sym_quats)
+            qk = qk * torch.sign((qk @ q[rx, ry]).unsqueeze(-1))
+            M = (w[:, None, None] * (qk[:, :, None] * qk[:, None, :])).sum(0)
+            _, evecs = torch.linalg.eigh(M)
+            out[rx, ry] = qnormalize(evecs[:, -1])
+    return out
 
 
 def fibonacci_hemisphere(n_points: int, dtype=torch.float64) -> torch.Tensor:
@@ -967,6 +1037,89 @@ class OrientationMap(AutoSerialize):
     # sub-grid refinement
     # ------------------------------------------------------------------
 
+    def smooth_orientations(
+        self,
+        match: int = 0,
+        sigma_px: float = 1.0,
+        sigma_deg: float = 1.0,
+        max_angle_deg: float = 5.0,
+        positions=None,
+    ) -> "OrientationMap":
+        """Average each orientation with its neighbours, keeping boundaries sharp.
+
+        A bilateral filter on the orientation field: every position is
+        replaced by the weighted mean of the orientations around it, with
+
+            w = exp(-r^2 / 2 sigma_px^2) * exp(-theta^2 / 2 sigma_deg^2)
+
+        for a neighbour r probe positions away whose orientation differs by
+        theta, and with neighbours beyond `max_angle_deg` excluded outright.
+        The angular term is what keeps this from blurring across a grain
+        boundary or between two variants: those neighbours are tens of
+        degrees away and carry no weight.
+
+        The point is the noise budget. Neighbouring probe positions inside a
+        grain measure the same orientation, so their scatter is measurement
+        error and averaging it down costs only spatial resolution, at the
+        scale of sigma_px probe steps. Running this before
+        `refine_orientations` starts the refinement from a cleaner field;
+        running it after smooths what the refinement leaves.
+
+        This does not repair the ambiguities that make an orientation map
+        jump by tens of degrees, such as two variants with the same
+        zero-layer pattern: those differ by far more than `max_angle_deg`
+        and are excluded by design. Fold the in-plane angle by
+        `Crystal.projected_rotation_order` for those.
+
+        Parameters
+        ----------
+        match : int, default=0
+            Which match index to smooth.
+        sigma_px : float, default=1.0
+            Spatial width of the kernel in probe positions. The window is
+            three sigma wide.
+        sigma_deg : float, default=1.0
+            Angular width: a neighbour misoriented by this much is weighted
+            down by 1/sqrt(e).
+        max_angle_deg : float, default=5.0
+            Neighbours beyond this misorientation are excluded.
+        positions : list[tuple[int, int]] | np.ndarray | None
+            Positions to smooth; defaults to those carrying a match.
+        """
+        assert self.quats is not None, "run match_orientations() first"
+        R, C = self.quats.shape[:2]
+        active = position_mask(positions, (R, C))
+        if self.computed is not None:
+            active = active & self.computed
+        active = active & (self.corr[..., match] > 0)
+        self.quats[..., match, :] = smooth_quaternions(
+            self.quats[..., match, :],
+            active,
+            self.crystal.sym_quats,
+            sigma_px=sigma_px,
+            sigma_deg=sigma_deg,
+            max_angle_deg=max_angle_deg,
+        )
+        self.metadata["smooth"] = dict(
+            match=int(match),
+            sigma_px=float(sigma_px),
+            sigma_deg=float(sigma_deg),
+            max_angle_deg=float(max_angle_deg),
+        )
+        return self
+
+    def smoothed_quats(self, match: int = 0, **kwargs) -> torch.Tensor:
+        """Smoothed copy of the orientations, leaving the stored ones alone."""
+        assert self.quats is not None
+        R, C = self.quats.shape[:2]
+        active = torch.ones((R, C), dtype=torch.bool)
+        if self.computed is not None:
+            active = active & self.computed
+        active = active & (self.corr[..., match] > 0)
+        return smooth_quaternions(
+            self.quats[..., match, :], active, self.crystal.sym_quats, **kwargs
+        )
+
     def refine_orientations(
         self,
         num_iterations: int = 5,
@@ -1407,7 +1560,7 @@ class OrientationMap(AutoSerialize):
 
         chunks = [i for i in range(0, N, chunk) if bool(valid_pos[i : i + chunk].any())]
         if progress_bar:
-            chunks = tqdm(chunks, desc="refining orientations (batched)")
+            chunks = tqdm(chunks, desc="refining orientations")
         for i0 in chunks:
             i1 = min(i0 + chunk, N)
             B = i1 - i0
@@ -1872,10 +2025,24 @@ class OrientationMap(AutoSerialize):
                 kwargs["mask"] = self.computed.numpy().astype(float)
         return kwargs
 
+    @property
+    def scan_scalebar(self) -> dict | None:
+        """Real-space scale bar of the scan, carried from the dataset.
+
+        `BraggVectors` stamps the scan sampling and units of the dataset onto
+        the detected peaks, and the calibration keeps them, so every map can
+        draw a scale bar without being told the step size. None when the
+        dataset was never calibrated, in which case set `dataset.sampling`
+        and `dataset.units` before detecting the disks.
+        """
+        md = self.metadata.get("peaks", {}) or {}
+        return scan_scalebar(md)
+
     def plot_orientation(self, direction: str = "z", match: int = 0, **kwargs):
         """IPF-colored orientation map; see orientation_visualization."""
         from quantem.diffraction.orientation_visualization import plot_orientation_map
 
+        kwargs.setdefault("scalebar", self.scan_scalebar)
         return plot_orientation_map(
             self, direction=direction, match=match, **self._default_mask(kwargs)
         )

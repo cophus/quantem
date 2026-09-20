@@ -323,7 +323,7 @@ class PhaseMap(AutoSerialize):
         self,
         phase_colors: np.ndarray | None = None,
         reliability_range: tuple[float, float] = (0.0, 0.1),
-        scalebar: dict | None = None,
+        scalebar: dict | str | None = "auto",
         figax=None,
     ):
         """Dominant-phase map, colored by phase and shaded by reliability.
@@ -335,9 +335,14 @@ class PhaseMap(AutoSerialize):
             the pattern overlay plots (gold, light blue, ...).
         reliability_range : tuple, default=(0.0, 0.1)
             Reliability values mapped to black ... full color.
-        scalebar : dict | None
-            Real-space scale bar, e.g. {"sampling": 30, "units": "A"}.
+        scalebar : dict | "auto" | None
+            Real-space scale bar. "auto" (the default) takes the scan step
+            and units carried from the dataset by the orientation maps; a
+            dict such as {"sampling": 30, "units": "A"} overrides it, and
+            None draws no bar.
         """
+        if isinstance(scalebar, str):
+            scalebar = self.orientation_maps[0].scan_scalebar if scalebar == "auto" else None
         import matplotlib.pyplot as plt
 
         from quantem.core.visualization.visualization_utils import add_scalebar_to_ax
