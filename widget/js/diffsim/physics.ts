@@ -149,20 +149,59 @@ function tiltedExcitation(r: Reflection, kz: number, tilt: [number, number]): nu
   return num / (2 * (kz - r.g[2]));
 }
 
+/** |U_h| for an index difference, zero when the crystal carries no such factor. */
+function couplingMag(c: CrystalData, h: number, k: number, l: number): number {
+  const key = `${h},${k},${l}`;
+  return Math.hypot(c.couplingRe.get(key) ?? 0, c.couplingIm.get(key) ?? 0);
+}
+
+const N_STRONG = 24; // candidates treated as the intermediate beams of a two-step path
+
+/**
+ * Rank candidates for the Bloch set, strongest first.
+ *
+ * Ranking by |U_g| alone drops exactly the reflections a dynamical
+ * calculation exists to show: silicon 002 and 222 have no structure factor
+ * of their own, so they score zero, yet they are the textbook example of a
+ * beam that fills by double diffraction and grows with thickness. A beam is
+ * worth keeping when it is strongly coupled to something that is itself
+ * strongly excited, so each candidate is scored by the largest coupling
+ * joining it either to the transmitted beam (|U_g|) or to one of the
+ * strongest candidates (|U_(g-h)|), divided by its excitation error.
+ */
+function rankCandidates(c: CrystalData, cand: { ref: Reflection; s: number }[]): { ref: Reflection; s: number }[] {
+  const direct = cand.map((x) => ({
+    x,
+    v: Math.hypot(c.U_re[x.ref.index], c.U_im[x.ref.index]) / (Math.abs(x.s) + 1e-4),
+  }));
+  direct.sort((a, b) => b.v - a.v);
+  const strong = direct.slice(0, Math.min(N_STRONG, direct.length)).map((d) => d.x.ref.hkl);
+  const scored = cand.map((x) => {
+    let best = Math.hypot(c.U_re[x.ref.index], c.U_im[x.ref.index]);
+    for (const h of strong) {
+      const u = couplingMag(c, x.ref.hkl[0] - h[0], x.ref.hkl[1] - h[1], x.ref.hkl[2] - h[2]);
+      if (u > best) best = u;
+    }
+    return { x, v: best / (Math.abs(x.s) + 1e-4) };
+  });
+  scored.sort((a, b) => b.v - a.v);
+  return scored.map((sc) => sc.x);
+}
+
 /**
  * Beams entering the Bloch calculation: the direct beam plus every
  * reflection within sgMax of the Ewald sphere at zero tilt (sgMax widened
  * by the tilt range when a convergent beam is sampled), capped at maxBeams
- * by keeping the beams with the largest |U_g| / |s_g|.
+ * by the ranking of rankCandidates.
  */
 export function selectBeams(c: CrystalData, q: Quat, kMax: number, sgMax: number, maxBeams: number, tiltRange = 0): Reflection[] {
   const all = labReflections(c, q, kMax);
   const widen = tiltRange * kMax; // max |delta s| = sin(alpha) |g|
   let beams = all.filter((r) => Math.abs(r.s) < sgMax + widen);
   if (beams.length > maxBeams) {
-    const score = (r: Reflection) => Math.hypot(c.U_re[r.index], c.U_im[r.index]) / (Math.abs(r.s) + 1e-4);
-    beams.sort((a, b) => score(b) - score(a));
-    beams = beams.slice(0, maxBeams);
+    beams = rankCandidates(c, beams.map((r) => ({ ref: r, s: r.s })))
+      .slice(0, maxBeams)
+      .map((x) => x.ref);
   }
   return [DIRECT, ...beams];
 }
@@ -334,16 +373,15 @@ export function nanobeamSolve(c: CrystalData, q: Quat, kMax: number, sgMax: numb
   let nSum = 0;
   for (const tilt of tilts) {
     const kz = Math.sqrt(Math.max(k0 * k0 - tilt[0] ** 2 - tilt[1] ** 2, 1e-12));
-    const cand: { i: number; s: number; score: number }[] = [];
+    let cand: { ref: Reflection; s: number; i: number }[] = [];
     for (let i = 0; i < all.length; i++) {
       const st = tiltedExcitation(all[i], kz, tilt);
-      if (Math.abs(st) < sgMax) {
-        const r = all[i];
-        cand.push({ i, s: st, score: Math.hypot(c.U_re[r.index], c.U_im[r.index]) / (Math.abs(st) + 1e-4) });
-      }
+      if (Math.abs(st) < sgMax) cand.push({ ref: all[i], s: st, i });
     }
-    if (cand.length > maxBeams) { cand.sort((a, b) => b.score - a.score); cand.length = maxBeams; }
-    const dyn = [DIRECT, ...cand.map((x) => all[x.i])];
+    if (cand.length > maxBeams) {
+      cand = rankCandidates(c, cand).slice(0, maxBeams) as typeof cand;
+    }
+    const dyn = [DIRECT, ...cand.map((x) => x.ref)];
     const pos = new Int32Array(dyn.length);
     pos[0] = 0;
     cand.forEach((x, j) => { pos[j + 1] = x.i + 1; });

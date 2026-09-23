@@ -39,6 +39,7 @@ const MAX_BEAMS_DRAG = 28;
 const SPIN_FPS = 20; // recompute rate while spinning (battery)
 const CBED_GRID = 7;
 const CBED_GRID_DRAG = 5;
+const CBED_PREC_NODES = 8; // ring nodes per incident direction of the cone
 
 interface Model { get(key: string): unknown }
 
@@ -210,7 +211,7 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
           <div class="${id}-group" id="${id}-modes">
             <div class="${id}-btn" data-mode="nanobeam">nanobeam</div>
             <div class="${id}-btn" data-mode="cbed">CBED</div>
-            <div class="${id}-btn" data-mode="kossel">Kossel lines</div>
+            <div class="${id}-btn" data-mode="kossel">Kikuchi pattern</div>
           </div>
           <label class="${id}-check" id="${id}-dynwrap"><input type="checkbox" id="${id}-dyn" ${state.dynamical ? "checked" : ""}> dynamical</label>
           <label class="${id}-check"><input type="checkbox" id="${id}-hkl" ${state.showHkl ? "checked" : ""}> hkl labels</label>
@@ -298,7 +299,13 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
   let nb: { beams: Reflection[]; nDyn: number } = { beams: [], nDyn: 0 };
   let nbSolution: NanobeamSolution | null = null;
   let nbTilts: [number, number][] = [[0, 0]];
-  let cbed: { grid: ReturnType<typeof tiltGrid>; beams: Reflection[]; nDyn: number; sols: ReturnType<typeof blochSolve>[] | null } | null = null;
+  let cbed: {
+    grid: ReturnType<typeof tiltGrid>;
+    beams: Reflection[];
+    nDyn: number;
+    nodes: [number, number][]; // precession ring, one entry at the origin without it
+    sols: ReturnType<typeof blochSolve>[] | null; // grid tilt major, ring node minor
+  } | null = null;
   let lines: ReturnType<typeof kosselLines> = [];
   let geomKey = "";
 
@@ -326,15 +333,23 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
     } else if (state.mode === "cbed") {
       const Rk = k0() * Math.sin(alpha);
       const grid = tiltGrid(Rk, (state.dragging || state.spinning) ? CBED_GRID_DRAG : CBED_GRID);
+      // every incident direction of the cone is itself precessed, so the cost
+      // is the grid times the ring: fewer ring nodes here than in nanobeam
+      const nRing = (state.dragging || state.spinning) ? Math.min(4, dragNodes) : CBED_PREC_NODES;
+      const nodes = precessionTilts(k0(), state.precession, nRing);
       if (state.dynamical) {
         const { beams, nDyn } = hybridBeams(crystal, q, crystal.k_max, SG_MAX, (state.dragging || state.spinning) ? 20 : 32, Math.sin(alpha));
         const dyn = beams.slice(0, nDyn);
-        cbed = { grid, beams, nDyn, sols: grid.tilts.map((t) => blochSolve(crystal, dyn, t)) };
+        const sols: ReturnType<typeof blochSolve>[] = [];
+        for (const t of grid.tilts) {
+          for (const nd of nodes) sols.push(blochSolve(crystal, dyn, [t[0] + nd[0], t[1] + nd[1]]));
+        }
+        cbed = { grid, beams, nDyn, nodes, sols };
       } else {
-        cbed = { grid, beams: [DIRECT, ...labReflections(crystal, q, crystal.k_max)], nDyn: 0, sols: null };
+        cbed = { grid, beams: [DIRECT, ...labReflections(crystal, q, crystal.k_max)], nDyn: 0, nodes, sols: null };
       }
     }
-    if (state.mode === "kossel" || (state.mode === "nanobeam" && state.kikuchi)) {
+    if (state.mode === "kossel" || (state.mode !== "kossel" && state.kikuchi)) {
       const fov = state.mode === "kossel" ? state.fieldMrad * 1e-3 : state.patternRange / k0();
       lines = kosselLines(crystal, q, Math.min(crystal.k_max, 2.5), fov);
     }
@@ -350,6 +365,36 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
     return out;
   };
 
+  /** Intensity of every beam at each incident direction of the cone, averaged
+   * over the precession ring. */
+  const intensitiesCbed = (): Float64Array[] => {
+    if (!cbed) return [];
+    const { grid, beams, nDyn, nodes, sols } = cbed;
+    return grid.tilts.map((t, i) => {
+      const out = new Float64Array(beams.length);
+      for (let k = 0; k < nodes.length; k++) {
+        const tilt: [number, number] = [t[0] + nodes[k][0], t[1] + nodes[k][1]];
+        const acc = new Float64Array(beams.length);
+        if (sols) {
+          acc.set(blochIntensities(sols[i * nodes.length + k], state.thickness));
+          slabIntensities(crystal, beams, nDyn, tilt, state.thickness, acc);
+        } else {
+          acc.set(kinematicalTilted(crystal, beams, tilt, 0.02));
+        }
+        for (let b = 0; b < out.length; b++) out[b] += acc[b] / nodes.length;
+      }
+      return out;
+    });
+  };
+
+  /** Disk-averaged intensity of every beam, for the double-click snap. */
+  const intensitiesCbedMean = (): Float64Array => {
+    const per = intensitiesCbed();
+    const out = new Float64Array(cbed ? cbed.beams.length : 0);
+    for (const arr of per) for (let b = 0; b < out.length; b++) out[b] += arr[b] / Math.max(per.length, 1);
+    return out;
+  };
+
   // ---------------------------------------------------------------- drawing
   const drawCellPanel = () => {
     const key = `${state.preset}|${state.nCells.join(",")}|${state.polyhedra}`;
@@ -362,7 +407,7 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
       if (ctx) {
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         const refl = state.mode === "nanobeam" && nb.beams.length ? nb.beams : labReflections(crystal, state.quat, crystal.k_max);
-        drawEwaldPanel(ctx, Sc, Se, refl, k0(), state.patternRange, SG_MAX, VIEW_X, dark, state.mode === "nanobeam" ? state.precession : 0);
+        drawEwaldPanel(ctx, Sc, Se, refl, k0(), state.patternRange, SG_MAX, VIEW_X, dark, state.mode !== "kossel" ? state.precession : 0);
       }
     }
     const R = quatToMatrix(state.quat);
@@ -446,14 +491,7 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
         ? `${nb.nDyn} Bloch beams (|s| < ${SG_MAX} Å⁻¹, absorptive), thin-slab intensities for the other ${nb.beams.length - nb.nDyn}${prec}`
         : `kinematical: |F|² with a Gaussian excitation envelope (σ = 0.02 Å⁻¹)`;
     } else if (state.mode === "cbed" && cbed) {
-      const inten = cbed.sols
-        ? cbed.sols.map((sol, i) => {
-          const out = new Float64Array(cbed!.beams.length);
-          out.set(blochIntensities(sol, state.thickness));
-          slabIntensities(crystal, cbed!.beams, cbed!.nDyn, cbed!.grid.tilts[i], state.thickness, out);
-          return out;
-        })
-        : cbed.grid.tilts.map((t) => kinematicalTilted(crystal, cbed!.beams, t, 0.02));
+      const inten = intensitiesCbed();
       const img = cbedImage(f, cbed.beams, cbed.grid, inten);
       // normalise to the brightest pixel outside the direct disk
       const Rpx = cbed.grid.R * (0.5 * S * 0.92) / f.qMax + 1.5;
@@ -469,7 +507,11 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
       for (let i = 0; i < img.length; i++) disp[i] = Math.min(1, Math.pow(Math.max(img[i], 0) / hi, state.power));
       histogramOf(disp);
       drawImage(ctx, f, disp, dark ? "gray" : "gray_r", state.vmin, state.vmax, dark, "Å⁻¹", 1);
-      status = `${cbed.nDyn} Bloch beams × ${cbed.grid.tilts.length} incident tilts per disk; disks summed where they overlap`;
+      if (state.kikuchi) drawKikuchiOverlay(ctx, f, lines, k0(), dark);
+      const prec = state.precession > 0
+        ? `; precession ${state.precession.toFixed(2)}° over ${cbed.nodes.length} ring nodes`
+        : "";
+      status = `${cbed.nDyn} Bloch beams × ${cbed.grid.tilts.length} incident tilts per disk; disks summed where they overlap${prec}`;
     } else if (state.mode === "kossel") {
       drawKosselLines(ctx, f, lines, dark, state.showHkl, 0.02);
       status = `deficient line of every reflection: line width = two-beam rocking width |U_g| / (k₀|g|), darkness ∝ |U_g|`;
@@ -574,17 +616,21 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
     const x = e.clientX - rect.left, y = e.clientY - rect.top;
     const f = frame();
     const sc = (0.5 * S * 0.92) / f.qMax;
-    if (state.mode === "nanobeam") {
-      const inten = intensitiesNanobeam();
+    if (state.mode === "nanobeam" || state.mode === "cbed") {
+      // a convergent beam draws the same reflections as wide disks, so both
+      // modes snap to the same two-beam condition the same way
+      const beams = state.mode === "cbed" && cbed ? cbed.beams : nb.beams;
+      const inten = state.mode === "cbed" ? intensitiesCbedMean() : intensitiesNanobeam();
       let iMax = 0;
-      for (let i = 1; i < nb.beams.length; i++) iMax = Math.max(iMax, inten[i]);
-      const snap = Math.max(8, 1.5 * k0() * Math.sin(state.semiconv * 1e-3) * sc);
+      for (let i = 1; i < beams.length; i++) iMax = Math.max(iMax, inten[i]);
+      const disk = k0() * Math.sin(state.semiconv * 1e-3) * sc;
+      const snap = Math.max(8, (state.mode === "cbed" ? 1.0 : 1.5) * disk);
       // several reflections of different g_z share one spot (in hcp the first
       // HOLZ layer is only 0.21 1/A up): take the candidate under the click
       // that needs the smallest tilt to reach Bragg, never more than 5 degrees
       let best: Reflection | null = null, bestTilt = (5 * Math.PI) / 180;
-      for (let i = 0; i < nb.beams.length; i++) {
-        const b = nb.beams[i];
+      for (let i = 0; i < beams.length; i++) {
+        const b = beams[i];
         if (b.index < 0 || !(inten[i] > 1e-4 * iMax)) continue;
         const [px, py] = toPx(f, b.g[0], b.g[1]);
         if (Math.hypot(px - x, py - y) > snap) continue;
@@ -600,9 +646,12 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
         recompute();
         return;
       }
+      // empty space: the Laue circle centre moves to the click
       shiftPattern((VIEW_X * (x - rect.width / 2)) / sc, -(y - rect.height / 2) / sc, true);
     } else {
-      shiftPattern(-(VIEW_X * (x - rect.width / 2)) / sc, (y - rect.height / 2) / sc, state.mode !== "kossel");
+      // the Kikuchi map is a map of beam directions, so the clicked direction
+      // moves onto the axis, which is the opposite sense
+      shiftPattern(-(VIEW_X * (x - rect.width / 2)) / sc, (y - rect.height / 2) / sc, false);
     }
     recompute();
   });
@@ -705,13 +754,16 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
   const updateModeUI = () => {
     modeButtons.forEach((b) => b.classList.toggle("active", b.dataset.mode === state.mode));
     const show = (sel: string, on: boolean) => { $(sel).style.display = on ? "" : "none"; };
-    show(`#${id}-thickwrap`, state.mode !== "kossel" && state.dynamical);
-    show(`#${id}-convwrap`, state.mode !== "kossel");
-    show(`#${id}-rangewrap`, state.mode !== "kossel");
-    show(`#${id}-fieldwrap`, state.mode === "kossel");
-    show(`#${id}-dynwrap`, state.mode !== "kossel");
-    show(`#${id}-kikwrap`, state.mode === "nanobeam");
-    show(`#${id}-precwrap`, state.mode === "nanobeam");
+    // nanobeam and CBED share every control; the Kikuchi pattern is a map of
+    // beam directions and takes the field of view instead
+    const pattern = state.mode !== "kossel";
+    show(`#${id}-thickwrap`, pattern && state.dynamical);
+    show(`#${id}-convwrap`, pattern);
+    show(`#${id}-rangewrap`, pattern);
+    show(`#${id}-fieldwrap`, !pattern);
+    show(`#${id}-dynwrap`, pattern);
+    show(`#${id}-kikwrap`, pattern);
+    show(`#${id}-precwrap`, pattern);
     show(`#${id}-approw`, state.mode !== "kossel");
     show(`#${id}-apppanel`, state.mode !== "kossel" && state.showAppearance);
   };

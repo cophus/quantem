@@ -36,6 +36,7 @@ import {
 
 const DIRECT: Reflection = { index: -1, hkl: [0, 0, 0], g: [0, 0, 0], gLen: 0, s: 0 };
 const SPIN_FPS = 20; // orientation update rate while spinning
+const CBED_PREC_NODES = 8; // precession ring nodes per incident direction of the cone
 const QUALITY: Record<string, { grid: number; beams: number; nanobeam: number }> = {
   fast: { grid: 5, beams: 24, nanobeam: 40 },
   medium: { grid: 7, beams: 36, nanobeam: 64 },
@@ -329,18 +330,24 @@ function DiffSim() {
   const onPatDoubleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left, y = e.clientY - rect.top;
-    if (mode === "nanobeam" && crystal) {
-      const snapPx = Math.max(8, 1.2 * (render === "disks" ? k0 * Math.sin(alpha) * patScale.current : markerSize * (S / 420)));
+    if ((mode === "nanobeam" || mode === "cbed") && crystal) {
+      // a convergent beam draws the same reflections as wide disks, so both
+      // modes snap to the same two-beam condition the same way
+      const beamList = mode === "cbed" && cbed ? cbed.beams : nbBeams;
+      const intenList = mode === "cbed" ? cbedMean : nbInten;
+      const snapPx = mode === "cbed"
+        ? Math.max(8, k0 * Math.sin(alpha) * patScale.current)
+        : Math.max(8, 1.2 * (render === "disks" ? k0 * Math.sin(alpha) * patScale.current : markerSize * (S / 420)));
       // candidates under the click: several reflections of different g_z
       // share one spot (in hcp the first HOLZ layer is only 0.21 1/A up), so
       // take the one that needs the SMALLEST tilt to reach Bragg, and never
       // jump by more than 5 degrees
       let best: Reflection | null = null, bestTilt = (5 * Math.PI) / 180;
       let iMax = 0;
-      for (let i = 1; i < nbBeams.length; i++) iMax = Math.max(iMax, nbInten[i] || 0);
-      for (let i = 0; i < nbBeams.length; i++) {
-        const b = nbBeams[i];
-        if (b.index < 0 || !(nbInten[i] > 1e-4 * iMax)) continue;
+      for (let i = 1; i < beamList.length; i++) iMax = Math.max(iMax, intenList[i] || 0);
+      for (let i = 0; i < beamList.length; i++) {
+        const b = beamList[i];
+        if (b.index < 0 || !(intenList[i] > 1e-4 * iMax)) continue;
         const [px, py] = toPx(frame, b.g[0], b.g[1]);
         if (Math.hypot(px - x, py - y) > snapPx) continue;
         const gxy = Math.hypot(b.g[0], b.g[1]);
@@ -404,29 +411,51 @@ function DiffSim() {
     if (!crystal || mode !== "cbed") return null;
     const Rk = k0 * Math.sin(alpha);
     const grid = tiltGrid(Rk, dragging ? 5 : qual.grid);
-    if (!dynamical) return { grid, beams: [DIRECT, ...labReflections(crystal, quat, crystal.k_max)], nDyn: 0, sols: null };
+    // every incident direction of the cone is itself precessed, so the cost is
+    // the grid times the ring: fewer ring nodes here than in nanobeam
+    const nodes = precessionTilts(k0, precession || 0, dragging ? 4 : CBED_PREC_NODES);
+    if (!dynamical) {
+      return { grid, beams: [DIRECT, ...labReflections(crystal, quat, crystal.k_max)], nDyn: 0, nodes, sols: null };
+    }
     const { beams, nDyn } = hybridBeams(crystal, quat, crystal.k_max, SG_MAX, dragging ? Math.min(qual.beams, 24) : qual.beams, Math.sin(alpha));
     const dyn = beams.slice(0, nDyn);
-    const sols = grid.tilts.map((t) => blochSolve(crystal, dyn, t));
-    return { grid, beams, nDyn, sols };
-  }, [crystal, quat, qMaxDisp, mode, dynamical, alpha, k0, dragging, qual, SG_MAX]);
+    const sols: ReturnType<typeof blochSolve>[] = []; // grid tilt major, ring node minor
+    for (const t of grid.tilts) {
+      for (const nd of nodes) sols.push(blochSolve(crystal, dyn, [t[0] + nd[0], t[1] + nd[1]]));
+    }
+    return { grid, beams, nDyn, nodes, sols };
+  }, [crystal, quat, qMaxDisp, mode, dynamical, alpha, k0, dragging, qual, SG_MAX, precession]);
   const cbedInten = React.useMemo(() => {
     if (!crystal || !cbed) return null;
-    if (cbed.sols) {
-      return cbed.sols.map((sol, i) => {
-        const out = new Float64Array(cbed.beams.length);
-        out.set(blochIntensities(sol, thickness));
-        slabIntensities(crystal, cbed.beams, cbed.nDyn, cbed.grid.tilts[i], thickness, out);
-        return out;
-      });
-    }
-    return cbed.grid.tilts.map((t) => kinematicalTilted(crystal, cbed.beams, t, sigma));
+    const { grid, beams, nDyn, nodes, sols } = cbed;
+    return grid.tilts.map((t, i) => {
+      const out = new Float64Array(beams.length);
+      for (let k = 0; k < nodes.length; k++) {
+        const tilt: [number, number] = [t[0] + nodes[k][0], t[1] + nodes[k][1]];
+        const acc = new Float64Array(beams.length);
+        if (sols) {
+          acc.set(blochIntensities(sols[i * nodes.length + k], thickness));
+          slabIntensities(crystal, beams, nDyn, tilt, thickness, acc);
+        } else {
+          acc.set(kinematicalTilted(crystal, beams, tilt, sigma));
+        }
+        for (let b = 0; b < out.length; b++) out[b] += acc[b] / nodes.length;
+      }
+      return out;
+    });
   }, [crystal, cbed, thickness, sigma]);
+  // disk-averaged intensity of every beam, for the double-click snap
+  const cbedMean = React.useMemo(() => {
+    if (!cbed || !cbedInten) return new Float64Array(0);
+    const out = new Float64Array(cbed.beams.length);
+    for (const arr of cbedInten) for (let b = 0; b < out.length; b++) out[b] += arr[b] / cbedInten.length;
+    return out;
+  }, [cbed, cbedInten]);
 
   // ---- Kossel -------------------------------------------------------------
   const fieldRad = fieldMrad * 1e-3;
   const lines = React.useMemo(() => {
-    if (!crystal || (mode !== "kossel" && !(mode === "nanobeam" && kikuchi))) return [];
+    if (!crystal || (mode !== "kossel" && !kikuchi)) return [];
     const fov = mode === "kossel" ? fieldRad : qMaxDisp / k0;
     return kosselLines(crystal, quat, Math.min(crystal.k_max, 2.5), fov);
   }, [crystal, quat, mode, fieldRad, kikuchi, qMaxDisp, k0]);
@@ -479,7 +508,7 @@ function DiffSim() {
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const refl = mode === "nanobeam" && nbBeams.length ? nbBeams : labReflections(crystal, quat, crystal.k_max);
-    drawEwaldPanel(ctx, Sc, Se, refl, k0, qMaxDisp, SG_MAX, viewX, dark, mode === "nanobeam" ? precession || 0 : 0);
+    drawEwaldPanel(ctx, Sc, Se, refl, k0, qMaxDisp, SG_MAX, viewX, dark, mode !== "kossel" ? precession || 0 : 0);
   }, [quat, Sc, Se, dark, viewX, showEwald, crystal, mode, nbBeams, qMaxDisp, k0, SG_MAX, precession]);
 
   const patRef = React.useRef<HTMLCanvasElement>(null);
@@ -492,7 +521,7 @@ function DiffSim() {
       const vmin = display.lo + (vminPct / 100) * (display.hi - display.lo);
       const vmax = display.lo + (vmaxPct / 100) * (display.hi - display.lo);
       drawImage(ctx, frame, display.data, cmap, vmin, vmax, dark, mode === "kossel" ? "rad" : "Å⁻¹", mode === "kossel" ? 0.01 : 1);
-      if (mode === "nanobeam" && kikuchi) drawKikuchiOverlay(ctx, frame, lines, k0, true);
+      if (mode !== "kossel" && kikuchi) drawKikuchiOverlay(ctx, frame, lines, k0, true);
       if (mode === "nanobeam" && showHkl) labelBeams(ctx, frame, nbBeams, nbInten, dark, true);
     } else if (mode === "nanobeam" && render === "disks") {
       drawDisks(ctx, frame, nbBeams, nbInten, dark, showHkl, k0 * Math.sin(alpha), markerPower);
@@ -688,7 +717,7 @@ function DiffSim() {
           <ToggleButtonGroup size="small" exclusive value={mode} onChange={(_, v) => v && setMode(v)} sx={tbg}>
             <ToggleButton value="nanobeam">nanobeam</ToggleButton>
             <ToggleButton value="cbed">CBED</ToggleButton>
-            <ToggleButton value="kossel">Kossel / LACBED</ToggleButton>
+            <ToggleButton value="kossel">Kikuchi pattern</ToggleButton>
           </ToggleButtonGroup>
           {mode !== "cbed" && (
             <ToggleButtonGroup size="small" exclusive value={render} onChange={(_, v) => v && setRender(v)} sx={tbg}>
@@ -707,7 +736,7 @@ function DiffSim() {
             <Switch size="small" sx={sw} checked={showHkl} onChange={(e) => setShowHkl(e.target.checked)} />
             <Typography sx={{ fontSize: 11 }}>hkl labels</Typography>
           </Stack>
-          {mode === "nanobeam" && (
+          {mode !== "kossel" && (
             <Stack direction="row" alignItems="center">
               <Switch size="small" sx={sw} checked={kikuchi} onChange={(e) => setKikuchi(e.target.checked)} />
               <Typography sx={{ fontSize: 11 }}>Kikuchi lines</Typography>
@@ -731,7 +760,7 @@ function DiffSim() {
           <LabeledSlider label="thickness" value={thickness} onChange={setThickness} min={10} max={2000} step={5} fmt={(v) => `${v.toFixed(0)} Å`} width={180}
             disabled={mode !== "kossel" ? !dynamical : render !== "pixels"} />
           {(mode === "cbed" || (mode === "nanobeam" && render === "disks")) && <LabeledSlider label="convergence semiangle" value={semiconv} onChange={setSemiconv} min={0.2} max={30} step={0.1} fmt={(v) => `${v.toFixed(1)} mrad`} width={180} />}
-          {mode === "nanobeam" && <LabeledSlider label="precession angle" value={precession} onChange={setPrecession} min={0} max={3} step={0.05} fmt={(v) => (v > 0 ? `${v.toFixed(2)}°` : "off")} width={180} />}
+          {mode !== "kossel" && <LabeledSlider label="precession angle" value={precession} onChange={setPrecession} min={0} max={3} step={0.05} fmt={(v) => (v > 0 ? `${v.toFixed(2)}°` : "off")} width={180} />}
           {mode !== "kossel" && <LabeledSlider label="pattern range" value={qMaxDisp} onChange={setQMaxDisp} min={0.2} max={crystal.k_max} step={0.05} fmt={(v) => `${v.toFixed(2)} Å⁻¹`} width={180} />}
           {mode === "kossel" && <LabeledSlider label="field of view (half angle)" value={fieldMrad} onChange={setFieldMrad} min={10} max={250} step={5} fmt={(v) => `${v.toFixed(0)} mrad`} width={180} />}
           {mode !== "kossel" && !dynamical && <LabeledSlider label="excitation error σ" value={sigma} onChange={setSigma} min={0.002} max={0.1} step={0.001} fmt={(v) => `${v.toFixed(3)} Å⁻¹`} width={180} />}
@@ -777,8 +806,10 @@ function DiffSim() {
         <Typography sx={{ fontSize: 10.5, opacity: 0.6, mt: 0.75 }}>
           {(energy / 1e3).toFixed(0)} keV · λ = {(crystal.wavelength * 100).toFixed(3)} pm · {nBeams} {mode === "kossel" ? "lines" : "beams"}
           {mode !== "kossel" && dynamical ? ` · ${nDyn} Bloch beams (|s| < ${SG_MAX} Å⁻¹${crystal.absorptive ? ", absorptive" : ""}), thin-slab intensities for the rest` : ""}
+          {mode !== "kossel" && precession > 0
+            ? ` · precession ${precession.toFixed(2)}° over ${mode === "cbed" ? (cbed ? cbed.nodes.length : 0) : precNodes.length} ring nodes`
+            : ""}
           {mode === "cbed" ? " · disks summed incoherently where they overlap" : ""}
-          {mode === "nanobeam" && precession > 0 ? ` · precession ${precession.toFixed(2)}°, ${precNodes.length} ring nodes` : ""}
           {status ? ` · ${status}` : ""}
         </Typography>
         <Typography sx={{ fontSize: 10.5, opacity: 0.6 }}>drag the cell (near face follows) or the pattern (tilt map follows) · shift-drag or two fingers twist about the beam · double-click a disk for its two-beam condition, or empty space to put the Laue circle centre there · buttons rotate about the screen axes</Typography>

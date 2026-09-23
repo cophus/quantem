@@ -4,7 +4,7 @@ DiffractionSim: interactive crystal and diffraction simulation for teaching.
 Left panel: the unit cell in 3D, rotated by dragging (mouse or touch) or by
 buttons about the screen axes. Right panel: the diffraction pattern of the
 same orientation, updated live: nanobeam (kinematical markers, or Bloch wave
-intensities that follow the thickness slider), CBED disks, or Kossel /
+intensities that follow the thickness slider), CBED disks, or the Kikuchi
 LACBED lines. Every simulation runs in the browser, so the widget can be
 exported as a single HTML file and embedded in a web page without Python.
 """
@@ -185,8 +185,8 @@ def _coupling_vector(crystal, hkl: torch.Tensor, gamma_rel: float) -> tuple[torc
 def prepare_kossel_reference(
     crystal, energy_ev: float, thicknesses_A, angle_step_mrad=3.0, k_max=1.0
 ):
-    """Bright field Kossel reference on the Lambert grid, for the pixel
-    rendering of the Kossel / LACBED mode (a lookup in the browser)."""
+    """Bright field reference on the Lambert grid, for the pixel rendering
+    of the Kikuchi pattern mode (a lookup in the browser)."""
     from quantem.diffraction import bloch
 
     master = bloch.calculate_kossel_reference(
@@ -233,7 +233,7 @@ class DiffractionSim(anywidget.AnyWidget):
         Scattering vector at the edge of the nanobeam / CBED panel
         (1/Angstroms); None uses 3, or k_max when that is smaller.
     field_mrad : float, default=50
-        Half angle of the Kossel / LACBED field of view.
+        Half angle of the Kikuchi pattern field of view.
     sg_max : float, default=0.05
         Excitation error cutoff (1/Angstroms) selecting the Bloch beams;
         reflections outside it take thin-slab intensities.
@@ -258,7 +258,9 @@ class DiffractionSim(anywidget.AnyWidget):
         operator's view down the column; there the entrance face is nearest
         and tilts opposite to the pattern (the Laue center marks where the
         zone axis exits toward the detector).
-    mode : {"nanobeam", "cbed", "kossel"}
+    mode : {"nanobeam", "cbed", "kikuchi"}
+        Nanobeam spots, convergent-beam disks, or the wide-angle Kikuchi
+        pattern. "kossel" is accepted as the old name of "kikuchi".
     render : {"markers", "disks", "pixels"}
         Nanobeam: markers sized by intensity, disks of the convergence
         semiangle with brightness by intensity, or a pixelated pattern.
@@ -296,6 +298,14 @@ class DiffractionSim(anywidget.AnyWidget):
         sync=True
     )
     mode = traitlets.Unicode("nanobeam").tag(sync=True)
+
+    @traitlets.validate("mode")
+    def _accept_old_mode_name(self, proposal):
+        # the wide-angle mode was called "kossel" before it took the name the
+        # EBSD community uses for the same bands
+        value = str(proposal["value"])
+        return "kossel" if value == "kikuchi" else value
+
     render = traitlets.Unicode("markers").tag(sync=True)
     dynamical = traitlets.Bool(True).tag(sync=True)
     thickness_A = traitlets.Float(500.0).tag(sync=True)
@@ -394,8 +404,8 @@ class DiffractionSim(anywidget.AnyWidget):
     def compute_kossel_reference(
         self, thicknesses_A=(300.0, 600.0, 1000.0), angle_step_mrad=3.0, k_max=1.0
     ):
-        """Precompute the Kossel reference pattern for the pixel rendering of
-        the Kossel / LACBED mode (about a minute for silicon at 3 mrad)."""
+        """Precompute the reference pattern for the pixel rendering of the
+        Kikuchi pattern mode (about a minute for silicon at 3 mrad)."""
         key = (
             round(self.energy_ev),
             tuple(float(t) for t in thicknesses_A),
