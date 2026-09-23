@@ -568,7 +568,15 @@ class Dataset4dstem(Dataset4d):
 
         return (distance >= r_inner) & (distance <= r_outer)
 
-    def show_virtual_images(self, figsize: tuple[int, int] | None = None, **kwargs) -> tuple:
+    def show_virtual_images(
+        self,
+        figsize: tuple[int, int] | None = None,
+        *,
+        positions: list[tuple[int, int]] | None = None,
+        position_color: str = "red",
+        position_size: float = 60.0,
+        **kwargs,
+    ) -> tuple:
         """
         Display all virtual images stored in the dataset using show_2d.
 
@@ -576,6 +584,13 @@ class Dataset4dstem(Dataset4d):
         ----------
         figsize : tuple[int, int] | None, optional
             Figure size in inches. If None, automatically calculated based on number of images
+        positions : list of tuple of int, optional
+            ``(row, col)`` scan positions to mark on every image, e.g. the
+            positions used to tune Bragg disk detection.
+        position_color : str, default="red"
+            Color of the position markers.
+        position_size : float, default=60.0
+            Area of the position markers in points squared.
         **kwargs
             Additional keyword arguments passed to show_2d (e.g., cmap, norm, cbar, etc.)
 
@@ -625,7 +640,119 @@ class Dataset4dstem(Dataset4d):
             kwargs.setdefault("scalebar", [scalebar] + [False] * (len(arrays) - 1))
         fig, axs = show_2d(arrays_organized, title=titles_organized, figsize=figsize, **kwargs)
 
+        if positions is not None and len(positions) > 0:
+            pos = np.asarray(positions, dtype=float).reshape(-1, 2)
+            for ax in np.atleast_1d(np.asarray(axs, dtype=object)).ravel():
+                ax.scatter(
+                    pos[:, 1],
+                    pos[:, 0],
+                    s=position_size,
+                    facecolors="none",
+                    edgecolors=position_color,
+                    linewidths=1.5,
+                )
+
         return fig, axs
+
+    def show_virtual_detectors(
+        self,
+        names: str | list[str] | None = None,
+        *,
+        colors: list[str] | None = None,
+        alpha: float = 0.2,
+        linewidth: float = 1.5,
+        legend: bool = True,
+        **kwargs,
+    ) -> tuple:
+        """Show the mean diffraction pattern with the virtual detectors drawn on it.
+
+        Every detector attached by :meth:`get_virtual_image` is drawn on a single
+        mean pattern, so their placement relative to the direct beam and the
+        diffracted rings can be checked at a glance.
+
+        Parameters
+        ----------
+        names : str or list of str, optional
+            Detector(s) to draw. ``None`` (default) draws all attached detectors.
+        colors : list of str, optional
+            One color per detector; defaults to the matplotlib color cycle.
+        alpha : float, default=0.2
+            Opacity of the filled detector area. Set to 0 for outlines only.
+        linewidth : float, default=1.5
+            Width of the detector outline.
+        legend : bool, default=True
+            If ``True``, label the detectors in a legend.
+        **kwargs
+            Passed to :func:`~quantem.core.visualization.show_2d`; ``norm``,
+            ``scalebar`` and ``title`` have diffraction-pattern defaults.
+
+        Returns
+        -------
+        tuple
+            ``(fig, ax)`` from :func:`~quantem.core.visualization.show_2d`.
+        """
+        if not self._virtual_detectors:
+            raise ValueError("No virtual detectors attached. Create one with get_virtual_image().")
+        if names is None:
+            names = list(self._virtual_detectors)
+        elif isinstance(names, str):
+            names = [names]
+        missing = [n for n in names if n not in self._virtual_detectors]
+        if missing:
+            raise ValueError(
+                f"Virtual detector(s) {missing} not found. "
+                f"Available detectors: {list(self._virtual_detectors)}"
+            )
+
+        if colors is None:
+            cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["red"])
+            colors = [cycle[i % len(cycle)] for i in range(len(names))]
+
+        dp_mean = self.dp_mean
+        kwargs.setdefault("norm", {"power": 0.4, "upper_quantile": 0.999})
+        kwargs.setdefault("title", "mean DP with virtual detectors")
+        kwargs.setdefault(
+            "scalebar", ScalebarConfig(sampling=self.sampling[2], units=self.units[2])
+        )
+        fig, ax = show_2d(dp_mean.array, **kwargs)
+
+        for name, color in zip(names, colors):
+            det = self._virtual_detectors[name]
+            mode, geometry, mask = det["mode"], det["geometry"], det["mask"]
+            if mask is not None:
+                ax.contour(mask, levels=[0.5], colors=[color], linewidths=linewidth)
+                ax.plot([], [], color=color, linewidth=linewidth, label=name)
+                continue
+            (cy, cx) = geometry[0]
+            if mode == "circle":
+                radius = geometry[1]
+                ax.add_patch(
+                    Circle((cx, cy), radius, color=color, fill=True, alpha=alpha, label=name)
+                )
+                ax.add_patch(
+                    Circle((cx, cy), radius, color=color, fill=False, linewidth=linewidth)
+                )
+            elif mode == "annular":
+                r_inner, r_outer = geometry[1]
+                ax.add_patch(
+                    Wedge(
+                        (cx, cy),
+                        r_outer,
+                        0,
+                        360,
+                        width=r_outer - r_inner,
+                        color=color,
+                        fill=True,
+                        alpha=alpha,
+                        label=name,
+                    )
+                )
+                for r in (r_inner, r_outer):
+                    ax.add_patch(Circle((cx, cy), r, color=color, fill=False, linewidth=linewidth))
+
+        if legend:
+            ax.legend(loc="upper right", framealpha=0.8)
+        return fig, ax
 
     def regenerate_virtual_images(self) -> None:
         """

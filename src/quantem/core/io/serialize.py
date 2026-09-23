@@ -172,6 +172,16 @@ class AutoSerialize:
         return val
 
     @staticmethod
+    def _convert_string_to_device_if_needed(val: Any, group: zarr.Group, key: str) -> Any:
+        """Convert string back to torch.device if it was originally a device."""
+        if isinstance(val, str) and group.attrs.get(f"{key}.is_torch_device", False):
+            try:
+                return torch.device(val)
+            except (ValueError, RuntimeError):
+                return val
+        return val
+
+    @staticmethod
     def _is_autoserialize_instance(value: Any) -> bool:
         """Return True if value behaves like an AutoSerialize instance, even across autoreloads."""
         if isinstance(value, AutoSerialize):
@@ -406,6 +416,12 @@ class AutoSerialize:
             group.attrs[name] = str(value)
             group.attrs[f"{name}.is_path"] = True
 
+        elif isinstance(value, torch.device):
+            # A device belongs to the machine, not to the data: store the string
+            # so the object reloads on a host that does not have that device.
+            group.attrs[name] = str(value)
+            group.attrs[f"{name}.is_torch_device"] = True
+
         elif self._is_autoserialize_instance(value):
             # Nested AutoSerialize subtree
             subgroup = group.require_group(name)
@@ -522,6 +538,7 @@ class AutoSerialize:
                 name == "_autoserialize"
                 or name.endswith(".torch_save")
                 or name.endswith(".is_path")
+                or name.endswith(".is_torch_device")
             ):
                 continue  # Skip metadata/flags
             if name in skip_names:
@@ -531,6 +548,7 @@ class AutoSerialize:
 
             # Convert string paths back to pathlib.Path objects if needed
             val = cls._convert_string_to_path_if_needed(val, group, name)
+            val = cls._convert_string_to_device_if_needed(val, group, name)
 
             setattr(obj, name, val)
             set_attrs.add(name)
@@ -869,6 +887,7 @@ class AutoSerialize:
                         val = group.attrs[key]
                         # Convert string paths back to Path objects if needed
                         val = cls._convert_string_to_path_if_needed(val, group, key)
+                        val = cls._convert_string_to_device_if_needed(val, group, key)
                         items.append(val)
                     elif key in group.array_keys():
                         items.append(maybe_tensor(group, key))
@@ -984,6 +1003,7 @@ class AutoSerialize:
                     val = group.attrs[key]
                     # Convert string paths back to Path objects if needed
                     val = cls._convert_string_to_path_if_needed(val, group, key)
+                    val = cls._convert_string_to_device_if_needed(val, group, key)
                     items.append(val)
                 elif key in group.array_keys():
                     items.append(maybe_tensor(group, key))
@@ -1073,11 +1093,13 @@ class AutoSerialize:
                     key == "_container_type"
                     or key.endswith(".torch_save")
                     or key.endswith(".is_path")
+                    or key.endswith(".is_torch_device")
                 ):
                     continue
                 val = group.attrs[key]
                 # Convert string paths back to Path objects if needed
                 val = cls._convert_string_to_path_if_needed(val, group, key)
+                val = cls._convert_string_to_device_if_needed(val, group, key)
                 result[key] = val
             # Restore arrays (including torch tensors)
             for key in group.array_keys():
@@ -1514,8 +1536,6 @@ class Bundle(AutoSerialize):
 
     def __repr__(self) -> str:
         items = ", ".join(
-            f"{k}: {type(v).__name__}"
-            for k, v in vars(self).items()
-            if not k.startswith("_")
+            f"{k}: {type(v).__name__}" for k, v in vars(self).items() if not k.startswith("_")
         )
         return f"Bundle({items})"
