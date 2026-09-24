@@ -465,7 +465,9 @@ def add_cbar_to_ax(
 
     formatter = ticker.ScalarFormatter(useMathText=True)
     formatter.set_scientific(True)
-    formatter.set_powerlimits((-1, 1))
+    # only fall back to a shared exponent for genuinely extreme ranges: a
+    # correlation running 0 to 0.8 should read 0.0, 0.2, ... not 0, 2 x 10^-1
+    formatter.set_powerlimits((-3, 4))
 
     sm = cm.ScalarMappable(norm=norm, cmap=cmap)
     cb = fig.colorbar(sm, cax=cax, ticks=ticks, format=formatter)

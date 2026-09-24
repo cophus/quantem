@@ -210,7 +210,7 @@ def peaks_to_calibrated(
     # carry the scan calibration through, so maps keep their scale bar, and
     # record the detector-to-scan rotation so pattern-overlay plots can put
     # peaks back into the raw detector frame
-    for key in ("scan_sampling", "scan_units"):
+    for key in ("scan_sampling", "scan_units", "origins", "origin_ref"):
         if key in (peaks_px.metadata or {}):
             out.metadata[key] = peaks_px.metadata[key]
     out.metadata["rotation_ccw_deg"] = float(rotation_ccw_deg)
@@ -727,14 +727,34 @@ class DiffractionCalibration(AutoSerialize):
         self.metadata: dict = dict(metadata or {})
 
     def apply(self, peaks_px, name: str = "bragg_peaks_calibrated"):
-        """Calibrated (qx, qy) peaks from origin-corrected pixel peaks."""
-        return peaks_to_calibrated(
+        """Calibrated (qx, qy) peaks from origin-corrected pixel peaks.
+
+        Parameters
+        ----------
+        peaks_px : Vector
+            Origin-corrected peaks in detector pixels, from
+            :meth:`~quantem.diffraction.BraggVectors.correct_peak_origins`.
+        name : str, default="bragg_peaks_calibrated"
+            Name of the returned Vector.
+
+        Returns
+        -------
+        Vector
+            Peaks in 1/Angstroms, carrying the measured pixel size and the
+            scan calibration forward so plots downstream need neither passed
+            to them.
+        """
+        out = peaks_to_calibrated(
             peaks_px,
             self.pixel_size,
             rotation_ccw_deg=self.rotation_ccw_deg,
             ellipse=self.ellipse,
             name=name,
         )
+        # the measured pixel size replaces whatever the dataset was carrying
+        out.metadata["pixel_size"] = float(self.pixel_size)
+        out.metadata["pixel_size_units"] = "A^-1"
+        return out
 
     def rebin(self, factor: float) -> "DiffractionCalibration":
         """The same calibration for data binned by `factor` more than this one."""

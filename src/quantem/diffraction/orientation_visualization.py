@@ -429,8 +429,10 @@ def plot_pattern_matches(
     scalebar: bool = True,
     show_measured: bool = True,
     marker_scale: float = 250.0,
+    measured_scale: float | None = None,
+    measured_power: float = 0.5,
     marker: str | None = None,
-    transpose: bool = False,
+    transpose_plots: bool = False,
     axsize: tuple[float, float] = (3.1, 3.1),
 ):
     """Candidate matches side by side, py4DSTEM style.
@@ -464,10 +466,18 @@ def plot_pattern_matches(
         Matplotlib marker for the simulated peaks. The default is an open
         circle over a diffraction pattern, which leaves the measured disk
         visible inside it, and a plus over the gray measured peaks.
-    transpose : bool, default=False
-        By default rows are probe positions and columns are candidates.
-        True swaps them, giving one row per candidate across the positions,
-        which fits a few candidates and many positions on a page.
+    measured_scale : float | None
+        Marker area of the gray measured peaks; defaults to
+        ``1.5 * marker_scale``. The direct beam is far brighter than the
+        disks, so the areas are compressed by `measured_power` and floored,
+        which keeps the weak spots visible.
+    measured_power : float, default=0.5
+        Compression applied to the measured intensities before sizing.
+    transpose_plots : bool, default=False
+        Panel layout only, nothing in the data is transposed. By default
+        rows are probe positions and columns are candidates; True swaps
+        them, giving one row per candidate across the positions, which fits
+        a few candidates and many positions on a page.
     """
     import matplotlib.pyplot as plt
 
@@ -489,7 +499,7 @@ def plot_pattern_matches(
 
     panels = [(i, m) for i in range(len(oms)) for m in matches]
     n_pos, n_pan = len(positions), len(panels)
-    n_r, n_c = (n_pan, n_pos) if transpose else (n_pos, n_pan)
+    n_r, n_c = (n_pan, n_pos) if transpose_plots else (n_pos, n_pan)
     fig, axs = plt.subplots(
         n_r,
         n_c,
@@ -500,24 +510,38 @@ def plot_pattern_matches(
     if marker is None:
         marker = "o" if over_image else "+"
     ordinal = ["1st", "2nd", "3rd"] + [f"{k + 1}th" for k in range(3, 9)]
+
+    # one limit for every panel, so positions are directly comparable. A
+    # position holding only the direct beam has q_max of zero, which would
+    # collapse its axes, so the limit is taken over all of them together.
+    if q_max_plot is not None:
+        q_lim = float(q_max_plot)
+    elif dataset is not None and pixel_size is not None:
+        q_lim = dataset.shape[-1] / 2 * pixel_size
+    else:
+        q_all = [
+            np.hypot(peaks[rx, ry].array[:, ix[0]], peaks[rx, ry].array[:, ix[1]])
+            for rx, ry in positions
+        ]
+        q_max = max((float(q.max()) for q in q_all if q.size), default=0.0)
+        q_lim = 1.1 * q_max if q_max > 0 else 1.0
+
     for pi, (rx, ry) in enumerate(positions):
         data = peaks[rx, ry].array.copy()
         rc = data[:, [ix[0], ix[1]]] @ rot_back.T
         data[:, ix[0]] = rc[:, 0]
         data[:, ix[1]] = rc[:, 1]
+        # the direct beam outshines every disk, so scaling the areas by the
+        # brightest peak shrinks the real spots to nothing; normalize on the
+        # diffracted peaks instead, compress, and floor so none vanish
         w_meas = data[:, ix[2]].clip(min=0)
-        w_meas = w_meas / max(w_meas.max(), 1e-12)
-        if q_max_plot is None:
-            if dataset is not None and pixel_size is not None:
-                q_lim = dataset.shape[-1] / 2 * pixel_size
-            else:
-                qr = np.hypot(data[:, ix[0]], data[:, ix[1]])
-                q_lim = 1.1 * qr.max() if qr.size else 1.0
-        else:
-            q_lim = q_max_plot
+        q_meas = np.hypot(data[:, ix[0]], data[:, ix[1]])
+        w_ref = w_meas[q_meas > 0.05]
+        hi = float(np.percentile(w_ref, 95)) if w_ref.size else float(w_meas.max(initial=0.0))
+        w_meas = np.clip((w_meas / max(hi, 1e-12)) ** measured_power, 0.15, 1.0)
         for ci, (i_om, m) in enumerate(panels):
             om = oms[i_om]
-            ax = axs[ci, pi] if transpose else axs[pi, ci]
+            ax = axs[ci, pi] if transpose_plots else axs[pi, ci]
             if over_image:
                 H, W = dataset.shape[-2], dataset.shape[-1]
                 if origins is not None:
@@ -526,9 +550,16 @@ def plot_pattern_matches(
                     o_r, o_c = H / 2, W / 2
                 # pixel j has center (j - origin) * pixel_size; array edges
                 # sit half a pixel beyond the first/last centers
+                img = np.asarray(dataset.array[rx, ry], dtype=float)
+                img = np.clip(img, 0, None) ** power
+                # the direct beam is orders of magnitude above the disks, so
+                # autoscaling to its peak flattens everything else
+                vmax = float(np.percentile(img, 99.9))
                 ax.imshow(
-                    np.asarray(dataset.array[rx, ry]) ** power,
+                    img,
                     cmap="gray_r",
+                    vmin=float(np.percentile(img, 2.0)),
+                    vmax=vmax if vmax > 0 else None,
                     extent=(
                         (-0.5 - o_c) * pixel_size,
                         (W - 0.5 - o_c) * pixel_size,
@@ -540,13 +571,21 @@ def plot_pattern_matches(
                 ax.scatter(
                     data[:, ix[1]],
                     data[:, ix[0]],
-                    s=marker_scale * w_meas,
+                    s=(1.5 * marker_scale if measured_scale is None else measured_scale) * w_meas,
                     color="0.75",
                     lw=0,
                 )
-            sim = om.generate_pattern(rx, ry, match=m)
-            inten = sim["intensity"].numpy()
-            sim_rc = np.stack([sim["qx"].numpy(), sim["qy"].numpy()], axis=1) @ rot_back.T
+            # a position with too few peaks was never matched, and its stored
+            # orientation is still the identity; drawing that [001] pattern
+            # would look like a fit where none was attempted
+            matched = float(om.corr[rx, ry, m]) > 0
+            if om.computed is not None:
+                matched = matched and bool(om.computed[rx, ry])
+            inten = np.zeros(0)
+            if matched:
+                sim = om.generate_pattern(rx, ry, match=m)
+                inten = sim["intensity"].numpy()
+                sim_rc = np.stack([sim["qx"].numpy(), sim["qy"].numpy()], axis=1) @ rot_back.T
             if inten.size:
                 size = marker_scale * inten / inten.max()
                 color = colors[i_om % len(colors)]
@@ -576,12 +615,18 @@ def plot_pattern_matches(
             ax.set_yticks([])
             ax.set_aspect("equal")
             ax.set_title(
-                "%s %s\n(%d, %d)   corr = %.2f"
-                % (om.crystal.name, ordinal[m], rx, ry, float(om.corr[rx, ry, m])),
+                "%s %s\n(%d, %d)   %s"
+                % (
+                    om.crystal.name,
+                    ordinal[m],
+                    rx,
+                    ry,
+                    ("corr = %.2f" % float(om.corr[rx, ry, m])) if matched else "no match",
+                ),
                 fontsize=9,
             )
-            last_row = (ci == n_r - 1) if transpose else (pi == n_r - 1)
-            first_col = (pi == 0) if transpose else (ci == 0)
+            last_row = (ci == n_r - 1) if transpose_plots else (pi == n_r - 1)
+            first_col = (pi == 0) if transpose_plots else (ci == 0)
             if scalebar and last_row and first_col:
                 add_scalebar_to_ax(
                     ax,

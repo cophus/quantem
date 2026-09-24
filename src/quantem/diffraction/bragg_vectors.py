@@ -93,6 +93,7 @@ class BraggVectors(AutoSerialize):
         self.device = device
 
         self.peaks: Vector | None = None
+        self.calibration = None
         self.bvm: Dataset2d | None = None
 
         self.origin: np.ndarray | None = None
@@ -586,6 +587,10 @@ class BraggVectors(AutoSerialize):
         bv.metadata["origin_correction"] = {
             "origin_ref": (float(origin_ref[0]), float(origin_ref[1])),
         }
+        # the fitted origins travel with the peaks: plots that put a pattern
+        # behind the peaks need them to line the two up
+        peaks.metadata["origins"] = origins
+        peaks.metadata["origin_ref"] = (float(origin_ref[0]), float(origin_ref[1]))
         bv.compute_bvm()
         return bv
 
@@ -1364,19 +1369,163 @@ class BraggVectors(AutoSerialize):
 
     # ---- helpers ----
 
-    def _scan_calibration(self) -> dict:
-        """Scan step and units of the dataset, to travel with the peaks.
+    # ------------------------------------------------------------------
+    # detector calibration
+    # ------------------------------------------------------------------
 
-        Everything downstream draws its real-space scale bar from this, so
-        the step size is set once on the dataset rather than passed to every
-        plot. A dataset still in pixels records nothing.
+    def measure_origins(self, search_radius: float = 6.0, robust: bool = True, plot: bool = False):
+        """Fit the diffraction origin at every probe position.
+
+        The direct beam wanders with the probe (descan). The brightest peak
+        within `search_radius` of the detector centre gives the origin at
+        each position, and a plane fit over the scan smooths the result.
+
+        Parameters
+        ----------
+        search_radius : float, default=6.0
+            Radius in detector pixels searched around the centre.
+        robust : bool, default=True
+            Reject outliers before the plane fit.
+        plot : bool, default=False
+            Show the measured and fitted origins.
+
+        Returns
+        -------
+        np.ndarray
+            ``(scan_row, scan_col, 2)`` origins in detector pixels.
         """
-        sampling = np.atleast_1d(np.asarray(self.dataset.sampling, dtype=float))[:2]
-        units = list(self.dataset.units)[:2]
-        unit = str(units[0]).strip("b'\"") if units else ""
-        if unit.lower() in ("pixels", "px", "pixel", ""):
-            return {}
-        return {"scan_sampling": tuple(float(v) for v in sampling), "scan_units": unit}
+        from quantem.diffraction import calibration
+
+        return calibration.measure_origins(
+            self, search_radius=search_radius, robust=robust, plot=plot
+        )
+
+    def plot_origin_fit(self, origins, search_radius: float = 6.0):
+        """Measured origins, the plane fit, and their residual.
+
+        Parameters
+        ----------
+        origins : np.ndarray
+            ``(scan_row, scan_col, 2)`` origins from :meth:`measure_origins`.
+        search_radius : float, default=6.0
+            The radius used to measure them, drawn for reference.
+
+        Returns
+        -------
+        tuple
+            ``(fig, axs)``.
+        """
+        from quantem.diffraction import calibration
+
+        return calibration.plot_origin_fit(self, origins, search_radius=search_radius)
+
+    def calibrate(self, crystal, pixel_size_guess: float, **kwargs):
+        """Measure the reciprocal pixel size and the elliptic distortion.
+
+        Matches the radial distribution of the detected peaks against the
+        ring positions of a known crystal: a coarse scan over broadened
+        rings fixes the ring assignment even from a poor starting guess,
+        then the ellipse and the scale are refined in turn, and every ring is
+        checked separately. The result carries the evidence behind it and can
+        be saved and applied to another dataset, which is the route for a
+        strained sample: measure on a standard such as nanocrystalline gold,
+        save, and apply there.
+
+        Call this on origin-corrected peaks -- the rings must be concentric
+        before their radii mean anything.
+
+        Parameters
+        ----------
+        crystal : Crystal or list of Crystal
+            Reference structure(s) with structure factors calculated.
+        pixel_size_guess : float
+            Starting reciprocal pixel size, 1/Angstroms per detector pixel.
+            Recovered from a factor of two out in either direction.
+        rotation_ccw_deg : float, default=0.0
+            Diffraction-to-scan rotation, recorded for later use.
+        plot : bool, default=True
+            Show the ring comparison before and after.
+        **kwargs
+            Further arguments of
+            :func:`~quantem.diffraction.calibration.calibrate`, e.g.
+            `fit_ellipse`, `k_min`, `k_max`, `marker_size` and `figsize`.
+
+        Returns
+        -------
+        DiffractionCalibration
+            The measured calibration, also stored on :attr:`calibration`.
+            Save it with ``cal.save(path)`` and reload it with
+            :func:`~quantem.core.io.serialize.load`.
+
+        Raises
+        ------
+        ValueError
+            If no peaks have been detected.
+        """
+        from quantem.diffraction import calibration as _cal
+
+        if self.peaks is None:
+            raise ValueError("Run detect_disks() before calibrate().")
+        cal = _cal.calibrate(self.peaks, crystal, pixel_size_guess, **kwargs)
+        self.calibration = cal
+        return cal
+
+    def apply_calibration(self, calibration=None, name: str = "bragg_peaks_calibrated"):
+        """Calibrated peaks in 1/Angstroms from the detected pixel peaks.
+
+        Parameters
+        ----------
+        calibration : DiffractionCalibration, optional
+            The calibration to apply. None (default) uses the one measured by
+            :meth:`calibrate`, so a calibration loaded from a standard is
+            passed here instead.
+        name : str, default="bragg_peaks_calibrated"
+            Name of the returned Vector.
+
+        Returns
+        -------
+        Vector
+            Peaks in 1/Angstroms, carrying the pixel size, the fitted origins
+            and the scan calibration, so plots downstream need none of them
+            passed.
+
+        Raises
+        ------
+        ValueError
+            If no peaks have been detected, or no calibration is available.
+        """
+        if self.peaks is None:
+            raise ValueError("Run detect_disks() before apply_calibration().")
+        cal = calibration if calibration is not None else getattr(self, "calibration", None)
+        if cal is None:
+            raise ValueError(
+                "No calibration available: run calibrate() first, or pass one loaded from a standard."
+            )
+        return cal.apply(self.peaks, name=name)
+
+    def _scan_calibration(self) -> dict:
+        """Calibration of the dataset, to travel with the peaks.
+
+        The scan step and the detector pixel size are properties of the
+        measurement, so they are set once on the dataset and carried by the
+        peaks rather than passed to every plot. Axes still in pixels record
+        nothing for that half.
+        """
+        out: dict = {}
+        sampling = np.atleast_1d(np.asarray(self.dataset.sampling, dtype=float))
+        units = [str(u).strip("b'\"") for u in self.dataset.units]
+
+        scan_unit = units[0] if units else ""
+        if scan_unit.lower() not in ("pixels", "px", "pixel", ""):
+            out["scan_sampling"] = tuple(float(v) for v in sampling[:2])
+            out["scan_units"] = scan_unit
+
+        if sampling.size >= 4 and len(units) >= 4:
+            dp_unit = units[2]
+            if dp_unit.lower() not in ("pixels", "px", "pixel", ""):
+                out["pixel_size"] = float(sampling[2])
+                out["pixel_size_units"] = dp_unit
+        return out
 
     def _resolve_background_sigma(self, background_sigma: float | str | None) -> float | None:
         """Resolve the ``background_sigma`` argument to a value in pixels.

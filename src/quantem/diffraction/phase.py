@@ -37,6 +37,36 @@ from quantem.diffraction.defaults import (
 from quantem.diffraction.orientation import OrientationMap, position_mask
 
 
+def _majority_filter(phase: np.ndarray, radius: int) -> np.ndarray:
+    """Replace each position by the most common phase around it.
+
+    Unindexed positions (-1) take part, so an isolated crystal pixel in
+    vacuum is removed rather than spreading.
+
+    Parameters
+    ----------
+    phase : np.ndarray
+        ``(scan_row, scan_col)`` phase indices, -1 where unindexed.
+    radius : int
+        Half-width of the square neighbourhood in probe positions.
+
+    Returns
+    -------
+    np.ndarray
+        Filtered phase indices, same shape and dtype.
+    """
+    from scipy.ndimage import uniform_filter
+
+    labels = np.unique(phase)
+    votes = np.stack(
+        [
+            uniform_filter((phase == v).astype(float), size=2 * radius + 1, mode="nearest")
+            for v in labels
+        ]
+    )
+    return labels[votes.argmax(axis=0)]
+
+
 class PhaseMap(AutoSerialize):
     """Assign best-fit phases to every probe position.
 
@@ -72,6 +102,8 @@ class PhaseMap(AutoSerialize):
         self.cost_best: torch.Tensor | None = None
         self.phase_index: torch.Tensor | None = None
         self.reliability: torch.Tensor | None = None
+        self.diffracted_intensity: torch.Tensor | None = None
+        self.num_diffracted: torch.Tensor | None = None
 
     @classmethod
     def from_orientation_maps(cls, orientation_maps: list[OrientationMap]) -> "PhaseMap":
@@ -96,6 +128,8 @@ class PhaseMap(AutoSerialize):
         min_sim_intensity_rel: float | None = None,
         k_max: float | None = None,
         min_number_peaks: int | None = None,
+        min_diffracted_peaks: int = 2,
+        null_k_min: float = 0.05,
         progress_bar: bool = True,
     ) -> "PhaseMap":
         """Score all candidate subsets at every probe position.
@@ -140,6 +174,16 @@ class PhaseMap(AutoSerialize):
             structure factors happen to include many of them.
         k_max : float | None
             Restrict the comparison below this scattering vector.
+        min_diffracted_peaks : int, default=2
+            Null hypothesis: a position needs at least this many measured
+            peaks beyond `null_k_min` before any phase is assigned. Vacuum
+            and amorphous support carry the direct beam and little else, and
+            a crystal fit to that is noise; those positions are left
+            unindexed (`phase_index` of -1) and plot black.
+        null_k_min : float, default=0.05
+            Scattering vector (1/Angstroms) above which a measured peak
+            counts as diffracted. The default excludes the direct beam,
+            which sits at the origin after `correct_peak_origins`.
         """
         from scipy.optimize import nnls
 
@@ -167,6 +211,8 @@ class PhaseMap(AutoSerialize):
             min_sim_intensity_rel=float(min_sim_intensity_rel),
             k_max=k_max,
             min_number_peaks=int(min_number_peaks),
+            min_diffracted_peaks=int(min_diffracted_peaks),
+            null_k_min=float(null_k_min),
         )
         peaks = oms[0].peaks
         R, C = peaks.shape[0], peaks.shape[1]
@@ -184,6 +230,8 @@ class PhaseMap(AutoSerialize):
         weights_out = torch.zeros((R, C, F), dtype=torch.float64)
         reliability = torch.zeros((R, C), dtype=torch.float64)
         best_subset = torch.full((R, C), -1, dtype=torch.long)
+        diffracted = torch.zeros((R, C), dtype=torch.float64)
+        num_diffracted = torch.zeros((R, C), dtype=torch.long)
 
         active = position_mask(positions, (R, C))
         for om in oms:
@@ -195,6 +243,16 @@ class PhaseMap(AutoSerialize):
         for rx, ry in iterator:
             data = peaks[rx, ry].array
             if data.shape[0] < min_number_peaks:
+                continue
+            # null hypothesis: no diffracted signal, so no phase to decide.
+            # Vacuum and amorphous support carry the direct beam and nothing
+            # else, and the measured signal beyond it is the evidence that
+            # any crystal is present at all.
+            qr_meas = np.hypot(data[:, ix[0]], data[:, ix[1]])
+            beyond = qr_meas > null_k_min
+            diffracted[rx, ry] = float(data[beyond, ix[2]].clip(min=0).sum())
+            num_diffracted[rx, ry] = int(beyond.sum())
+            if int(beyond.sum()) < min_diffracted_peaks:
                 continue
             qxy = torch.as_tensor(data[:, ix[:2]], dtype=torch.float64)
             im = torch.as_tensor(data[:, ix[2]], dtype=torch.float64).clamp_min(0)
@@ -271,6 +329,8 @@ class PhaseMap(AutoSerialize):
 
         self.costs_single = costs_single
         self.cost_best = cost_best
+        self.diffracted_intensity = diffracted
+        self.num_diffracted = num_diffracted
         self.phase_weights = weights_out
         self.reliability = reliability
         self.best_subset = best_subset
@@ -280,7 +340,10 @@ class PhaseMap(AutoSerialize):
         w_phase = torch.zeros((R, C, n_maps), dtype=torch.float64)
         for f, (i_om, _) in enumerate(cands):
             w_phase[..., i_om] += weights_out[..., f]
+        # argmax over all-zero weights returns 0, which would label every
+        # position that was never fit as the first phase; mark them instead
         self.phase_index = w_phase.argmax(dim=-1)
+        self.phase_index[torch.isnan(cost_best)] = -1
         self.phase_fractions = w_phase / w_phase.sum(dim=-1, keepdim=True).clamp_min(1e-12)
         return self
 
@@ -319,10 +382,53 @@ class PhaseMap(AutoSerialize):
         self.metadata["dynamical_applied"] = dict(result.get("metadata", {}))
         return self
 
+    def signal_confidence(
+        self,
+        signal_range: tuple[float, float] | str = "auto",
+    ) -> np.ndarray:
+        """Confidence in [0, 1] that a crystal is present, from the data alone.
+
+        The measured intensity beyond the direct beam, scaled to [0, 1]. This
+        is the null-hypothesis test made visible: vacuum and amorphous support
+        diffract nothing, so they score zero however well some orientation
+        happens to correlate. Positions the null hypothesis left unindexed in
+        :meth:`fit` are forced to zero.
+
+        Use it to fade the phase map and the orientation maps together::
+
+            conf = pm.signal_confidence()
+            mask_a = (pm.phase_index.numpy() == 0) * conf
+
+        Parameters
+        ----------
+        signal_range : tuple | "auto", default="auto"
+            Diffracted intensity mapped to 0 ... 1. "auto" spans zero to the
+            95th percentile over the indexed positions.
+
+        Returns
+        -------
+        np.ndarray
+            ``(scan_row, scan_col)`` confidence in [0, 1].
+        """
+        if self.diffracted_intensity is None:
+            raise ValueError("Run fit() before signal_confidence().")
+        sig = np.nan_to_num(self.diffracted_intensity.numpy())
+        indexed = self.phase_index.numpy() >= 0
+        if isinstance(signal_range, str):
+            vals = sig[indexed]
+            hi = float(np.percentile(vals, 95)) if vals.size else 1.0
+            lo, hi = 0.0, max(hi, 1e-12)
+        else:
+            lo, hi = signal_range
+        return ((sig - lo) / max(hi - lo, 1e-12)).clip(0, 1) * indexed
+
     def plot_phase(
         self,
         phase_colors: np.ndarray | None = None,
-        reliability_range: tuple[float, float] = (0.0, 0.1),
+        shade_by: str = "signal",
+        shade_range: tuple[float, float] | str = "auto",
+        majority_filter: int = 0,
+        reliability_range: tuple[float, float] | None = None,
         scalebar: dict | str | None = "auto",
         figax=None,
     ):
@@ -333,8 +439,30 @@ class PhaseMap(AutoSerialize):
         phase_colors : np.ndarray | None
             One RGB color per phase; defaults to the shared palette used by
             the pattern overlay plots (gold, light blue, ...).
-        reliability_range : tuple, default=(0.0, 0.1)
-            Reliability values mapped to black ... full color.
+        shade_by : {"signal", "reliability", "none"}, default="signal"
+            What the brightness means. "signal" fades each position by the
+            measured diffracted intensity (see :meth:`signal_confidence`), so
+            vacuum and amorphous support go black and the map shows where
+            crystals actually are. "reliability" uses the cost gap to the best
+            model without the winning crystal, which answers a different
+            question -- which phase, given that there is one -- and carries no
+            information about whether anything is there. "none" draws every
+            indexed position at full color.
+        shade_range : tuple | "auto", default="auto"
+            Values mapped to black ... full color. "auto" takes a high
+            percentile over the indexed positions, since the absolute scale
+            depends on the data.
+        majority_filter : int, default=0
+            Radius in probe positions of a majority filter applied to the
+            phase decision for display only; the stored decision is
+            untouched. 1 replaces each position by the most common phase in
+            its 3x3 neighbourhood, which removes isolated single-pixel
+            phases without moving a real boundary. Orientation smoothing
+            does not do this: it averages orientations within one phase and
+            leaves the phase assignment alone.
+        reliability_range : tuple | None
+            Backwards-compatible shortcut: setting it selects
+            ``shade_by="reliability"`` with this range.
         scalebar : dict | "auto" | None
             Real-space scale bar. "auto" (the default) takes the scan step
             and units carried from the dataset by the orientation maps; a
@@ -351,10 +479,35 @@ class PhaseMap(AutoSerialize):
         assert self.phase_index is not None and self.reliability is not None
         if phase_colors is None:
             phase_colors = DEFAULT_PHASE_COLORS[: len(self.names)]
-        lo, hi = reliability_range
-        rel = np.nan_to_num(self.reliability.numpy(), nan=0.0)
-        alpha = ((rel - lo) / (hi - lo)).clip(0, 1)
-        rgb = phase_colors[self.phase_index.numpy()] * alpha[..., None]
+        if reliability_range is not None:
+            shade_by, shade_range = "reliability", reliability_range
+        phase = self.phase_index.numpy()
+        indexed = phase >= 0
+        if majority_filter > 0:
+            phase = _majority_filter(phase, int(majority_filter))
+        if shade_by == "signal":
+            alpha = self.signal_confidence(shade_range)
+            lo, hi = 0.0, 1.0
+            cbar_label = "diffracted signal"
+        elif shade_by == "reliability":
+            rel = np.nan_to_num(self.reliability.numpy(), nan=0.0)
+            if isinstance(shade_range, str):
+                vals = rel[indexed]
+                hi = float(np.percentile(vals, 98)) if vals.size else 1.0
+                lo, hi = 0.0, max(hi, 1e-12)
+            else:
+                lo, hi = shade_range
+            alpha = ((rel - lo) / max(hi - lo, 1e-12)).clip(0, 1) * indexed
+            cbar_label = "reliability"
+        elif shade_by == "none":
+            alpha = indexed.astype(float)
+            lo, hi = 0.0, 1.0
+            cbar_label = "indexed"
+        else:
+            raise ValueError(
+                f"shade_by must be 'signal', 'reliability' or 'none', got {shade_by!r}"
+            )
+        rgb = phase_colors[np.where(indexed, phase, 0)] * alpha[..., None]
 
         if figax is None:
             fig, ax = plt.subplots(figsize=(9, 4.5))
@@ -393,5 +546,5 @@ class PhaseMap(AutoSerialize):
                 cb.set_ticks([])
             else:
                 cb.set_ticks([lo, hi])
-                cb.set_label("reliability", fontsize=9)
+                cb.set_label(cbar_label, fontsize=9)
         return fig, ax

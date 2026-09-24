@@ -27,6 +27,7 @@ import torch
 from ase import Atoms
 from ase.data import chemical_symbols
 
+from quantem.core.io.serialize import AutoSerialize
 from quantem.diffraction.defaults import SIGMA_EXCITATION
 from quantem.diffraction.rotations import qrotate, symmetry_quaternions
 
@@ -175,7 +176,7 @@ def electron_scattering_factor(numbers: torch.Tensor, g: torch.Tensor) -> torch.
     return (a * (2.0 + b * g2) / (1.0 + b * g2) ** 2).sum(dim=-1)
 
 
-class Crystal:
+class Crystal(AutoSerialize):
     """A crystal structure with kinematical diffraction methods.
 
     Build with `from_ase` or `from_cif`, then call

@@ -461,6 +461,20 @@ class AutoSerialize:
             subgroup.attrs["_rng_type"] = "torch.Generator"
             # Don't try to save the state - it's not essential for core functionality
 
+        elif type(value).__module__.startswith("ase.") and type(value).__name__ == "Atoms":
+            # An ase.Atoms is fully defined by these four arrays; storing them
+            # keeps the file readable and avoids pickling an ase version in.
+            subgroup = group.require_group(name)
+            subgroup.attrs["_ase_atoms"] = True
+            self._write_ndarray(
+                subgroup, "numbers", np.asarray(value.get_atomic_numbers()), compressors
+            )
+            self._write_ndarray(
+                subgroup, "positions", np.asarray(value.get_positions()), compressors
+            )
+            self._write_ndarray(subgroup, "cell", np.asarray(value.get_cell()), compressors)
+            self._write_ndarray(subgroup, "pbc", np.asarray(value.get_pbc()), compressors)
+
         else:
             # Fallback: dill-serialize + gzip-compress
             print(f"falling back in serialize for {name} of type {type(value)}")
@@ -576,8 +590,23 @@ class AutoSerialize:
                 continue
             subgrp = AutoSerialize._get_group(group, name)
 
+            # ase.Atoms group
+            if subgrp.attrs.get("_ase_atoms"):
+                from ase import Atoms
+
+                atoms = Atoms(
+                    numbers=AutoSerialize._read_array_np(subgrp, "numbers"),
+                    positions=AutoSerialize._read_array_np(subgrp, "positions"),
+                    cell=AutoSerialize._read_array_np(subgrp, "cell"),
+                    pbc=AutoSerialize._read_array_np(subgrp, "pbc"),
+                )
+                if type(atoms) in skip_types:
+                    continue
+                setattr(obj, name, atoms)
+                set_attrs.add(name)
+
             # torch tensor group
-            if subgrp.attrs.get("_torch_tensor"):
+            elif subgrp.attrs.get("_torch_tensor"):
                 data = AutoSerialize._read_array_np(subgrp, "tensor").tobytes()
                 buf = io.BytesIO(data)
                 tensor = torch.load(buf, map_location="cpu", weights_only=False)

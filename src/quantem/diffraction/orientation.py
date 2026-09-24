@@ -50,7 +50,6 @@ from quantem.diffraction.rotations import (
     quat_from_zone_axis,
     sample_zone_axes,
     symmetry_aligned,
-    symmetry_reduced_zone_angles,
 )
 
 
@@ -274,6 +273,7 @@ class OrientationMap(AutoSerialize):
         # results
         self.quats: torch.Tensor | None = None
         self.corr: torch.Tensor | None = None
+        self.corr_residual: torch.Tensor | None = None
         self.corr_second: torch.Tensor | None = None
         self.reliability: torch.Tensor | None = None
         self.mirror: torch.Tensor | None = None
@@ -752,6 +752,39 @@ class OrientationMap(AutoSerialize):
         out = torch.zeros((self.shell_radii.shape[0], self.num_gamma), dtype=torch.float64)
         return self._deposit_polar(qr, qphi, amp, out)
 
+    def _grid_quats(self, flat_idx: torch.Tensor, Z: int, G: int, n_ch: int) -> torch.Tensor:
+        """Library orientations at flat (channel, zone, gamma) indices.
+
+        No subpixel refinement: these are used only to test whether two
+        candidates are the same orientation, where the grid step is far
+        finer than the separation being tested.
+
+        Parameters
+        ----------
+        flat_idx : torch.Tensor
+            ``(..., )`` indices into the flattened ``(ch, Z, G)`` correlation.
+
+        Returns
+        -------
+        torch.Tensor
+            ``(..., 4)`` quaternions.
+        """
+        idx = flat_idx.cpu()
+        ch = idx // (Z * G)
+        z = (idx // G) % Z
+        g = idx % G
+        q_zone = self.zone_quats[z]
+        gamma = self.gamma[g].clone()
+        is_mirror = ch == 1
+        if n_ch > 1:
+            q_flip = torch.tensor([0.0, 1.0, 0.0, 0.0], dtype=torch.float64)
+            q_zone = torch.where(is_mirror[..., None], qmult(q_flip, q_zone), q_zone)
+            gamma = torch.where(is_mirror, -gamma - np.pi, gamma)
+        half = gamma / 2
+        zeros = torch.zeros_like(half)
+        q_spin = torch.stack((torch.cos(half), zeros, zeros, torch.sin(half)), dim=-1)
+        return qmult(q_spin, q_zone)
+
     def _polar_images(self, arrays: list[np.ndarray], ix: list[int]) -> torch.Tensor:
         """Sparse polar images (B, S, G) of a batch of measured patterns,
         deposited in one call."""
@@ -781,6 +814,8 @@ class OrientationMap(AutoSerialize):
         include_mirror: bool = True,
         min_number_peaks: int | None = None,
         min_angle_between_matches_deg: float = 15.0,
+        suppress_matched: float = 1.0,
+        top_k_matches: int = 256,
         subpixel_gamma: bool = True,
         subpixel_zone: bool = True,
         min_detector_fraction: float = 0.3,
@@ -821,7 +856,23 @@ class OrientationMap(AutoSerialize):
         min_number_peaks : int | None
             Skip positions with fewer detected peaks (including the direct
             beam); defaults to MIN_NUMBER_PEAKS (5).
+        suppress_matched : float, default=1.0
+            Fraction of each accepted match subtracted from the measured
+            polar image before the next match is sought, so later matches
+            fit the peaks earlier ones leave unexplained. 1.0 removes the
+            matched component exactly; 0 disables the deflation and leaves
+            `min_angle_between_matches_deg` as the only thing separating the
+            matches, which lets two of them index the same peaks. Only
+            meaningful with `num_matches` above 1. The deflation steers the
+            search only: `corr` scores every match against the pattern as
+            measured, so the matches stay comparable, and `corr_residual`
+            holds the score against the residual each one actually saw.
         min_angle_between_matches_deg : float, default=15.0
+            Minimum separation between matches, applied to the zone axis and
+            the in-plane angle together: a candidate is rejected only when it
+            is within this angle of an earlier match in both. Two grains
+            sharing a zone axis but rotated in plane past this angle are
+            therefore kept as separate matches.
             Exclusion radius (degrees, zone-axis distance) around earlier
             matches, both for later matches and for the second-best score
             used in `reliability`.
@@ -842,6 +893,8 @@ class OrientationMap(AutoSerialize):
             include_mirror=bool(include_mirror),
             min_number_peaks=int(min_number_peaks),
             min_angle_between_matches_deg=float(min_angle_between_matches_deg),
+            suppress_matched=float(suppress_matched),
+            top_k_matches=int(top_k_matches),
             subpixel_gamma=bool(subpixel_gamma),
             subpixel_zone=bool(subpixel_zone),
             min_detector_fraction=float(min_detector_fraction),
@@ -857,22 +910,14 @@ class OrientationMap(AutoSerialize):
         quats = torch.zeros((R, C, M, 4), dtype=torch.float64)
         quats[..., 0] = 1.0
         corr_out = torch.zeros((R, C, M), dtype=torch.float64)
+        corr_res = torch.zeros((R, C, M), dtype=torch.float64)
         corr_second = torch.zeros((R, C), dtype=torch.float64)
         mirror_out = torch.zeros((R, C, M), dtype=torch.bool)
 
         fields = peaks.fields
         ix = [fields.index(f) for f in ("qx", "qy", "intensity")]
 
-        # zone-pair angular distances for the exclusion ball around matches,
-        # minimized over the matching symmetry: a redundant library
-        # (hemisphere fallback, pseudo-symmetry) holds symmetry copies of
-        # every zone, and those must not count as the "second best" match
         dtype = getattr(self, "dtype", torch.float64)
-        zone_ang = (
-            symmetry_reduced_zone_angles(self.zone_axes, self.crystal.sym_quats_matching)
-            .to(dtype)
-            .to(device)
-        )  # (Z, Z)
 
         plan_fft = self.plan_fft  # (Z, S, G) complex
         wanted = position_mask(positions, (R, C))
@@ -901,51 +946,91 @@ class OrientationMap(AutoSerialize):
                 .to(dtype)
                 .to(device)
             )
-            norms = torch.linalg.norm(im_stack.reshape(len(batch), -1), dim=1).clamp_min(1e-12)
+            B = im_stack.shape[0]
             with warnings.catch_warnings():
                 # torch's MPS FFT emits an internal out-tensor resize notice
                 warnings.simplefilter("ignore", UserWarning)
                 im_fft = torch.fft.fft(im_stack, dim=-1)  # (B, S, G)
-
-            # contract shells: (B, Z, G) per channel
-            cc = torch.einsum("zsg,bsg->bzg", plan_fft, im_fft)
-            channels = [cc]
-            if include_mirror:
-                channels.append(torch.einsum("zsg,bsg->bzg", plan_fft, torch.conj(im_fft)))
-            corr = torch.fft.ifft(torch.stack(channels, dim=1), dim=-1).real
-            # normalize: library slices are unit vectors, so dividing by the
-            # experimental norm makes corr a cosine similarity in [0, 1]
-            corr = corr / norms[:, None, None, None]
-            if self.plan_norm_shift is not None:
-                # square-detector correction: renormalize by the on-detector
-                # template norm at each in-plane shift, and suppress
-                # rotations where most of the template is unmeasurable
-                n_ch = corr.shape[1]
-                corr = corr / self.plan_norm_shift[None, :n_ch].clamp_min(1e-3)
-                corr = corr.masked_fill(
-                    self.plan_frac_shift[None, :n_ch] < min_detector_fraction, 0.0
-                )
-            # corr: (B, ch, Z, G)
-            B = corr.shape[0]
+            # frequency ramp used to roll a template to an in-plane angle
+            k_ramp = torch.fft.fftfreq(G, d=1.0 / G).to(im_fft.dtype).to(device)
 
             for m in range(M):
-                if m > 0:
-                    # suppress zones near earlier matches, per pattern
-                    for b in range(B):
-                        for mm in range(m):
-                            rx, ry = batch[b]
-                            # zone index of previous match not stored; use angle
-                            # to previous zone axis
-                            zprev = self._zprev[b][mm]
-                            corr[
-                                b, :, zone_ang[zprev] < min_angle_between_matches_deg, :
-                            ] = -torch.inf
-                flat_idx = corr.reshape(B, -1).argmax(dim=1)
+                norms = torch.linalg.norm(
+                    torch.fft.ifft(im_fft, dim=-1).real.reshape(B, -1), dim=1
+                ).clamp_min(1e-12)
+                # contract shells: (B, Z, G) per channel
+                cc = torch.einsum("zsg,bsg->bzg", plan_fft, im_fft)
+                channels = [cc]
+                if include_mirror:
+                    channels.append(torch.einsum("zsg,bsg->bzg", plan_fft, torch.conj(im_fft)))
+                corr_raw = torch.fft.ifft(torch.stack(channels, dim=1), dim=-1).real
+                # normalize: library slices are unit vectors, so dividing by the
+                # experimental norm makes corr a cosine similarity in [0, 1]
+                corr = corr_raw / norms[:, None, None, None]
+                if self.plan_norm_shift is not None:
+                    # square-detector correction: renormalize by the on-detector
+                    # template norm at each in-plane shift, and suppress
+                    # rotations where most of the template is unmeasurable
+                    n_ch = corr.shape[1]
+                    corr = corr / self.plan_norm_shift[None, :n_ch].clamp_min(1e-3)
+                    corr = corr.masked_fill(
+                        self.plan_frac_shift[None, :n_ch] < min_detector_fraction, 0.0
+                    )
+                # corr: (B, ch, Z, G)
+                if m == 0:
+                    # the deflation below changes the image every match, so
+                    # keep the correlation against the pattern as measured:
+                    # selection uses the residual, the reported score does not
+                    corr_full = corr
                 n_ch = corr.shape[1]
+                flat = corr.reshape(B, -1)
+                if M > 1:
+                    # Rank the candidates and walk down until one is a
+                    # genuinely different orientation from every earlier
+                    # match. The test is the full misorientation, reduced by
+                    # crystal symmetry: neither the zone axis nor the in-plane
+                    # angle alone can tell a symmetry copy (same orientation,
+                    # different library entry) from two grains sharing a zone
+                    # axis but rotated in plane, and those must be treated
+                    # oppositely.
+                    K = min(flat.shape[1], top_k_matches)
+                    top_v, top_i = flat.topk(K, dim=1)
+                    q_top = self._grid_quats(top_i, Z, G, n_ch)  # (B, K, 4)
+                    keep = torch.zeros((B, K), dtype=torch.bool)
+                    if m == 0:
+                        keep[:, 0] = True
+                    else:
+                        ok = torch.ones((B, K), dtype=torch.bool)
+                        for mm in range(m):
+                            q_prev = self._qprev[mm]  # (B, 4)
+                            ang = misorientation_angle_deg(
+                                q_prev[:, None, :].expand(-1, K, -1).reshape(-1, 4),
+                                q_top.reshape(-1, 4),
+                                self.crystal.sym_quats_matching,
+                            ).reshape(B, K)
+                            ok &= ang >= min_angle_between_matches_deg
+                        ok &= torch.isfinite(top_v.cpu())
+                        first = torch.where(
+                            ok.any(dim=1), ok.double().argmax(dim=1), torch.full((B,), -1)
+                        )
+                        for b in range(B):
+                            if first[b] >= 0:
+                                keep[b, int(first[b])] = True
+                    sel = torch.where(
+                        keep.any(dim=1),
+                        keep.double().argmax(dim=1),
+                        torch.zeros(B, dtype=torch.long),
+                    ).to(flat.device)
+                    flat_idx = top_i.gather(1, sel[:, None]).squeeze(1)
+                    invalid = ~keep.any(dim=1).to(flat.device)
+                else:
+                    flat_idx = flat.argmax(dim=1)
+                    invalid = torch.zeros(B, dtype=torch.bool, device=flat.device)
                 ch_i = flat_idx // (Z * G)
                 z_i = (flat_idx // G) % Z
                 g_i = flat_idx % G
-                c_val = corr.reshape(B, -1).gather(1, flat_idx[:, None]).squeeze(1)
+                c_val = flat.gather(1, flat_idx[:, None]).squeeze(1)
+                c_val = c_val.masked_fill(invalid, -torch.inf)
 
                 gamma = gamma_grid[g_i.cpu()].clone()
                 if subpixel_gamma:
@@ -1001,33 +1086,86 @@ class OrientationMap(AutoSerialize):
                 q_spin = torch.stack((torch.cos(half), zeros, zeros, torch.sin(half)), dim=-1)
                 q = qmult(q_spin, q_zone)
 
+                # score every match against the pattern as measured, so the
+                # matches are comparable with each other and across positions
+                c_report = corr_full.reshape(B, -1).gather(1, flat_idx[:, None]).squeeze(1)
+                c_report = c_report.masked_fill(invalid, -torch.inf)
                 for b, (rx, ry) in enumerate(batch):
                     if torch.isfinite(c_val[b]):
                         quats[rx, ry, m] = q[b]
-                        corr_out[rx, ry, m] = c_val[b].cpu().double()
+                        corr_out[rx, ry, m] = c_report[b].cpu().double()
+                        corr_res[rx, ry, m] = c_val[b].cpu().double()
                         mirror_out[rx, ry, m] = bool(is_mirror[b])
 
                 if m == 0:
-                    # second-best score outside the exclusion ball around the
-                    # best zone axis -> reliability = corr - corr_second
-                    far = zone_ang[z_i] >= min_angle_between_matches_deg  # (B, Z)
-                    c2 = (
-                        corr.masked_fill(~far[:, None, :, None], -torch.inf)
-                        .reshape(B, -1)
-                        .amax(dim=1)
+                    # second-best score at an orientation genuinely different
+                    # from the best one -> reliability = corr - corr_second.
+                    # Same misorientation test, so a symmetry copy of the
+                    # winner never counts as the runner-up, while a real
+                    # in-plane degeneracy does.
+                    K2 = min(corr.reshape(B, -1).shape[1], top_k_matches)
+                    tv, ti = corr.reshape(B, -1).topk(K2, dim=1)
+                    q_t2 = self._grid_quats(ti, Z, G, n_ch)
+                    q_best = self._grid_quats(flat_idx[:, None], Z, G, n_ch)[:, 0]
+                    ang2 = misorientation_angle_deg(
+                        q_best[:, None, :].expand(-1, K2, -1).reshape(-1, 4),
+                        q_t2.reshape(-1, 4),
+                        self.crystal.sym_quats_matching,
+                    ).reshape(B, K2)
+                    far2 = (ang2 >= min_angle_between_matches_deg) & torch.isfinite(tv.cpu())
+                    c2 = torch.where(
+                        far2.any(dim=1),
+                        tv.cpu().double().masked_fill(~far2, -torch.inf).amax(dim=1),
+                        torch.full((B,), -torch.inf, dtype=torch.float64),
                     )
                     for b, (rx, ry) in enumerate(batch):
                         if torch.isfinite(c2[b]):
-                            corr_second[rx, ry] = c2[b].cpu().double()
+                            corr_second[rx, ry] = c2[b]
 
                 if M > 1:
                     if m == 0:
-                        self._zprev = [[] for _ in range(B)]
-                    for b in range(B):
-                        self._zprev[b].append(int(z_i[b]))
+                        self._qprev = []
+                    self._qprev.append(q.clone())
+
+                if M > 1 and m < M - 1 and suppress_matched > 0:
+                    # Deflate the matched template out of the measured polar
+                    # image, so the next match sees only what this one leaves
+                    # unexplained. Without this, the exclusion ball keeps the
+                    # next zone axis far away in orientation but nothing stops
+                    # it from being fitted to the same peaks -- two grains in
+                    # one probe then index as one, and the second match is a
+                    # different view of the first.
+                    #
+                    # The templates are unit vectors, so the amount of this
+                    # template present in the image is its raw inner product,
+                    # read off the un-normalized correlation at the winning
+                    # (zone, in-plane angle). Subtracting that multiple is the
+                    # matching-pursuit step and removes it exactly.
+                    b_ar = torch.arange(B, device=device)
+                    alpha = suppress_matched * corr_raw[b_ar, ch_i, z_i, g_i].clamp_min(0).to(
+                        im_fft.dtype
+                    )
+                    # roll the template to the matched in-plane angle: a shift
+                    # of g samples is a linear phase on its transform
+                    phase = torch.exp(
+                        -2j * np.pi * k_ramp[None, :] * g_i[:, None].to(k_ramp.dtype) / G
+                    )
+                    t_fft = torch.conj(plan_fft[z_i]) * phase[:, None, :]  # (B, S, G)
+                    if include_mirror:
+                        # the mirrored template is gamma -> -gamma, a conjugate
+                        # in the transform, and its own roll
+                        t_mir = torch.conj(t_fft)
+                        t_fft = torch.where((ch_i == 1)[:, None, None].to(device), t_mir, t_fft)
+                    im_fft = im_fft - alpha[:, None, None] * t_fft
+                    # measured intensity is non-negative; keep it that way
+                    im_real = torch.fft.ifft(im_fft, dim=-1).real.clamp_min(0)
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", UserWarning)
+                        im_fft = torch.fft.fft(im_real.to(dtype), dim=-1)
 
         self.quats = quats
         self.corr = corr_out
+        self.corr_residual = corr_res
         self.corr_second = corr_second
         self.reliability = corr_out[..., 0] - corr_second
         self.mirror = mirror_out
@@ -1201,10 +1339,13 @@ class OrientationMap(AutoSerialize):
             grid robustness).
         neighbor_rescue : bool, default=True
             Second pass over positions whose best match disagrees with every
-            neighbor by more than rescue_threshold_deg: re-refine from each
-            distinct neighbor orientation and keep the highest-scoring
-            result (score = total paired measured intensity). Repairs
-            isolated wrong local optima such as near-degenerate variants.
+            neighbor by more than rescue_threshold_deg: re-refine from every
+            distinct candidate orientation -- all matches of all eight
+            neighbors, and this position's own remaining matches -- and keep
+            the highest-scoring result (score = total paired measured
+            intensity). Repairs isolated wrong local optima such as
+            near-degenerate variants, and probe positions straddling two
+            grains, where the correct orientation is often the second match.
         rescue_threshold_deg : float, default=2.0
             Minimum-neighbor misorientation that triggers the rescue pass.
         """
@@ -1460,19 +1601,31 @@ class OrientationMap(AutoSerialize):
                 best_q = self.quats[rx, ry, 0]
                 best_s = float(scores[rx, ry])
                 cands = []
+
+                def _add(qn, cands=cands):
+                    if all(
+                        float(misorientation_angle_deg(qn, c, self.crystal.sym_quats)) > 0.5
+                        for c in cands
+                    ):
+                        cands.append(qn)
+
+                # where two grains overlap in one probe, the right orientation
+                # is often this position's own second match rather than the
+                # first, so try every candidate here as well as every
+                # candidate of every neighbour
+                for m in range(1, M):
+                    if self.corr[rx, ry, m] > 0:
+                        _add(self.quats[rx, ry, m])
                 for dr in (-1, 0, 1):
                     for dc in (-1, 0, 1):
                         nr, nc = rx + dr, ry + dc
                         if (dr == 0 and dc == 0) or not (0 <= nr < R and 0 <= nc < C):
                             continue
-                        if self.corr[nr, nc, 0] <= 0:
-                            continue  # neighbour carries no match (never run, or skipped)
-                        qn = self.quats[nr, nc, 0]
-                        if all(
-                            float(misorientation_angle_deg(qn, c, self.crystal.sym_quats)) > 0.5
-                            for c in cands
-                        ):
-                            cands.append(qn)
+                        for m in range(M):
+                            # neighbour match absent (never run, or skipped)
+                            if self.corr[nr, nc, m] <= 0:
+                                continue
+                            _add(self.quats[nr, nc, m])
                 for qc in cands:
                     q, sc = refine_single(qc.clone(), q_exp, w_exp)
                     if sc > best_s * 1.02:
@@ -1481,6 +1634,8 @@ class OrientationMap(AutoSerialize):
                     n_rescued += 1
                 self.quats[rx, ry, 0] = best_q
                 scores[rx, ry] = best_s
+            self.metadata["refine"]["n_retried"] = len(retry)
+            self.metadata["refine"]["n_rescued"] = int(n_rescued)
         return self
 
     # ------------------------------------------------------------------
