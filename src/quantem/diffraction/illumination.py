@@ -109,7 +109,26 @@ def averaged_gaussian_intensity_envelope(
     c, a, b = excitation_coefficients(g_lab, energy_ev, precession_deg, semiconv_mrad)
     if precession_deg <= 0 and semiconv_mrad <= 0:
         return np.exp(-0.5 * (c / sigma) ** 2), c, a, b
-    return gaussian_envelope(c, a, b, sigma), c, a, b
+    # A reflection farther from the Ewald sphere than the illumination sweeps
+    # it, plus six envelope widths, is never excited (the envelope there is
+    # below 1e-8). At k_max = 2 that is nearly all of them, and the quadrature
+    # below costs 400 Bessel evaluations per reflection.
+    env = np.zeros_like(c)
+    live = np.abs(c) < a + b + 6.0 * sigma
+    if live.any():
+        if semiconv_mrad <= 0:
+            # a pure precession ring has the fast Bessel series the orientation
+            # plan uses; the disk quadrature is needed only with convergence
+            env[live] = (
+                gaussian_envelope_ring_torch(
+                    torch.as_tensor(c[live]), torch.as_tensor(a[live]), sigma
+                )
+                .cpu()
+                .numpy()
+            )
+        else:
+            env[live] = gaussian_envelope(c[live], a[live], b[live], sigma)
+    return env, c, a, b
 
 
 def ring_disk_quadrature(r: float, R: float, n_phi: int = 128, n_r: int = 8, n_psi: int = 32):

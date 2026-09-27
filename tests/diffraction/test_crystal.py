@@ -331,9 +331,7 @@ def test_projected_order_matches_pattern_degeneracy():
     n = bcc.projected_rotation_order(axis.numpy())
     q = quat_from_zone_axis(axis)
     beam = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
-    spun = qnormalize(
-        qmult(quat_from_axis_angle(beam, torch.tensor(2 * np.pi / n)), q)
-    )
+    spun = qnormalize(qmult(quat_from_axis_angle(beam, torch.tensor(2 * np.pi / n)), q))
 
     a = bcc.generate_pattern(q, energy_ev=200e3, sigma_excitation=0.02)
     b = bcc.generate_pattern(spun, energy_ev=200e3, sigma_excitation=0.02)
@@ -346,3 +344,145 @@ def test_projected_order_matches_pattern_degeneracy():
     assert float(dmin.max()) < 1e-6
     rel = (a["intensity"] - b["intensity"][j]).abs().max() / a["intensity"].max()
     assert float(rel) < 1e-6
+
+
+_LFSO_PRISTINE_CIF = """data_
+_cell_length_a 5.1749
+_cell_length_b 8.9426
+_cell_length_c 5.1721
+_cell_angle_alpha 90
+_cell_angle_beta 109.697
+_cell_angle_gamma 90
+_symmetry_space_group_name_H-M C2/m
+loop_
+_symmetry_equiv_pos_as_xyz
+ 'x, y, z'
+ '-x, y, -z'
+ 'x, -y, z'
+ '-x, -y, -z'
+ 'x+1/2, y+1/2, z'
+ '-x+1/2, y+1/2, -z'
+ 'x+1/2, -y+1/2, z'
+ '-x+1/2, -y+1/2, -z'
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+_atom_site_occupancy
+Fe1 Fe 0 0.3380 0.5 0.389
+Li1 Li 0 0.3380 0.5 0.611
+Sb1 Sb 0 0 0.5 0.360
+Fe2 Fe 0 0 0.5 0.640
+Li2 Li 0 0.5 0 1
+Li3 Li 0 0.1662 0 1
+O1 O 0.7359 0.5 0.2706 1
+O2 O 0.7665 0.8415 0.2722 1
+"""
+
+
+def test_from_cif_keeps_partial_occupancy(tmp_path):
+    # ASE reads a shared site as its majority species alone: this structure
+    # would load with no Sb at all, and Sb is its strongest scatterer
+    path = tmp_path / "lfso_pristine.cif"
+    path.write_text(_LFSO_PRISTINE_CIF)
+    xtl = Crystal.from_cif(path, verbose=False)
+    content: dict[str, float] = {}
+    for s, f in zip(xtl.atoms.get_chemical_symbols(), xtl.occupancy.numpy()):
+        content[s] = content.get(s, 0.0) + float(f)
+    assert content["Sb"] == pytest.approx(0.72, abs=1e-6)
+    assert content["Fe"] == pytest.approx(2.836, abs=1e-6)
+    assert content["Li"] == pytest.approx(8.444, abs=1e-6)
+    assert content["O"] == pytest.approx(12.0, abs=1e-6)
+    assert xtl.spacegroup.startswith("C2/m")
+
+
+def test_pseudo_symmetry_names_the_breaking_reflection(tmp_path):
+    # the three 120 degree twin variants of the honeycomb-ordered cell differ
+    # only by the (020) superstructure reflection at ~0.07 of the strongest;
+    # at the default tolerance that rejects the layered parent, and the
+    # report must name the reflection responsible
+    path = tmp_path / "lfso_pristine.cif"
+    path.write_text(_LFSO_PRISTINE_CIF)
+    strict = Crystal.from_cif(path, verbose=False)
+    rep = strict.pseudo_symmetry_report
+    assert rep["rejected"] and rep["candidate"] == "-3m"
+    assert 0.05 < rep["intensity_mismatch"] < 0.1
+    (h0, i0, h1, i1) = rep["broken_by"]
+    assert tuple(abs(v) for v in h0) == (0, 2, 0)
+    assert "broken by" in strict.symmetry_summary()
+
+
+def test_pseudo_symmetry_from_parent_lattice(tmp_path):
+    # the honeycomb superstructure sits on a layered R-3m parent, itself on a
+    # rocksalt parent; neither parent's rotations map the monoclinic cell onto
+    # itself, so only the parent-lattice route can find them
+    path = tmp_path / "lfso_pristine.cif"
+    path.write_text(_LFSO_PRISTINE_CIF)
+    layered = Crystal.from_cif(path, pseudo_symmetry_intensity_tol=0.1, verbose=False)
+    assert layered.pointgroup_matching == "-3m"
+    assert layered.sym_quats_matching.shape[0] == 6
+    assert "parent lattice" in layered.pseudo_symmetry_report["route"]
+    # the layer normal is ~[103] in the monoclinic cell
+    assert any("103" in lab for lab in layered.zone_axis_wedge_labels(mathtext=False))
+
+    rocksalt = Crystal.from_cif(path, pseudo_symmetry_intensity_tol=0.4, verbose=False)
+    assert rocksalt.pointgroup_matching == "m-3m"
+    assert rocksalt.sym_quats_matching.shape[0] == 24
+    # the rocksalt parent is broken only by the (001) layer-ordering reflection
+    h0, i0, h1, i1 = rocksalt.pseudo_symmetry_report["broken_by"]
+    assert tuple(abs(v) for v in h0) == (0, 0, 1)
+    assert 0.3 < rocksalt.pseudo_symmetry_report["intensity_mismatch"] < 0.35
+
+
+_LFSO_CHARGED_CIF = """data_
+_cell_length_a 5.04848
+_cell_length_b 5.04848
+_cell_length_c 9.4279
+_cell_angle_alpha 90
+_cell_angle_beta 90
+_cell_angle_gamma 120
+_symmetry_space_group_name_H-M P-31c
+loop_
+_symmetry_equiv_pos_as_xyz
+ 'x, y, z'
+ '-x, -y, -z'
+ '-x+y, -x, z'
+ '-x+y, y, -z+1/2'
+ '-y, -x, -z+1/2'
+ '-y, x-y, z'
+ 'y, -x+y, -z'
+ 'y, x, z+1/2'
+ 'x-y, -y, z+1/2'
+ 'x-y, x, -z'
+ '-x, -x+y, z+1/2'
+ 'x, x-y, -z+1/2'
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+_atom_site_occupancy
+Me1 Li 0.3333333 0.6666667 0.75 0.673
+Me11 Sb 0.3333333 0.6666667 0.75 0.327
+Me2 Li 0.3333333 0.6666667 0.25 0.327
+Me22 Sb 0.3333333 0.6666667 0.25 0.673
+Me3 Fe 0 0 0.75 1
+O1 O 0.7409 0.7329 0.8660 1
+"""
+
+
+def test_hexagonal_pseudo_symmetry_can_be_adopted(tmp_path):
+    # a hexagonal cell given to five decimals reproduces rotation products to
+    # only ~1e-6; a closure test that strict rejected every hexagonal parent
+    # group whatever the intensity tolerance
+    path = tmp_path / "lfso_charged.cif"
+    path.write_text(_LFSO_CHARGED_CIF)
+    strict = Crystal.from_cif(path, pseudo_symmetry_intensity_tol=0.4, verbose=False)
+    assert strict.pointgroup_matching == "-3m"
+    assert strict.pseudo_symmetry_report["candidate"] == "6/mmm"
+    loose = Crystal.from_cif(path, pseudo_symmetry_intensity_tol=1.0, verbose=False)
+    assert loose.pointgroup_matching == "6/mmm"
+    assert loose.sym_quats_matching.shape[0] == 12

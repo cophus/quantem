@@ -17,7 +17,10 @@ at every thickness essentially for free:
 
 from __future__ import annotations
 
+import os
+import threading
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -150,10 +153,22 @@ def _check_dynamical_factors(crystal: Crystal, energy_ev: float, g_max_beams: fl
     """Warn once per crystal when the absorptive factors were computed at
     another energy or do not cover every coupling g - h of the beam list
     (which needs factors out to twice the largest beam)."""
-    if getattr(crystal, "U_dyn", None) is None:
-        return
     key = id(crystal)
     if key in _coverage_warned:
+        return
+    if getattr(crystal, "U_dyn", None) is None:
+        k_kin = getattr(crystal, "k_max", None)
+        msg = (
+            "no absorptive structure factors (calculate_dynamical_structure_factors), "
+            "so the Bloch calculation uses the elastic kinematical factors"
+        )
+        if k_kin is not None and 2 * g_max_beams > k_kin + 1e-9:
+            msg += (
+                f", which stop at {k_kin:.2f} 1/A while the couplings of this beam list "
+                f"reach {2 * g_max_beams:.2f} 1/A"
+            )
+        _coverage_warned.add(key)
+        warnings.warn(f"{crystal.name}: {msg}", stacklevel=3)
         return
     e_dyn = getattr(crystal, "dyn_energy_ev", None)
     k_dyn = getattr(crystal, "dyn_k_max", None)
@@ -321,6 +336,9 @@ def refine_thickness(
         A fitted PhaseMap (fit() has been run).
     thicknesses_A : np.ndarray | None
         Thickness grid in Angstroms; default 50 ... 1000 in 25 A steps.
+    min_number_peaks : int | None
+        Positions with fewer measured peaks, direct beam included, are
+        skipped; None inherits the phase fit's minimum. At least 3.
 
     Returns
     -------
@@ -337,9 +355,14 @@ def refine_thickness(
     fit_md = phase_map.metadata.get("fit") if hasattr(phase_map, "metadata") else None
     pair_distance = resolve(pair_distance, "pair_distance", fit_md, default=PAIR_DISTANCE)
     power_intensity = resolve(power_intensity, "power_intensity", fit_md, default=POWER_INTENSITY)
-    min_number_peaks = resolve(
-        min_number_peaks, "min_number_peaks", fit_md, default=MIN_NUMBER_PEAKS
+    min_number_peaks = int(
+        resolve(min_number_peaks, "min_number_peaks", fit_md, default=MIN_NUMBER_PEAKS)
     )
+    if min_number_peaks < 3:
+        raise ValueError(
+            f"min_number_peaks={min_number_peaks}: a dynamical fit needs at least the "
+            "direct beam and two non-collinear reflections"
+        )
     if hasattr(phase_map, "metadata"):
         phase_map.metadata["thickness"] = dict(
             thicknesses_A=np.asarray(thicknesses_A, dtype=float).tolist(),
@@ -2155,6 +2178,7 @@ def refine_dynamical(
     rescue_thickness_A: float = 100.0,
     rescue_tilt_deg: float = 0.05,
     rescue_max_starts: int = 2,
+    num_workers: int | None = None,
     progress_bar: bool = True,
 ) -> dict:
     """Dynamical refinement on the Bragg vectors: orientation, thickness,
@@ -2225,6 +2249,11 @@ def refine_dynamical(
         Unpaired simulated beams weaker than this fraction of the
         strongest simulated beam do not count against a candidate (the
         detector would not have seen them).
+    min_number_peaks : int | None
+        Positions with fewer measured peaks, direct beam included, are
+        skipped. None inherits the minimum of the phase fit, itself the
+        matching's (5 by default). At least 3: the direct beam and two
+        non-collinear reflections.
     refine_deformation : bool, default=True
         Solve the symmetric in-plane deformation and the in-plane rotation
         from the paired positions before the intensity search; the
@@ -2259,10 +2288,18 @@ def refine_dynamical(
         skipping neighbors whose solution repeats one already tried.
     neighbor_rescue : bool, default=True
         Second pass: positions whose winning solution differs from a
-        4-neighbor of the same crystal by more than rescue_thickness_A or
-        rescue_tilt_deg are refined again from that neighbor's solution,
-        and the lower cost is kept. Repairs isolated wrong basins
+        4-neighbor of the same crystal (the nearest refined position within
+        two steps, so a mask of every second position works too) by more
+        than rescue_thickness_A or rescue_tilt_deg are refined again from
+        that neighbor's solution, and the lower cost is kept. Repairs isolated wrong basins
         (thickness aliases, tilt minima at a grid edge).
+    num_workers : int | None
+        Threads refining positions side by side; None uses every core.
+        The Bloch eigensolves are too small to spread over cores on their
+        own, so this is where the speed comes from. Positions are handed
+        out in contiguous raster-order blocks and warm starts stay inside a
+        block, so the result depends on the number of blocks, never on
+        which thread finishes first.
 
     Returns
     -------
@@ -2294,9 +2331,14 @@ def refine_dynamical(
     min_sim_intensity_rel = resolve(
         min_sim_intensity_rel, "min_sim_intensity_rel", fit_md, default=MIN_SIM_INTENSITY_REL
     )
-    min_number_peaks = resolve(
-        min_number_peaks, "min_number_peaks", fit_md, default=MIN_NUMBER_PEAKS
+    min_number_peaks = int(
+        resolve(min_number_peaks, "min_number_peaks", fit_md, default=MIN_NUMBER_PEAKS)
     )
+    if min_number_peaks < 3:
+        raise ValueError(
+            f"min_number_peaks={min_number_peaks}: a dynamical fit needs at least the "
+            "direct beam and two non-collinear reflections"
+        )
     precession_deg = float(resolve(precession_deg, "precession_deg", om_md, default=0.0))
     semiconv_mrad = float(resolve(semiconv_mrad, "semiconv_mrad", om_md, default=0.0))
     if n_precession_search is None:
@@ -2325,6 +2367,7 @@ def refine_dynamical(
         rescue_thickness_A=float(rescue_thickness_A),
         rescue_tilt_deg=float(rescue_tilt_deg),
         rescue_max_starts=int(rescue_max_starts),
+        num_workers=None if num_workers is None else int(num_workers),
     )
     if hasattr(phase_map, "metadata"):
         phase_map.metadata["dynamical"] = used
@@ -2557,13 +2600,12 @@ def refine_dynamical(
     for om in oms:
         if om.computed is not None:
             mask_rc = mask_rc & om.computed
-    iterator = [(r, c) for r, c in np.ndindex(R, C) if mask_rc[r, c]]
-    if progress_bar:
-        iterator = tqdm(iterator, desc="dynamical refinement")
-    for rx, ry in iterator:
+    positions = [(r, c) for r, c in np.ndindex(R, C) if mask_rc[r, c]]
+
+    def refine_position(rx, ry, block):
         pk = peaks_at(rx, ry)
         if pk is None:
-            continue
+            return
         qxy, im, w_exp = pk
         for f, (i_om, m) in enumerate(cands):
             om = oms[i_om]
@@ -2580,10 +2622,14 @@ def refine_dynamical(
             stages = tilt_stages
             if warm_start and len(tilt_stages) > 1:
                 # an already refined neighbor of the same candidate (raster
-                # order: above or to the left) is a start inside the fine
-                # stages' reach; its solution costs one coarse stage less
-                for nr, nc in ((rx - 1, ry), (rx, ry - 1)):
-                    if nr < 0 or nc < 0 or not torch.isfinite(cost_out[nr, nc, f]):
+                # order: above or to the left, in the same block, one or two
+                # steps away so a mask of every second position still warm
+                # starts) is a start inside the fine stages' reach; its
+                # solution costs one coarse stage less
+                for nr, nc in ((rx - 1, ry), (rx, ry - 1), (rx - 2, ry), (rx, ry - 2)):
+                    if (nr, nc) not in block:
+                        continue
+                    if not torch.isfinite(cost_out[nr, nc, f]):
                         continue
                     # same grain: the kinematically matched orientations of
                     # the two positions agree within the coarse stage
@@ -2604,20 +2650,78 @@ def refine_dynamical(
                 continue
             store(rx, ry, f, sol)
 
+    def run_parallel(jobs, work, desc):
+        """Run work(job) over jobs on num_workers threads. Each Bloch
+        eigensolve is too small to use more than one core, and torch
+        releases the GIL inside it, so positions run side by side; every
+        job writes only its own positions."""
+        bar = tqdm(total=sum(len(j) for j in jobs), desc=desc) if progress_bar else None
+        lock = threading.Lock()
+
+        def run(job):
+            for item in job:
+                work(item)
+                if bar is not None:
+                    with lock:
+                        bar.update(1)
+
+        if n_workers == 1:
+            for job in jobs:
+                run(job)
+        else:
+            n_threads = torch.get_num_threads()
+            torch.set_num_threads(1)
+            try:
+                with ThreadPoolExecutor(n_workers) as pool:
+                    for fut in [pool.submit(run, job) for job in jobs]:
+                        fut.result()
+            finally:
+                torch.set_num_threads(n_threads)
+        if bar is not None:
+            bar.close()
+
+    n_workers = max(1, int(num_workers if num_workers is not None else os.cpu_count() or 1))
+    # fill the lazily cached lattice data once, before any thread reads it
+    for om in oms:
+        _beam_universe(om.crystal)
+    # contiguous runs of positions in raster order, several per worker so
+    # they balance but long enough that most positions still warm start;
+    # warm starts stay inside a run, so the result does not depend on which
+    # thread finished first
+    n_blocks = 1 if n_workers == 1 else max(1, min(4 * n_workers, len(positions) // 16))
+    blocks = []
+    for idx in np.array_split(np.arange(len(positions)), max(n_blocks, 1)):
+        block = {positions[i] for i in idx}
+        blocks.append([(*positions[i], block) for i in idx])
+    run_parallel(
+        [b for b in blocks if b], lambda item: refine_position(*item), "dynamical refinement"
+    )
+
     if neighbor_rescue and len(tilt_stages) > 1:
         cost_f0 = torch.nan_to_num(cost_out, nan=torch.inf)
         f_win = cost_f0.argmin(dim=-1)
         done = torch.isfinite(cost_out).any(dim=-1)
         rescue_list = []
+
+        def nearest_done(rx, ry, dr, dc):
+            # the refined position one step away, or two on a sparse mask
+            for k in (1, 2):
+                nr, nc = rx + k * dr, ry + k * dc
+                if 0 <= nr < R and 0 <= nc < C and done[nr, nc]:
+                    return nr, nc
+            return None
+
         for rx, ry in np.ndindex(R, C):
             if not done[rx, ry]:
                 continue
             f = int(f_win[rx, ry])
             i_om = cands[f][0]
             starts = []
-            for nr, nc in ((rx - 1, ry), (rx + 1, ry), (rx, ry - 1), (rx, ry + 1)):
-                if not (0 <= nr < R and 0 <= nc < C) or not done[nr, nc]:
+            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nb = nearest_done(rx, ry, dr, dc)
+                if nb is None:
                     continue
+                nr, nc = nb
                 fn = int(f_win[nr, nc])
                 if cands[fn][0] != i_om:
                     continue
@@ -2652,22 +2756,34 @@ def refine_dynamical(
                         kept.append((c_n, nr, nc, fn))
                     if len(kept) >= max(1, rescue_max_starts):
                         break
-                rescue_list.append((rx, ry, f, [(nr, nc, fn) for _, nr, nc, fn in kept]))
-        it = tqdm(rescue_list, desc="neighbor rescue") if progress_bar else rescue_list
-        for rx, ry, f, starts in it:
+                # the neighbors' solutions as they stand now: rescues run
+                # in parallel and must not start from each other's updates
+                rescue_list.append(
+                    (rx, ry, f, [quat_out[nr, nc, fn].clone() for _, nr, nc, fn in kept])
+                )
+
+        def rescue(item):
+            rx, ry, f, starts = item
             pk = peaks_at(rx, ry)
             if pk is None:
-                continue
+                return
             qxy, im, w_exp = pk
             crystal = oms[cands[f][0]].crystal
-            for nr, nc, fn in starts:
-                sol = refine_from(crystal, quat_out[nr, nc, fn], qxy, im, w_exp, tilt_stages[1:])
+            for q_n in starts:
+                sol = refine_from(crystal, q_n, qxy, im, w_exp, tilt_stages[1:])
                 if sol is not None and sol["cost"] < float(cost_out[rx, ry, f]) - 1e-9:
                     cost0_keep = float(cost0_out[rx, ry, f])
                     store(rx, ry, f, sol)
                     if np.isfinite(cost0_keep):
                         cost0_out[rx, ry, f] = cost0_keep
                     rescued_out[rx, ry] = True
+
+        n_jobs = 1 if n_workers == 1 else 4 * n_workers
+        run_parallel(
+            [rescue_list[k::n_jobs] for k in range(n_jobs) if rescue_list[k::n_jobs]],
+            rescue,
+            "neighbor rescue",
+        )
 
     n_maps = len(oms)
     cost_f = torch.nan_to_num(cost_out, nan=torch.inf)

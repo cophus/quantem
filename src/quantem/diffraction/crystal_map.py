@@ -29,6 +29,25 @@ from quantem.diffraction.orientation import OrientationMap
 from quantem.diffraction.phase import PhaseMap
 
 
+def _common_k_max(crystals, k_max: float | None) -> float:
+    """The one k_max every crystal is simulated to, or an error saying why not."""
+    if k_max is not None:
+        return float(k_max)
+    have = {xtl.name: xtl.k_max for xtl in crystals}
+    missing = [n for n, k in have.items() if k is None]
+    if missing:
+        raise ValueError(
+            f"no structure factors for {missing}: pass k_max= to CrystalMap.from_vectors, "
+            "which computes them for every crystal"
+        )
+    if len({round(float(k), 9) for k in have.values()}) > 1:
+        raise ValueError(
+            f"crystals are simulated to different k_max {have}; pass k_max= to "
+            "CrystalMap.from_vectors to set one range for all of them"
+        )
+    return float(next(iter(have.values())))
+
+
 class CrystalMap(AutoSerialize):
     """Per-position crystal orientation and phase over a scan.
 
@@ -45,11 +64,15 @@ class CrystalMap(AutoSerialize):
         Crystal names, used for indexing and plot labels.
     phases : PhaseMap or None
         The phase decision, populated by :meth:`fit`.
+    dynamical : dict or None
+        The last :meth:`refine_dynamical` result.
     """
 
     _token = object()
 
-    def __init__(self, orientation_maps: list[OrientationMap], _token=None):
+    def __init__(
+        self, orientation_maps: list[OrientationMap], _token=None, k_max: float | None = None
+    ):
         if _token is not self._token:
             raise RuntimeError(
                 "Use CrystalMap.from_vectors() or CrystalMap.from_orientation_maps()."
@@ -67,7 +90,9 @@ class CrystalMap(AutoSerialize):
             raise ValueError(f"all crystals must share one scan shape, got {shapes}")
         self.orientation_maps = orientation_maps
         self.phases: PhaseMap | None = None
+        self.dynamical: dict | None = None
         self.metadata: dict = {}
+        self.k_max = _common_k_max([om.crystal for om in orientation_maps], k_max)
 
     # ------------------------------------------------------------------
     # construction
@@ -81,6 +106,7 @@ class CrystalMap(AutoSerialize):
         energy_ev: float = 300e3,
         precession_deg: float = 0.0,
         semiconv_mrad: float = 0.0,
+        k_max: float | None = None,
     ) -> "CrystalMap":
         """Build one OrientationMap per crystal from a shared peak table.
 
@@ -93,8 +119,26 @@ class CrystalMap(AutoSerialize):
             work uses the same entry point.
         energy_ev, precession_deg, semiconv_mrad
             Passed to :meth:`OrientationMap.from_vectors`.
+        k_max : float, optional
+            Largest scattering vector (1/Angstroms) in the simulated patterns,
+            applied to every crystal: their structure factors are computed
+            here, so it is set once. Match it to the detector; reflections
+            beyond it cannot be paired. None keeps the structure factors the
+            crystals already have, which must then share one k_max, since two
+            phases simulated to different ranges are not compared fairly.
+
+        Raises
+        ------
+        ValueError
+            If `k_max` is None and the crystals have no structure factors, or
+            have them to different ranges.
         """
         xtls = list(crystals) if isinstance(crystals, (list, tuple)) else [crystals]
+        if k_max is not None:
+            for xtl in xtls:
+                xtl.calculate_structure_factors(k_max=float(k_max))
+        else:
+            _common_k_max(xtls, None)  # say what is wrong before anything is built
         oms = [
             OrientationMap.from_vectors(
                 peaks,
@@ -105,7 +149,7 @@ class CrystalMap(AutoSerialize):
             )
             for xtl in xtls
         ]
-        return cls(oms, _token=cls._token)
+        return cls(oms, _token=cls._token, k_max=k_max)
 
     @classmethod
     def from_orientation_maps(cls, orientation_maps: list[OrientationMap]) -> "CrystalMap":
@@ -215,8 +259,9 @@ class CrystalMap(AutoSerialize):
 
         Least squares on the paired peak positions removes the quantization
         of the plan: the in-plane rotation comes from the pairing, the zone
-        axis tilt from the intensity envelope. A second pass rescues
-        positions whose answer disagrees with all of their neighbours.
+        axis tilt from the intensity envelope. Positions that disagree with
+        a neighbour are then retried from the candidates around them, and
+        ties go to the orientation the neighbours share.
 
         Parameters
         ----------
@@ -253,6 +298,157 @@ class CrystalMap(AutoSerialize):
         self.phases = PhaseMap.from_orientation_maps(self.orientation_maps)
         self.phases.fit(**kwargs)
         return self
+
+    def refine_dynamical(self, mask=None, **kwargs) -> "CrystalMap":
+        """Dynamical refinement of orientation, thickness, strain and phase.
+
+        Bloch-wave intensities, averaged over the precession ring, are fit to
+        the measured peaks of every candidate at every position of `mask`,
+        and the candidate with the lowest cost decides the phase there; the
+        rest of the scan keeps its decision. See
+        :func:`~quantem.diffraction.bloch.refine_dynamical` for the model and
+        every argument. The refined orientations are written back, so calls
+        can be staged: thickness and tilt first with
+        ``refine_deformation=False``, then the in-plane strain from those
+        orientations with a narrower tilt search.
+
+        Every crystal is given absorptive structure factors out to twice
+        `k_max`, which the couplings between beams need; they are computed
+        here when missing or too short.
+
+        Parameters
+        ----------
+        mask : np.ndarray or list of tuple, optional
+            Positions to refine, an (R, C) boolean mask or (row, col) list.
+            None refines every matched position, which takes hours.
+        k_max : float, optional
+            Largest |g| (1/Angstroms) of the beams in the Bloch calculation.
+            Defaults to the k_max of the kinematical simulation. Cutting it
+            low saves time but drops beams that carry real dynamical
+            coupling.
+        **kwargs
+            Passed to :func:`~quantem.diffraction.bloch.refine_dynamical`.
+            `require_phase_weight` defaults to False here, so a crystal the
+            kinematical fit rejected still competes.
+
+        Returns
+        -------
+        CrystalMap
+            Self, with the result in :attr:`dynamical`.
+        """
+        from quantem.diffraction import bloch
+
+        pm = self._require_fit("refine_dynamical()")
+        k_max = float(kwargs.pop("k_max", None) or self.k_max)
+        energy_ev = self.orientation_maps[0].energy_ev
+        for om in self.orientation_maps:
+            xtl = om.crystal
+            if (
+                getattr(xtl, "U_dyn", None) is None
+                or getattr(xtl, "dyn_k_max", 0.0) < 2 * k_max - 1e-9
+                or abs(getattr(xtl, "dyn_energy_ev", energy_ev) - energy_ev) > 1.0
+            ):
+                xtl.calculate_dynamical_structure_factors(energy_ev, k_max=2 * k_max)
+        kwargs["k_max"] = k_max
+        kwargs.setdefault("require_phase_weight", False)
+        self.dynamical = bloch.refine_dynamical(pm, mask=mask, **kwargs)
+        pm.apply_dynamical(self.dynamical)
+        return self
+
+    def plot_dynamical(self, phase=None, strain: bool = False, crop: bool = True, **kwargs):
+        """Maps of the last :meth:`refine_dynamical`.
+
+        Thickness, tilt correction, the cost gain of the tilt search and the
+        final cost, or with `strain` the six crystal-frame strain components.
+
+        Parameters
+        ----------
+        phase : int or str, optional
+            Show only positions this crystal won. None shows all of them.
+        strain : bool, default=False
+            Plot the strain components instead.
+        crop : bool, default=True
+            Crop to the refined positions.
+        **kwargs
+            Passed to :func:`~quantem.diffraction.bloch.plot_dynamical_maps`
+            or :func:`~quantem.diffraction.bloch.plot_strain_crystal_frame`.
+
+        Returns
+        -------
+        tuple
+            ``(fig, axs)``.
+        """
+        from quantem.diffraction import bloch
+
+        result = getattr(self, "dynamical", None)
+        if result is None:
+            raise ValueError("run refine_dynamical() before plot_dynamical().")
+        i = None if phase is None else self._phase_indices(phase)[0]
+        maps = bloch.dynamical_maps(result, self.phases, crystal_index=i)
+        m = maps["mask"].numpy()
+        sl = (slice(None), slice(None))
+        if crop and m.any():
+            rows, cols = np.nonzero(m)
+            sl = (slice(rows.min(), rows.max() + 1), slice(cols.min(), cols.max() + 1))
+        kwargs.setdefault("scalebar", self.orientation_maps[0].scan_scalebar)
+        if strain:
+            comps = {k: v.numpy()[sl] for k, v in maps["strain"].items()}
+            return bloch.plot_strain_crystal_frame(comps, mask=m[sl], **kwargs)
+        cropped = dict(maps)
+        for k in ("thickness", "tilt_deg", "gain", "cost"):
+            cropped[k] = maps[k][sl]
+        return bloch.plot_dynamical_maps(cropped, **kwargs)
+
+    def example_positions(
+        self,
+        phase=None,
+        num: int = 4,
+        ambiguous: bool = False,
+        min_distance: float = 16.0,
+        min_signal: float = 0.3,
+    ) -> list[tuple[int, int]]:
+        """Well-separated probe positions for inspecting the phase decision.
+
+        The clearest examples of a crystal are where it won by the largest
+        margin (the phase reliability); the ambiguous ones are where the two
+        best crystals scored closest. Only positions that diffract are
+        considered, and each pick is at least `min_distance` from the others,
+        so the examples come from different parts of the scan.
+
+        Parameters
+        ----------
+        phase : int or str, optional
+            Crystal the positions must have been assigned to. None allows
+            any crystal.
+        num : int, default=4
+            Number of positions.
+        ambiguous : bool, default=False
+            Pick the closest decisions instead of the clearest.
+        min_distance : float, default=16.0
+            Smallest separation between picks, in probe positions.
+        min_signal : float, default=0.3
+            Smallest :meth:`signal_confidence` a position needs.
+
+        Returns
+        -------
+        list of tuple of int
+            ``(row, col)`` positions, clearest (or closest) first.
+        """
+        pm = self._require_fit("example_positions()")
+        ph = self.phase_index
+        rel = np.asarray(pm.reliability, dtype=float)
+        ok = (ph >= 0) & np.isfinite(rel) & (self.signal_confidence() >= min_signal)
+        if phase is not None:
+            ok &= ph == self._phase_indices(phase)[0]
+        rc = np.argwhere(ok)
+        order = np.argsort(rel[ok] if ambiguous else -rel[ok], kind="stable")
+        picks: list[tuple[int, int]] = []
+        for r, c in rc[order]:
+            if all((r - a) ** 2 + (c - b) ** 2 >= min_distance**2 for a, b in picks):
+                picks.append((int(r), int(c)))
+                if len(picks) == num:
+                    break
+        return picks
 
     # ------------------------------------------------------------------
     # derived quantities
@@ -445,6 +641,9 @@ class CrystalMap(AutoSerialize):
             is how a probe straddling two grains shows itself.
         dataset : Dataset4dstem, optional
             Show the recorded diffraction pattern behind the overlay.
+        norm : dict or str, optional
+            Passed to `show_2d`, which draws that pattern, e.g.
+            {"power": 0.5, "upper_quantile": 0.98}.
         measured_scale, measured_power : float, optional
             Size and intensity compression of the gray measured peaks.
         transpose_plots : bool, default=False
@@ -468,6 +667,52 @@ class CrystalMap(AutoSerialize):
             if md.get("origins") is not None:
                 kwargs.setdefault("origins", np.asarray(md["origins"]))
         return plot_pattern_matches(oms, positions=positions, **kwargs)
+
+    def plot_ring_comparison(self, k_min: float = 0.1, k_max: float | None = None, **kwargs):
+        """Measured radial peak distribution against the rings of every crystal.
+
+        One panel per candidate: the red fill is the histogram of every
+        calibrated peak, the black lines are that crystal's ring positions.
+        Run it before matching. With the scale fixed by a standard, a ring
+        that sits beside the measured peaks means either the reference
+        lattice parameter is wrong for this specimen or the calibration did
+        not transfer -- and matching cannot recover from either.
+
+        Parameters
+        ----------
+        k_min : float, default=0.1
+            Smallest scattering vector shown, 1/Angstroms.
+        k_max : float, optional
+            Largest scattering vector shown; defaults to the map's own k_max.
+        k_broadening : float, optional
+            Broaden the rings into a simulated profile; None (default) draws
+            sharp lines.
+        **kwargs
+            Further arguments of
+            :func:`~quantem.diffraction.calibration.plot_ring_comparison`.
+
+        Returns
+        -------
+        tuple
+            ``(fig, axs)``.
+        """
+        from quantem.diffraction import calibration
+
+        return calibration.plot_ring_comparison(
+            self.peaks,
+            [om.crystal for om in self.orientation_maps],
+            k_min=k_min,
+            k_max=k_max if k_max is not None else self._k_max_or_crystals(),
+            **kwargs,
+        )
+
+    def _k_max_or_crystals(self) -> float:
+        # maps saved before k_max lived on the CrystalMap carry it only on
+        # their crystals
+        k = getattr(self, "k_max", None)
+        if k is None:
+            k = max(float(om.crystal.k_max or 1.5) for om in self.orientation_maps)
+        return float(k)
 
     def plot_correlation(self, **kwargs):
         """Correlation and reliability of every crystal, one panel each.

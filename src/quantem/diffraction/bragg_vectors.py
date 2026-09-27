@@ -1373,17 +1373,28 @@ class BraggVectors(AutoSerialize):
     # detector calibration
     # ------------------------------------------------------------------
 
-    def measure_origins(self, search_radius: float = 6.0, robust: bool = True, plot: bool = False):
+    def measure_origins(
+        self,
+        search_radius: float = 6.0,
+        robust: bool = True,
+        plot: bool = False,
+        center=None,
+    ):
         """Fit the diffraction origin at every probe position.
 
         The direct beam wanders with the probe (descan). The brightest peak
-        within `search_radius` of the detector centre gives the origin at
-        each position, and a plane fit over the scan smooths the result.
+        within `search_radius` of `center` gives the origin at each
+        position, and a plane fit over the scan smooths the result.
 
         Parameters
         ----------
         search_radius : float, default=6.0
-            Radius in detector pixels searched around the centre.
+            Radius in detector pixels searched around `center`.
+        center : tuple of float, optional
+            ``(row, col)`` to search around; defaults to the detector
+            centre. Pass the beam position from
+            :func:`~quantem.diffraction.disk_detection.estimate_central_beam`
+            when the beam is not centred on the detector.
         robust : bool, default=True
             Reject outliers before the plane fit.
         plot : bool, default=False
@@ -1397,10 +1408,10 @@ class BraggVectors(AutoSerialize):
         from quantem.diffraction import calibration
 
         return calibration.measure_origins(
-            self, search_radius=search_radius, robust=robust, plot=plot
+            self, search_radius=search_radius, robust=robust, plot=plot, center=center
         )
 
-    def plot_origin_fit(self, origins, search_radius: float = 6.0):
+    def plot_origin_fit(self, origins, search_radius: float = 6.0, center=None):
         """Measured origins, the plane fit, and their residual.
 
         Parameters
@@ -1408,7 +1419,9 @@ class BraggVectors(AutoSerialize):
         origins : np.ndarray
             ``(scan_row, scan_col, 2)`` origins from :meth:`measure_origins`.
         search_radius : float, default=6.0
-            The radius used to measure them, drawn for reference.
+            The radius used to measure them.
+        center : tuple of float, optional
+            The centre used to measure them.
 
         Returns
         -------
@@ -1417,7 +1430,50 @@ class BraggVectors(AutoSerialize):
         """
         from quantem.diffraction import calibration
 
-        return calibration.plot_origin_fit(self, origins, search_radius=search_radius)
+        return calibration.plot_origin_fit(
+            self, origins, search_radius=search_radius, center=center
+        )
+
+    def measure_scan_rotation(
+        self,
+        origins=None,
+        mask_radius: float | None = None,
+        plot: bool = False,
+    ) -> float:
+        """Rotation between the detector and the scan, from the direct beam.
+
+        The center of mass of the direct beam traces the projected potential
+        gradient over the scan, which is a curl-free field in the scan frame.
+        Rotating the detector axes until the curl vanishes recovers the angle.
+        It sets the in-plane orientations and nothing else: zone axes, phases
+        and the out-of-plane maps do not depend on it.
+
+        The curl is unchanged by a 180 degree rotation, so the answer is this
+        angle or this angle plus 180.
+
+        Parameters
+        ----------
+        origins : np.ndarray, optional
+            ``(scan_row, scan_col, 2)`` origins from :meth:`measure_origins`;
+            defaults to the detector centre.
+        mask_radius : float, optional
+            Radius in detector pixels around the origin used for the center
+            of mass, which keeps the Bragg disks out of it. Set it a little
+            beyond the direct beam.
+        plot : bool, default=False
+            Show the curl and divergence against the trial angle.
+
+        Returns
+        -------
+        float
+            Counter-clockwise rotation in degrees, in [0, 180).
+        """
+        from quantem.diffraction import calibration
+
+        out = calibration.measure_scan_rotation(
+            self.dataset, origins=origins, mask_radius=mask_radius, plot=plot
+        )
+        return out[0] if isinstance(out, tuple) else out
 
     def calibrate(self, crystal, pixel_size_guess: float, **kwargs):
         """Measure the reciprocal pixel size and the elliptic distortion.

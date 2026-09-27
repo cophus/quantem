@@ -987,3 +987,35 @@ def test_refine_dynamical_neighbor_rescue():
     assert maps["mask"][0].all()
     assert set(maps["strain"]) == {"aa", "bb", "cc", "ab", "ac", "bc"}
     assert torch.isfinite(maps["gain"][0]).all()
+
+
+def test_refine_dynamical_threads_match_one_worker():
+    from quantem.diffraction.rotations import misorientation_angle_deg
+
+    # 32 positions: two blocks of 16 on two threads, one warm-start chain
+    # broken at the block boundary
+    n = 32
+    kw = dict(
+        thicknesses_A=np.arange(300, 700, 25.0),
+        tilt_stages=((0.25, 0.05), (0.04, 0.01)),
+        power_intensity=0.5,
+        sg_max=0.06,
+        k_max=1.0,
+        neighbor_rescue=False,
+        progress_bar=False,
+    )
+    out = {}
+    for nw in (1, 2):
+        xtl, om, pm, q_true, _, _ = _smooth_map_setup(n, 0.1)
+        res = bloch.refine_dynamical(pm, num_workers=nw, **kw)
+        out[nw] = (res, om.quats[0, :, 0].clone())
+    (res_1, q_1), (res_2, q_2) = out[1], out[2]
+    assert int(res_1["warm_started"].sum()) == n - 1
+    assert int(res_2["warm_started"].sum()) == n - 2
+    # the first block is the same computation on either route
+    assert torch.equal(q_1[:16], q_2[:16])
+    assert torch.equal(res_1["thickness"][0, :16], res_2["thickness"][0, :16])
+    # breaking the warm-start chain costs nothing in accuracy
+    e1 = misorientation_angle_deg(q_true, q_1, xtl.sym_quats).numpy()
+    e2 = misorientation_angle_deg(q_true, q_2, xtl.sym_quats).numpy()
+    assert e2.mean() <= e1.mean() + 0.01

@@ -20,7 +20,7 @@ DEFAULT_PHASE_COLORS = np.array(
 )
 ORIGIN_COLOR = "#2ca02c"
 MEASURED_COLOR = "0.15"
-IPF_GAMMA = 0.4
+IPF_SATURATION_POWER = 0.6  # <1 shrinks the white centre of the IPF wedge
 # cluster / grain label colors (tab10 cycle)
 CLUSTER_COLORS = [
     (0.122, 0.467, 0.706),
@@ -33,25 +33,27 @@ CLUSTER_COLORS = [
     (0.498, 0.498, 0.498),
     (0.737, 0.741, 0.133),
     (0.090, 0.745, 0.812),
-]  # <1 expands the white / mixed-color regions of the wedge
-# additive corner colors: full red, green capped to avoid the fluorescent
-# look, blue lifted off pure dark blue; pairwise sums give near-max-chroma
-# yellow / cyan / violet and the three together give white
-IPF_CORNER_COLORS = np.array(
-    [
-        [1.00, 0.00, 0.00],
-        [0.00, 0.70, 0.00],
-        [0.00, 0.30, 1.00],
-    ]
-)
+]
 
 
 def _bary_to_rgb(w: np.ndarray) -> np.ndarray:
-    """Barycentric wedge weights (..., 3) to RGB via the additive anchors."""
+    """Barycentric wedge weights (..., 3) to RGB.
+
+    Hue runs around the wedge centre, red, green and blue at the corners and
+    yellow, cyan and magenta midway along the edges; saturation is the
+    distance from the centre, full on every edge. Only the centre itself is
+    white, so the whole wedge, edges included, keeps its contrast.
+    """
+    from matplotlib.colors import hsv_to_rgb
+
     w = np.clip(w, 0, None)
-    w = w / np.clip(w.max(axis=-1, keepdims=True), 1e-12, None)
-    w = w**IPF_GAMMA
-    return np.clip(w @ IPF_CORNER_COLORS, 0, 1)
+    w = w / np.clip(w.sum(axis=-1, keepdims=True), 1e-12, None)
+    theta = np.deg2rad([90.0, 210.0, 330.0])
+    x = w @ np.cos(theta)
+    y = w @ np.sin(theta)
+    hue = ((np.rad2deg(np.arctan2(y, x)) - 90.0) / 360.0) % 1.0
+    sat = np.clip(1.0 - 3.0 * w.min(axis=-1), 0, 1) ** IPF_SATURATION_POWER
+    return hsv_to_rgb(np.stack((hue, sat, np.ones_like(hue)), axis=-1))
 
 
 def _parse_direction(direction) -> torch.Tensor:
@@ -424,7 +426,7 @@ def plot_pattern_matches(
     origins: np.ndarray | None = None,
     matches=(0, 1),
     colors=None,
-    power: float = 0.4,
+    norm=None,
     q_max_plot: float | None = None,
     scalebar: bool = True,
     show_measured: bool = True,
@@ -460,6 +462,11 @@ def plot_pattern_matches(
         the background pattern with the origin-corrected peaks.
     matches : tuple[int, ...], default=(0, 1)
         Match indices per crystal.
+    norm : dict | str | None
+        `norm` of `show_2d`, which draws the recorded pattern, e.g.
+        {"power": 0.5, "upper_quantile": 0.98}. The default,
+        {"power": 0.4, "upper_quantile": 0.999}, keeps the direct beam from
+        flattening the disks.
     colors : list | None
         One color per crystal; defaults to red, blue, green, purple.
     marker : str | None
@@ -467,7 +474,10 @@ def plot_pattern_matches(
         circle over a diffraction pattern, which leaves the measured disk
         visible inside it, and a plus over the gray measured peaks.
     measured_scale : float | None
-        Marker area of the gray measured peaks; defaults to
+        Largest marker area of the gray measured peaks, in points^2. The
+        default fits the markers to the patterns shown: the largest disk is
+        about 0.6 of the median spacing between neighbouring peaks, so dense
+        patterns get small markers and sparse ones large, up to
         ``1.5 * marker_scale``. The direct beam is far brighter than the
         disks, so the areas are compressed by `measured_power` and floored,
         which keeps the weak spots visible.
@@ -480,6 +490,8 @@ def plot_pattern_matches(
         a few candidates and many positions on a page.
     """
     import matplotlib.pyplot as plt
+
+    from quantem.core.visualization import show_2d
 
     oms = (
         list(orientation_maps)
@@ -526,6 +538,23 @@ def plot_pattern_matches(
         q_max = max((float(q.max()) for q in q_all if q.size), default=0.0)
         q_lim = 1.1 * q_max if q_max > 0 else 1.0
 
+    if measured_scale is None:
+        # size the measured disks to the spacing of the peaks on screen, so a
+        # dense pattern does not turn into overlapping blobs
+        spacings = []
+        for rx, ry in positions:
+            xy = peaks[rx, ry].array[:, [ix[0], ix[1]]]
+            xy = xy[(np.abs(xy) <= q_lim).all(axis=1)]
+            if xy.shape[0] > 2:
+                d = np.hypot(xy[:, None, 0] - xy[None, :, 0], xy[:, None, 1] - xy[None, :, 1])
+                np.fill_diagonal(d, np.inf)
+                spacings.append(np.median(d.min(axis=1)))
+        if spacings:
+            spacing_pt = float(np.median(spacings)) / (2 * q_lim) * min(axsize) * 72
+            measured_scale = min(1.5 * marker_scale, np.pi / 4 * (0.6 * spacing_pt) ** 2)
+        else:
+            measured_scale = 1.5 * marker_scale
+
     for pi, (rx, ry) in enumerate(positions):
         data = peaks[rx, ry].array.copy()
         rc = data[:, [ix[0], ix[1]]] @ rot_back.T
@@ -550,28 +579,28 @@ def plot_pattern_matches(
                     o_r, o_c = H / 2, W / 2
                 # pixel j has center (j - origin) * pixel_size; array edges
                 # sit half a pixel beyond the first/last centers
-                img = np.asarray(dataset.array[rx, ry], dtype=float)
-                img = np.clip(img, 0, None) ** power
                 # the direct beam is orders of magnitude above the disks, so
                 # autoscaling to its peak flattens everything else
-                vmax = float(np.percentile(img, 99.9))
-                ax.imshow(
-                    img,
+                show_2d(
+                    np.clip(np.asarray(dataset.array[rx, ry], dtype=float), 0, None),
+                    norm=norm if norm is not None else {"power": 0.4, "upper_quantile": 0.999},
                     cmap="gray_r",
-                    vmin=float(np.percentile(img, 2.0)),
-                    vmax=vmax if vmax > 0 else None,
-                    extent=(
+                    figax=(fig, ax),
+                    tight_layout=False,
+                )
+                ax.images[-1].set_extent(
+                    (
                         (-0.5 - o_c) * pixel_size,
                         (W - 0.5 - o_c) * pixel_size,
                         (H - 0.5 - o_r) * pixel_size,
                         (-0.5 - o_r) * pixel_size,
-                    ),
+                    )
                 )
             elif show_measured:
                 ax.scatter(
                     data[:, ix[1]],
                     data[:, ix[0]],
-                    s=(1.5 * marker_scale if measured_scale is None else measured_scale) * w_meas,
+                    s=measured_scale * w_meas,
                     color="0.75",
                     lw=0,
                 )

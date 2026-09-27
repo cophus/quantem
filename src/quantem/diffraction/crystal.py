@@ -36,16 +36,20 @@ _B = "\u0305"
 
 
 def direction_indices(
-    lat_real: torch.Tensor | np.ndarray, d, max_multiple: int = 12
+    lat_real: torch.Tensor | np.ndarray, d, max_multiple: int = 12, atol: float = 2e-3
 ) -> np.ndarray | None:
     """Smallest integer [uvw] along a Cartesian direction, or None if the
-    direction is not a lattice direction with indices up to max_multiple."""
+    direction is not a lattice direction with indices up to max_multiple.
+
+    `atol` is the allowed deviation of the normalized indices from integers;
+    loosen it to index the axes of a pseudo-symmetry, which are lattice
+    directions of an ideal parent but only nearly so in the real cell."""
     A_T_inv = np.linalg.inv(np.asarray(lat_real, dtype=float).T)
     v = A_T_inv @ np.asarray(d, dtype=float)
     v = v / np.abs(v).max()
     for m in range(1, max_multiple + 1):
         w = v * m
-        if np.allclose(w, np.round(w), atol=2e-3):
+        if np.allclose(w, np.round(w), atol=atol):
             ints = np.round(w).astype(int)
             g = np.gcd.reduce(np.abs(ints))
             return ints // max(g, 1)
@@ -176,6 +180,53 @@ def electron_scattering_factor(numbers: torch.Tensor, g: torch.Tensor) -> torch.
     return (a * (2.0 + b * g2) / (1.0 + b * g2) ** 2).sum(dim=-1)
 
 
+def _expand_partial_occupancy(atoms: Atoms) -> Atoms:
+    """One atom per species on every shared site, with its fractional occupancy.
+
+    ASE's CIF reader keeps the majority species of a mixed site and records
+    the full composition in ``atoms.info['occupancy']``, keyed by the site
+    index held in ``atoms.arrays['spacegroup_kinds']``. Structures with only
+    fully occupied sites are returned unchanged.
+
+    Parameters
+    ----------
+    atoms : Atoms
+        As returned by ``ase.io.read`` on a CIF.
+
+    Returns
+    -------
+    Atoms
+        The expanded structure, with ``arrays['occupancy']`` set.
+    """
+    occ = atoms.info.get("occupancy")
+    kinds = atoms.arrays.get("spacegroup_kinds")
+    if not occ or kinds is None:
+        return atoms
+    sites = [occ.get(str(int(k))) for k in kinds]
+    if all(
+        s is None or (len(s) == 1 and abs(float(next(iter(s.values()))) - 1.0) < 1e-9)
+        for s in sites
+    ):
+        return atoms
+
+    frac = atoms.get_scaled_positions(wrap=False)
+    symbols, positions, occupancy = [], [], []
+    for i, site in enumerate(sites):
+        if not site:
+            symbols.append(atoms[i].symbol)
+            positions.append(frac[i])
+            occupancy.append(1.0)
+            continue
+        for element, fraction in site.items():
+            symbols.append(element)
+            positions.append(frac[i])
+            occupancy.append(float(fraction))
+    out = Atoms(symbols=symbols, scaled_positions=positions, cell=atoms.cell, pbc=atoms.pbc)
+    out.set_array("occupancy", np.asarray(occupancy, dtype=float))
+    out.info.update({k: v for k, v in atoms.info.items() if k != "occupancy"})
+    return out
+
+
 class Crystal(AutoSerialize):
     """A crystal structure with kinematical diffraction methods.
 
@@ -210,11 +261,22 @@ class Crystal(AutoSerialize):
             matching group differs from the cell's own. None matches with
             the exact symmetry.
         pseudo_symmetry_intensity_tol : float, default=0.05
-            Dimensionless intensity tolerance of the same decision: the
-            extra operations of the parent group must map the kinematical
-            intensities of the reflections they relate onto each other
-            within this fraction of the strongest reflection, otherwise the
-            patterns are distinguishable and the parent group is rejected.
+            Largest intensity difference allowed between reflections that a
+            candidate pseudo-symmetry would make equivalent, as a fraction of
+            the strongest reflection's kinematical intensity |F|^2. Each
+            extra rotation is applied to every reflection within 2.0 1/A and
+            each intensity compared with its image's; if any pair differs by
+            more than this fraction, the orientations the rotation relates
+            are distinguishable and it is rejected. 0.05 merges only
+            orientations whose patterns differ by reflections at 5% of the
+            strongest; 0.4 also merges orientations told apart only by a
+            reflection at 40%, appropriate when that reflection is known to
+            be weak or absent in the data (stacking disorder, cation mixing).
+            Candidates are the relaxed-position group, the lattice's own
+            holohedry, and the holohedries of the parent lattices generated
+            by the strong reflections, so superstructure twin variants are
+            tested as well. The printout names the reflection pair that
+            decides each candidate.
         """
         self.atoms = atoms
         self.name = name if name is not None else atoms.get_chemical_formula()
@@ -230,6 +292,9 @@ class Crystal(AutoSerialize):
         self.occupancy = torch.as_tensor(np.asarray(occupancy, dtype=float))
 
         self._setup_symmetry(symprec, pseudo_symmetry_tol, pseudo_symmetry_intensity_tol)
+        # the summary states any pseudo-symmetry adopted; when it has been
+        # shown, the orientation plan does not warn about it again
+        self._summary_shown = bool(verbose)
         if verbose:
             print(self.symmetry_summary())
 
@@ -247,11 +312,34 @@ class Crystal(AutoSerialize):
 
     @classmethod
     def from_cif(cls, file_path: str | Path, name: str | None = None, **kwargs) -> "Crystal":
+        """Build a Crystal from a CIF file, keeping fractional site occupancies.
+
+        ASE reads a mixed-occupancy site as a single atom of the majority
+        species, which silently deletes every minority element: a layered
+        oxide with Sb sharing a site with Fe loads with no Sb at all, and Sb
+        is by far its strongest scatterer. ASE does record the occupancies it
+        discarded, so each shared site is expanded here back into one atom
+        per species, each carrying its fraction in
+        ``atoms.arrays['occupancy']``, which the structure-factor sum uses.
+
+        Parameters
+        ----------
+        file_path : str or Path
+            Path to the CIF file.
+        name : str, optional
+            Display name; defaults to the chemical formula.
+        **kwargs
+            Passed to the Crystal constructor, e.g. `pseudo_symmetry_tol`.
+
+        Returns
+        -------
+        Crystal
+        """
         from ase.io import read
 
         atoms = read(file_path)
         assert isinstance(atoms, Atoms)
-        return cls(atoms, name=name, **kwargs)
+        return cls(_expand_partial_occupancy(atoms), name=name, **kwargs)
 
     @property
     def volume(self) -> float:
@@ -262,7 +350,7 @@ class Crystal(AutoSerialize):
         """Reciprocal lattice vectors as rows, no 2*pi factor."""
         return torch.linalg.inv(self.lat_real).T
 
-    def _quick_intensities(self, k_max: float = 1.2) -> tuple[torch.Tensor, torch.Tensor]:
+    def _quick_intensities(self, k_max: float = 2.0) -> tuple[torch.Tensor, torch.Tensor]:
         """Kinematical |F|^2 of every reflection with |g| <= k_max (hkl, I),
         for the pseudo-symmetry intensity check; no thermal factors."""
         recip = self.lat_recip
@@ -334,47 +422,66 @@ class Crystal(AutoSerialize):
         # the heavy sublattice. Both candidate sets are filtered by the same
         # intensity test, so an operation is adopted only when it leaves the
         # kinematical pattern unchanged.
-        candidates: list[tuple[str, np.ndarray]] = []
+        #
+        # "parent lattice": the lattice generated by the strong reflections
+        # alone. A superstructure (cation ordering on a rocksalt or layered
+        # frame) has a larger cell than its parent, and the parent's
+        # symmetries map the superstructure onto a twin of itself rather than
+        # onto itself, so neither route above can see them. When the
+        # superstructure reflections are weak the twins give the same
+        # pattern, and these are exactly the variants matching must merge.
+        lat = self.lat_real.numpy()
+        candidates: list[tuple[str, np.ndarray, np.ndarray]] = []
         try:
             ds_relaxed = spglib.get_symmetry_dataset(cell, symprec=symprec_pseudo)
         except Exception:
             ds_relaxed = None
         if ds_relaxed is not None:
-            candidates.append(("relaxed positions", ds_relaxed.rotations))
-        lattice_cell = (
-            self.lat_real.numpy(),
-            np.zeros((1, 3)),
-            np.ones(1, dtype=int),
-        )
+            candidates.append(("relaxed positions", ds_relaxed.rotations, lat))
+        lattice_cell = (lat, np.zeros((1, 3)), np.ones(1, dtype=int))
         try:
             ds_lattice = spglib.get_symmetry_dataset(lattice_cell, symprec=symprec_pseudo)
         except Exception:
             ds_lattice = None
         if ds_lattice is not None:
-            candidates.append(("lattice", ds_lattice.rotations))
+            candidates.append(("lattice", ds_lattice.rotations, lat))
+        candidates += self._parent_lattice_candidates(pseudo_symmetry_tol, intensity_tol)
 
         best = None
-        for route, rotations in candidates:
-            quats = symmetry_quaternions(rotations, self.lat_real.numpy())
+        closest = None  # the rejected candidate that came nearest to passing
+        for route, rotations, lattice in candidates:
+            quats = symmetry_quaternions(rotations, lattice)
             if quats.shape[0] <= self.sym_quats.shape[0]:
                 continue
             pg_cand = spglib.get_pointgroup(rotations)[0].strip()
             accepted, worst = self._intensity_preserving_subgroup(quats, intensity_tol)
-            if self.pseudo_symmetry_report.get("candidate") is None or accepted is not None:
-                self.pseudo_symmetry_report.setdefault("candidate", pg_cand)
-                self.pseudo_symmetry_report.setdefault("intensity_mismatch", worst)
             if accepted is None:
+                if closest is None or worst < closest[0]:
+                    closest = (worst, pg_cand, route, self._breaking_reflection)
                 continue
             if best is None or accepted.shape[0] > best[1].shape[0]:
-                best = (route, accepted, pg_cand, worst, quats.shape[0])
+                best = (route, accepted, pg_cand, quats.shape[0])
 
         if best is None:
-            if "candidate" in self.pseudo_symmetry_report:
-                self.pseudo_symmetry_report["rejected"] = True
+            if closest is not None:
+                worst, pg_cand, route, pair = closest
+                self.pseudo_symmetry_report.update(
+                    candidate=pg_cand,
+                    intensity_mismatch=worst,
+                    broken_by=pair,
+                    route=route,
+                    rejected=True,
+                )
             return
-        route, accepted, pg_cand, worst, n_cand = best
+        route, accepted, pg_cand, n_cand = best
+        # the largest difference among the rotations actually adopted
+        _, worst = self._intensity_preserving_subgroup(accepted, 1.0)
         self.pseudo_symmetry_report.update(
-            candidate=pg_cand, intensity_mismatch=worst, route=route, rejected=False
+            candidate=pg_cand,
+            intensity_mismatch=worst,
+            broken_by=self._breaking_reflection,
+            route=route,
+            rejected=False,
         )
         self.sym_quats_matching = accepted
         # name the accepted group by the candidate symbol when every one of
@@ -385,6 +492,81 @@ class Crystal(AutoSerialize):
         else:
             self.pointgroup_matching = f"{accepted.shape[0]} rotations"
             self.laue_group_matching = self.laue_group
+
+    def _parent_lattice_candidates(
+        self, pseudo_symmetry_tol: float, intensity_tol: float
+    ) -> list[tuple[str, np.ndarray, np.ndarray]]:
+        """Holohedries of the lattices generated by the strong reflections.
+
+        For each intensity cut, the parent translations are the fractions t
+        of the cell with h.t integer for every reflection h stronger than
+        the cut; they form the real-space lattice dual to the strong
+        reflections. Its holohedry is a candidate group. Cuts run from very
+        low (the cell's own lattice once centring is removed) up to the
+        intensity tolerance, since reflections weaker than that are allowed
+        to break the pseudo-symmetry anyway.
+
+        Returns
+        -------
+        list of tuple
+            ``(route, rotations, lattice)``: integer rotations in the basis of
+            ``lattice``, whose rows are the parent vectors in the crystal's
+            own Cartesian frame.
+        """
+        import itertools
+
+        import spglib
+
+        hkl, inten = self._quick_intensities()
+        if inten.numel() == 0 or float(inten.max()) <= 0:
+            return []
+        inten = inten / inten.max()
+        lat = self.lat_real.numpy()
+        vol = abs(float(np.linalg.det(lat)))
+        # denominators 1, 2, 3, 4, 6, 12 cover the supercells met in practice
+        n_grid = 12
+        grid = np.array(list(itertools.product(range(n_grid), repeat=3)), dtype=float) / n_grid
+
+        out: list[tuple[str, np.ndarray, np.ndarray]] = []
+        seen: set[int] = set()
+        cuts = sorted({0.02, 0.05, 0.1, 0.2, 0.3, 0.5, float(intensity_tol)})
+        for cut in cuts:
+            if cut > 1.0:
+                continue
+            strong = hkl[inten > cut].numpy().astype(float)
+            if strong.shape[0] < 3 or np.linalg.matrix_rank(strong) < 3:
+                continue
+            phase = strong @ grid.T
+            t = grid[np.all(np.abs(phase - np.round(phase)) < 1e-6, axis=0)]
+            if t.shape[0] < 2:
+                continue  # the cell is its own parent: nothing new
+            try:
+                parent = spglib.standardize_cell(
+                    (lat, t, np.ones(t.shape[0], dtype=int)),
+                    to_primitive=True,
+                    no_idealize=True,
+                    symprec=1e-5,
+                )
+            except Exception:
+                parent = None
+            if parent is None:
+                continue
+            L = np.asarray(parent[0], dtype=float)
+            ratio = int(round(vol / abs(float(np.linalg.det(L)))))
+            if ratio in seen:
+                continue
+            seen.add(ratio)
+            a_min = float(np.linalg.norm(L, axis=1).min())
+            try:
+                ds = spglib.get_symmetry_dataset(
+                    (L, np.zeros((1, 3)), np.ones(1, dtype=int)),
+                    symprec=float(pseudo_symmetry_tol) * a_min,
+                )
+            except Exception:
+                ds = None
+            if ds is not None:
+                out.append((f"parent lattice, {ratio}x smaller cell", ds.rotations, L))
+        return out
 
     def _intensity_preserving_subgroup(
         self, quats: torch.Tensor, intensity_tol: float
@@ -411,11 +593,25 @@ class Crystal(AutoSerialize):
         Rs = quat_to_matrix(quats)
         Rs_true = quat_to_matrix(self.sym_quats)
 
+        # a pseudo-symmetry group comes from a lattice that is only nearly
+        # ideal, so its rotations and their products agree to the distortion
+        # (~1e-2 here, ~1e-6 for a hexagonal cell given to 5 decimals).
+        # Distinct crystallographic rotations are at least 60 degrees apart,
+        # with matrix entries differing by ~0.5, so 0.05 is unambiguous.
+        match_tol = 0.05
+
         def is_true(R):
-            return any(float((R - Rt).abs().max()) < 1e-6 for Rt in Rs_true)
+            return any(float((R - Rt).abs().max()) < match_tol for Rt in Rs_true)
 
         mismatch = torch.zeros(quats.shape[0], dtype=torch.float64)
         worst = 0.0
+        self._breaking_reflection = None
+        # a pseudo-symmetry holds only approximately in the metric too, so an
+        # image lands near, not on, the reflection it maps onto: snap it to
+        # the nearest one within the same fractional tolerance allowed for
+        # the atom positions, and treat anything farther as absent
+        snap = max(float(self._pseudo_symmetry_tol or 0.0), 1e-3)
+        g_len = torch.linalg.norm(g, dim=1)
         for i, R in enumerate(Rs):
             if is_true(R):
                 continue
@@ -423,8 +619,24 @@ class Crystal(AutoSerialize):
             hkl_img = torch.round(g_img @ self.lat_real.T).to(torch.long)
             idx = torch.tensor([lut.get(tuple(h), -1) for h in hkl_img.tolist()])
             ok = idx >= 0
-            m = float((inten[ok] - inten[idx[ok]]).abs().max()) / i_max if bool(ok.any()) else 0.0
+            if not bool(ok.any()):
+                continue
+            near = torch.linalg.norm(g_img - g[idx.clamp(min=0)], dim=1) <= snap * g_len + 1e-9
+            i_img = torch.where(near, inten[idx.clamp(min=0)], torch.zeros_like(inten))
+            diff = (inten[ok] - i_img[ok]).abs()
+            m = float(diff.max()) / i_max
             mismatch[i] = m
+            if m > worst:
+                # the reflection pair responsible, reported so the user can
+                # judge whether the data actually resolve it
+                j = int(torch.argmax(diff))
+                src = torch.nonzero(ok).squeeze(1)[j]
+                self._breaking_reflection = (
+                    tuple(int(v) for v in hkl[src].tolist()),
+                    float(inten[src]) / i_max,
+                    tuple(int(v) for v in hkl[idx[src]].tolist()),
+                    float(i_img[src]) / i_max,
+                )
             worst = max(worst, m)
 
         keep = mismatch <= intensity_tol
@@ -437,7 +649,7 @@ class Crystal(AutoSerialize):
             R_keep = Rs[idx]
             prod = torch.einsum("aij,bjk->abik", R_keep, R_keep).reshape(-1, 3, 3)
             d = (prod[:, None] - R_keep[None]).abs().amax(dim=(-1, -2))
-            closed = bool((d.min(dim=1).values < 1e-6).all())
+            closed = bool((d.min(dim=1).values < match_tol).all())
             if closed:
                 return quats[idx], worst
             drop = idx[int(torch.argmax(mismatch[idx]))]
@@ -570,8 +782,14 @@ class Crystal(AutoSerialize):
 
     @property
     def hexagonal_matching(self) -> bool:
-        """Whether the matching Laue class uses 4-index direction symbols."""
-        return self.laue_group_matching in ("6/m", "6/mmm", "-3", "-3m")
+        """Whether directions are written with 4-index symbols.
+
+        Directions are always indexed in the crystal's own cell, so this
+        follows that cell's Laue class, not the matching group's: a
+        monoclinic superstructure matched with a trigonal parent group still
+        has a monoclinic cell, and Miller-Bravais indices would be wrong.
+        """
+        return self.laue_group in ("6/m", "6/mmm", "-3", "-3m")
 
     def zone_axis_wedge_labels(self, mathtext: bool = True) -> list[str] | None:
         """Direction labels of the wedge corners (4-index for hexagonal and
@@ -579,14 +797,23 @@ class Crystal(AutoSerialize):
         corners = self.zone_axis_wedge()
         if corners is None:
             return None
-        return [
-            format_direction(
-                direction_indices(self.lat_real, c.numpy()),
-                hexagonal=self.hexagonal_matching,
-                mathtext=mathtext,
+        loose = max(2.0 * float(self._pseudo_symmetry_tol or 0.0), 0.02)
+        labels = []
+        for c in corners:
+            uvw = direction_indices(self.lat_real, c.numpy())
+            prefix = ""
+            if uvw is None:
+                # an axis of the pseudo-symmetry parent, a lattice direction
+                # only to within the distortion of the real cell
+                uvw = direction_indices(self.lat_real, c.numpy(), atol=loose)
+                prefix = "~"
+            labels.append(
+                prefix
+                + format_direction(uvw, hexagonal=self.hexagonal_matching, mathtext=mathtext)
+                if uvw is not None
+                else "(irrational)"
             )
-            for c in corners
-        ]
+        return labels
 
     def matching_symmetry_warning(self) -> str | None:
         """Message when the matching (pseudo) symmetry differs from the
@@ -599,7 +826,8 @@ class Crystal(AutoSerialize):
             f"pseudo-symmetry point group {self.pointgroup_matching} (Laue "
             f"class {self.laue_group_matching}, found at pseudo_symmetry_tol = "
             f"{self._pseudo_symmetry_tol:g} of the shortest lattice vector, "
-            f"intensities matching within {self.pseudo_symmetry_report.get('intensity_mismatch', 0.0):.1%}), "
+            f"intensities matching within {self.pseudo_symmetry_report.get('intensity_mismatch', 0.0):.2f} "
+            "of the strongest reflection), "
             f"while the cell's own symmetry "
             f"is {self.pointgroup} (Laue class {self.laue_group}). Orientations "
             f"related by the extra operations give the same library entry, so "
@@ -627,14 +855,37 @@ class Crystal(AutoSerialize):
                 f"(Laue class {self.laue_group_matching}) "
                 "-- used for orientation matching",
             ]
+            rep = self.pseudo_symmetry_report
+            if rep.get("route"):
+                lines += [f"                   from the {rep['route']}"]
+            if rep.get("intensity_mismatch", 0.0) > 0 and rep.get("broken_by") is not None:
+                h0, i0, h1, i1 = rep["broken_by"]
+                lines += [
+                    "                   accepted at intensity tol %.2f: largest difference "
+                    "(%s) at %.2f against (%s) at %.2f"
+                    % (
+                        self._pseudo_symmetry_intensity_tol,
+                        " ".join(map(str, h0)),
+                        i0,
+                        " ".join(map(str, h1)),
+                        i1,
+                    )
+                ]
         elif self._pseudo_symmetry_tol is not None:
             rep = self.pseudo_symmetry_report
             if rep.get("rejected"):
                 lines += [
-                    f"  pseudo-symmetry  {rep['candidate']} within {self._pseudo_symmetry_tol:g} of "
-                    f"the lattice, rejected: intensities differ by "
-                    f"{rep['intensity_mismatch']:.1%} (tol {self._pseudo_symmetry_intensity_tol:.0%})",
+                    f"  pseudo-symmetry  {rep['candidate']} from the {rep.get('route', 'lattice')}, "
+                    f"rejected: intensities differ by "
+                    f"{rep['intensity_mismatch']:.2f} (tol {self._pseudo_symmetry_intensity_tol:.2f})",
                 ]
+                if rep.get("broken_by") is not None:
+                    h0, i0, h1, i1 = rep["broken_by"]
+                    lines += [
+                        "                   broken by (%s) at %.2f against (%s) at %.2f of the "
+                        "strongest reflection"
+                        % (" ".join(map(str, h0)), i0, " ".join(map(str, h1)), i1)
+                    ]
             else:
                 lines += [
                     f"  pseudo-symmetry  none found at tol = {self._pseudo_symmetry_tol:g} "

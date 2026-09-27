@@ -22,9 +22,7 @@ from quantem.diffraction.rotations import (
 
 def _pattern(xtl, q, rng):
     p = xtl.generate_pattern(q, energy_ev=200e3, sigma_excitation=0.02)
-    arr = np.column_stack(
-        [p["qx"].numpy(), p["qy"].numpy(), p["intensity"].numpy()]
-    )
+    arr = np.column_stack([p["qx"].numpy(), p["qy"].numpy(), p["intensity"].numpy()])
     arr[:, :2] += rng.normal(0, 0.003, (arr.shape[0], 2))
     arr[:, 2] *= rng.lognormal(0, 0.3, arr.shape[0])
     return arr
@@ -43,8 +41,7 @@ def test_two_phase_map():
     # beta along [111] zone; alpha along [0001]: the Burgers-related pair
     # shares the hexagonal net, the hard case for phase mapping
     q_beta = quat_from_axis_angle(
-        torch.tensor([1.0, -1.0, 0.0], dtype=torch.float64)
-        / np.sqrt(2),
+        torch.tensor([1.0, -1.0, 0.0], dtype=torch.float64) / np.sqrt(2),
         torch.tensor(np.arccos(1 / np.sqrt(3)), dtype=torch.float64),
     )
     q_alpha = qmult(
@@ -77,9 +74,7 @@ def test_two_phase_map():
                 truth[r, c] = 2
             row.append(arr)
         cells.append(row)
-    peaks = Vector.from_data(
-        cells, fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t"
-    )
+    peaks = Vector.from_data(cells, fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t")
 
     oms = []
     for xtl in (ti_a, ti_b):
@@ -112,3 +107,86 @@ def test_two_phase_map():
     # phases with a valid orientation (either is acceptable)
     band_pi = pi[:, band[0] : band[1] + 1]
     assert np.isin(band_pi, [0, 1]).all()
+
+
+def test_crystal_map_sets_k_max_once():
+    # two phases simulated to different ranges are not compared fairly, and
+    # setting k_max per crystal invites exactly that mistake
+    import numpy as np
+    import pytest
+    from ase.build import bulk
+
+    from quantem.core.datastructures import Vector
+    from quantem.diffraction import Crystal, CrystalMap
+
+    peaks = Vector.from_data(
+        [[np.array([[0.0, 0.0, 1.0], [0.3, 0.1, 0.5], [-0.2, 0.4, 0.3]])]],
+        fields=["qx", "qy", "intensity"],
+        name="p",
+    )
+    au = Crystal.from_ase(bulk("Au", "fcc", a=4.08, cubic=True), verbose=False)
+    fe = Crystal.from_ase(bulk("Fe", "bcc", a=2.87, cubic=True), verbose=False)
+
+    with pytest.raises(ValueError, match="pass k_max"):
+        CrystalMap.from_vectors(peaks, [au, fe])
+
+    au.calculate_structure_factors(k_max=1.4)
+    fe.calculate_structure_factors(k_max=2.0)
+    with pytest.raises(ValueError, match="different k_max"):
+        CrystalMap.from_vectors(peaks, [au, fe])
+
+    cm = CrystalMap.from_vectors(peaks, [au, fe], k_max=1.8)
+    assert cm.k_max == 1.8
+    assert au.k_max == fe.k_max == 1.8
+    assert float(au.g_len.max()) <= 1.8 and float(fe.g_len.max()) <= 1.8
+
+
+def test_dynamical_update_is_local_and_examples_are_spread():
+    from quantem.diffraction.crystal_map import CrystalMap
+
+    rng = np.random.default_rng(4)
+    ti_a = Crystal.from_ase(
+        bulk("Ti", "hcp", a=2.9505, c=4.6855), name="Ti alpha", verbose=False
+    ).calculate_structure_factors(k_max=1.5)
+    ti_b = Crystal.from_ase(
+        bulk("Ti", "bcc", a=3.26, cubic=True), name="Ti beta", verbose=False
+    ).calculate_structure_factors(k_max=1.5)
+    q_a = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    q_b = quat_from_axis_angle(
+        torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64),
+        torch.tensor(np.deg2rad(20.0), dtype=torch.float64),
+    )
+    R, C = 3, 8
+    cells = [
+        [_pattern(ti_a, q_a, rng) if c < 4 else _pattern(ti_b, q_b, rng) for c in range(C)]
+        for _ in range(R)
+    ]
+    peaks = Vector.from_data(cells, fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t")
+    oms = []
+    for xtl in (ti_a, ti_b):
+        om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+        om.build_plan()
+        om.match_orientations(progress_bar=False)
+        oms.append(om)
+    cm = CrystalMap.from_orientation_maps(oms)
+    cm.fit(progress_bar=False)
+    before = cm.phase_index.copy()
+    assert (before[:, :4] == 0).all() and (before[:, 4:] == 1).all()
+
+    # a dynamical result that reached one position and flipped it
+    F = len(cm.phases.candidates)
+    cost = torch.full((R, C, F), torch.nan, dtype=torch.float64)
+    cost[0, 0] = torch.tensor([0.9, 0.1])
+    cm.phases.apply_dynamical({"cost": cost, "phase_index": cost.nan_to_num(9).argmin(-1)})
+    after = cm.phase_index
+    assert after[0, 0] == 1
+    changed = after != before
+    changed[0, 0] = False
+    assert not changed.any()
+    assert (cm.phases.metadata["kinematical"]["phase_index"].numpy() == before).all()
+
+    picks = cm.example_positions(phase="Ti beta", num=3, min_distance=3)
+    assert all(cm.phase_index[p] == 1 for p in picks)
+    assert all(
+        (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 >= 9 for i, a in enumerate(picks) for b in picks[:i]
+    )

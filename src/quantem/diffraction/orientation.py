@@ -274,6 +274,7 @@ class OrientationMap(AutoSerialize):
         self.quats: torch.Tensor | None = None
         self.corr: torch.Tensor | None = None
         self.corr_residual: torch.Tensor | None = None
+        self.score: torch.Tensor | None = None
         self.corr_second: torch.Tensor | None = None
         self.reliability: torch.Tensor | None = None
         self.mirror: torch.Tensor | None = None
@@ -332,6 +333,7 @@ class OrientationMap(AutoSerialize):
         detector_q_max: float | tuple[float, float] | str | None = "auto",
         device: str | torch.device = "cpu",
         verbose: bool = True,
+        progress_bar: bool = True,
     ) -> "OrientationMap":
         """Build the polar correlation library over the fundamental wedge.
 
@@ -415,8 +417,12 @@ class OrientationMap(AutoSerialize):
             silicon 'mps' runs the correlation in float32 (about 1.5x faster
             than the CPU); the refinements that follow stay on the CPU.
         verbose : bool, default=True
-            Print the symmetry actually used for matching (including any
-            pseudo-symmetry reduction) and the plan size.
+            Print the plan size and the group used for matching. The crystal
+            prints its full symmetry, pseudo-symmetry included, when built.
+        progress_bar : bool, default=True
+            Show a progress bar while the library is deposited, which is
+            most of the time: ~20 s per crystal at k_max = 2 over a trigonal
+            wedge, several times that over a full hemisphere.
         """
         crystal = self.crystal
         self.device = torch.device(device)
@@ -488,7 +494,7 @@ class OrientationMap(AutoSerialize):
         self.num_gamma = int(round(360 / angle_step_in_plane_deg))
         self.gamma = torch.linspace(0, 2 * np.pi, self.num_gamma + 1, dtype=torch.float64)[:-1]
 
-        plan = self._build_reference(self.zone_quats)
+        plan = self._build_reference(self.zone_quats, progress_bar=progress_bar)
         # store conj(fft) along gamma so matching is a single complex matmul
         self.plan_fft = torch.conj(torch.fft.fft(plan, dim=-1)).to(self.cdtype).to(self.device)
 
@@ -566,14 +572,17 @@ class OrientationMap(AutoSerialize):
             else tuple(np.atleast_1d(detector_q_max).tolist()),
         )
         if verbose:
-            print(crystal.symmetry_summary())
+            # the crystal printed its own symmetry when it was built; the plan
+            # adds only what it sampled
             print(
-                "  orientation plan %d zone axes x %d in-plane angles, "
-                "%d radial shells"
+                "%s: orientation plan %d zone axes x %d in-plane angles, "
+                "%d radial shells, matching %s"
                 % (
+                    crystal.name,
                     self.zone_axes.shape[0],
                     self.gamma.shape[0],
                     self.shell_radii.shape[0],
+                    crystal.pointgroup_matching,
                 )
             )
         return self
@@ -615,7 +624,8 @@ class OrientationMap(AutoSerialize):
                     'zone_axis_range must be "auto", "full", "fiber", or an array of directions'
                 )
             msg = crystal.matching_symmetry_warning()
-            if msg is not None:
+            # a crystal built with verbose=True already said this in its summary
+            if msg is not None and not getattr(crystal, "_summary_shown", False):
                 warnings.warn(msg, stacklevel=3)
             wedge = crystal.zone_axis_wedge()
             if wedge is None:  # triclinic / monoclinic: not a spherical triangle
@@ -640,6 +650,7 @@ class OrientationMap(AutoSerialize):
         amp: torch.Tensor,
         out: torch.Tensor,
         image: torch.Tensor | None = None,
+        progress: str | None = None,
     ) -> torch.Tensor:
         """Deposit peaks into polar images with the shared correlation kernel.
 
@@ -658,6 +669,8 @@ class OrientationMap(AutoSerialize):
         image : torch.Tensor | None
             (K,) image index of every peak, so a whole batch of patterns
             (or a whole library) is deposited in one call.
+        progress : str | None
+            Description for a progress bar over the chunks; None shows none.
         """
         radii = self.shell_radii.to(qr.dtype)
         delta = self.corr_kernel_size
@@ -671,7 +684,10 @@ class OrientationMap(AutoSerialize):
         flat = out.view(-1, out.shape[-1])
         # chunked so the (entries, G) weight array stays a few tens of MB
         chunk = max(1, 4_000_000 // gamma.shape[0])
-        for c0 in range(0, k_all.numel(), chunk):
+        starts = range(0, k_all.numel(), chunk)
+        if progress is not None:
+            starts = tqdm(starts, desc=progress)
+        for c0 in starts:
             k_idx = k_all[c0 : c0 + chunk]
             s_idx = s_all[c0 : c0 + chunk]
             w_r = torch.exp(-(dr[k_idx, s_idx] ** 2) / (2 * delta**2)) * amp[k_idx]
@@ -683,7 +699,9 @@ class OrientationMap(AutoSerialize):
             flat.index_add_(0, rows, w)
         return out
 
-    def _build_reference(self, zone_quats: torch.Tensor) -> torch.Tensor:
+    def _build_reference(
+        self, zone_quats: torch.Tensor, progress_bar: bool = False
+    ) -> torch.Tensor:
         """Polar reference library (Z, S, G) for the given zone-axis quats."""
         crystal = self.crystal
         lam = self.wavelength
@@ -732,7 +750,12 @@ class OrientationMap(AutoSerialize):
         plan = torch.zeros((Z, self.shell_radii.shape[0], self.num_gamma), dtype=torch.float64)
         z_idx, n_idx = torch.nonzero(vals > 1e-8, as_tuple=True)
         self._deposit_polar(
-            qr[z_idx, n_idx], qphi[z_idx, n_idx], vals[z_idx, n_idx], plan, image=z_idx
+            qr[z_idx, n_idx],
+            qphi[z_idx, n_idx],
+            vals[z_idx, n_idx],
+            plan,
+            image=z_idx,
+            progress=f"orientation plan {crystal.name}" if progress_bar else None,
         )
 
         norm = torch.linalg.norm(plan.reshape(Z, -1), dim=1).clamp_min(1e-12)
@@ -872,10 +895,8 @@ class OrientationMap(AutoSerialize):
             the in-plane angle together: a candidate is rejected only when it
             is within this angle of an earlier match in both. Two grains
             sharing a zone axis but rotated in plane past this angle are
-            therefore kept as separate matches.
-            Exclusion radius (degrees, zone-axis distance) around earlier
-            matches, both for later matches and for the second-best score
-            used in `reliability`.
+            therefore kept as separate matches. The same test picks the
+            second-best score used in `reliability`.
         subpixel_gamma : bool, default=True
             Parabolic sub-bin refinement of the in-plane angle.
         subpixel_zone : bool, default=True
@@ -1233,7 +1254,7 @@ class OrientationMap(AutoSerialize):
         self.quats[..., match, :] = smooth_quaternions(
             self.quats[..., match, :],
             active,
-            self.crystal.sym_quats,
+            self.crystal.sym_quats_matching,
             sigma_px=sigma_px,
             sigma_deg=sigma_deg,
             max_angle_deg=max_angle_deg,
@@ -1255,7 +1276,7 @@ class OrientationMap(AutoSerialize):
             active = active & self.computed
         active = active & (self.corr[..., match] > 0)
         return smooth_quaternions(
-            self.quats[..., match, :], active, self.crystal.sym_quats, **kwargs
+            self.quats[..., match, :], active, self.crystal.sym_quats_matching, **kwargs
         )
 
     def refine_orientations(
@@ -1274,6 +1295,9 @@ class OrientationMap(AutoSerialize):
         batched: bool = True,
         neighbor_rescue: bool = True,
         rescue_threshold_deg: float = 2.0,
+        rescue_passes: int = 3,
+        score_tol: float = 0.002,
+        consensus_tol: float = 0.01,
         progress_bar: bool = True,
     ) -> "OrientationMap":
         """Refine matched orientations by least squares on paired peak positions.
@@ -1324,30 +1348,63 @@ class OrientationMap(AutoSerialize):
             Half-range of the envelope tilt search, in degrees.
         zone_max_total_deg : float | None
             Trust region: cap on the cumulative envelope tilt applied to
+            each orientation, relative to its matched start. The coarse
+            match is grid-accurate to about half the zone-axis step, so tilt
+            corrections beyond that scale are noise walking the orientation
+            out of its basin. Defaults to 0.75 * the plan's zone step.
         power_intensity : float | None
             Power applied to the measured and predicted intensities in the
             tilt envelope fit, inherited from the plan (0.25 by default).
             Linear intensities let the strongest reflections dominate and,
             on dynamical data, drive the fit to the edge of the search range.
-            each orientation, relative to its matched start. The coarse
-            match is grid-accurate to about half the zone-axis step, so tilt
-            corrections beyond that scale are noise walking the orientation
-            out of its basin. Defaults to 0.375 * the plan's zone step.
         sigma_envelope : float | None
             Excitation-error width of the envelope objective; defaults to
             half the plan's sigma_excitation (the plan value is widened for
             grid robustness).
         neighbor_rescue : bool, default=True
-            Second pass over positions whose best match disagrees with every
-            neighbor by more than rescue_threshold_deg: re-refine from every
-            distinct candidate orientation -- all matches of all eight
-            neighbors, and this position's own remaining matches -- and keep
-            the highest-scoring result (score = total paired measured
-            intensity). Repairs isolated wrong local optima such as
-            near-degenerate variants, and probe positions straddling two
-            grains, where the correct orientation is often the second match.
+            Retry every position that disagrees with a matched neighbour by
+            more than `rescue_threshold_deg`, from every distinct candidate
+            around it: all matches of the eight neighbours, this position's
+            own other matches, and its Friedel twin (the orientation rotated
+            180 degrees about the beam). The one that best explains the
+            measured peaks is kept, judged by the same correlation matching
+            maximizes (see below); among candidates within `consensus_tol`
+            of the best, the one most neighbours agree with. Repairs wrong
+            local optima, near-degenerate variants, and probe positions
+            straddling two grains.
         rescue_threshold_deg : float, default=2.0
-            Minimum-neighbor misorientation that triggers the rescue pass.
+            Misorientation to a neighbour that triggers a retry.
+        rescue_passes : int, default=3
+            Rescue passes; each after the first revisits only positions next
+            to a change, since a corrected neighbour can offer a better
+            candidate.
+        score_tol : float, default=0.002
+            Correlation margin. A refinement that moves an orientation by
+            more than `rescue_threshold_deg` is undone where it lowers the
+            correlation below the library match's by more than this, and a
+            rescue candidate replaces the current orientation only when it
+            beats it by more than this.
+        consensus_tol : float, default=0.01
+            Correlation within which two candidates count as equally good.
+            Sparse patterns often cannot tell a few orientations apart:
+            pseudo-symmetric variants whose distinguishing reflections were
+            not recorded, and always the Friedel twin, as kinematic spot
+            positions are centrosymmetric and only the Ewald curvature
+            separates the two. Such ties are broken by agreement with the
+            eight neighbours; the Friedel twin is adopted only this way,
+            never on its score alone. 0 judges every position by its own
+            pattern alone.
+
+        Notes
+        -----
+        Every orientation is judged by the correlation it gives with the
+        measured peaks -- the cosine similarity of the two patterns built
+        from the library's Gaussian pairing kernel -- and the result is
+        stored in :attr:`score`. Refinement itself works on paired peak
+        positions, a different objective; on sparse or ambiguous patterns it
+        can move an orientation downhill, and scoring every candidate the
+        same way is what keeps the stages consistent. The counts of reverted
+        refinements and rescued positions are in ``metadata['refine']``.
         """
         assert self.quats is not None
         plan_md = self.metadata.get("plan")
@@ -1370,6 +1427,9 @@ class OrientationMap(AutoSerialize):
             sigma_envelope=sigma_envelope,
             neighbor_rescue=bool(neighbor_rescue),
             rescue_threshold_deg=float(rescue_threshold_deg),
+            rescue_passes=int(rescue_passes),
+            score_tol=float(score_tol),
+            consensus_tol=float(consensus_tol),
         )
         peaks = self.peaks
         R, C, M = self.quats.shape[:3]
@@ -1544,6 +1604,12 @@ class OrientationMap(AutoSerialize):
         active = position_mask(positions, (R, C))
         if self.computed is not None:
             active = active & self.computed
+        # the library matches, kept so refinement can be undone where it
+        # made the fit worse
+        q_start = self.quats.clone()
+        # one bar per crystal covers refinement and neighbour rescue; each
+        # stage adds its own work to the total as it starts
+        bar = tqdm(total=0, desc=f"refining {self.crystal.name}") if progress_bar else None
         if batched and not refine_tilt:
             self._refine_batched(
                 scores,
@@ -1557,13 +1623,16 @@ class OrientationMap(AutoSerialize):
                 min_pairs=min_pairs,
                 refine_zone=refine_zone,
                 power_env=power_env,
-                progress_bar=progress_bar,
+                progress_bar=bar if bar is not None else False,
             )
         else:
             iterator = [(rx, ry) for rx, ry in np.ndindex(R, C) if active[rx, ry]]
-            if progress_bar:
-                iterator = tqdm(iterator, desc="refining orientations")
+            if bar is not None:
+                bar.total = (bar.total or 0) + len(iterator)
+                bar.refresh()
             for rx, ry in iterator:
+                if bar is not None:
+                    bar.update(1)
                 q_exp, w_exp = get_exp(rx, ry)
                 if q_exp is None:
                     continue
@@ -1575,72 +1644,244 @@ class OrientationMap(AutoSerialize):
                     if m == 0:
                         scores[rx, ry] = sc
 
-        if neighbor_rescue:
-            # a wrong local optimum (e.g. a near-degenerate variant) shows as
-            # a discontinuity: retry those positions from each distinct
-            # neighbor orientation and keep the best-scoring result
-            q0 = self.quats[..., 0, :]
-            miso_min = torch.full((R, C), torch.inf, dtype=torch.float64)
-            for dr, dc in ((0, 1), (1, 0)):
-                a = q0[: R - dr, : C - dc]
-                b = q0[dr:, dc:]
-                mm = misorientation_angle_deg(
-                    a.reshape(-1, 4), b.reshape(-1, 4), self.crystal.sym_quats
-                ).reshape(R - dr, C - dc)
-                miso_min[: R - dr, : C - dc] = torch.minimum(miso_min[: R - dr, : C - dc], mm)
-                miso_min[dr:, dc:] = torch.minimum(miso_min[dr:, dc:], mm)
-            retry = torch.nonzero((miso_min > rescue_threshold_deg) & active)
-            it2 = retry.tolist()
-            if progress_bar and len(it2):
-                it2 = tqdm(it2, desc="neighbor rescue")
-            n_rescued = 0
-            for rx, ry in it2:
-                q_exp, w_exp = get_exp(rx, ry)
-                if q_exp is None:
+        # Refinement polishes the orientation on paired peak positions, which
+        # is accurate for small corrections but can jump to another basin on
+        # sparse or ambiguous patterns. A polish within `rescue_threshold_deg`
+        # is trusted: the correlation depends on the excitation envelope,
+        # which is only approximately known, so it cannot referee sub-degree
+        # moves. A jump beyond that must explain the measured peaks better
+        # than the library match did, or it is undone.
+        act_list = [(rx, ry) for rx, ry in np.ndindex(R, C) if active[rx, ry]]
+        if bar is not None:
+            bar.set_description(f"{self.crystal.name} checking against the library match")
+            bar.total += len(act_list)
+            bar.refresh()
+        cscore = torch.zeros((R, C), dtype=torch.float64)
+        n_reverted = 0
+        for rx, ry in act_list:
+            if bar is not None:
+                bar.update(1)
+            data = peaks[rx, ry].array
+            meas = self._measured_term(data, ix)
+            for m in range(M):
+                if self.corr[rx, ry, m] <= 0:
                     continue
-                best_q = self.quats[rx, ry, 0]
-                best_s = float(scores[rx, ry])
-                cands = []
+                s_new = self._correlation_score(self.quats[rx, ry, m], data, ix, meas)
+                moved = float(
+                    misorientation_angle_deg(
+                        self.quats[rx, ry, m], q_start[rx, ry, m], self.crystal.sym_quats_matching
+                    )
+                )
+                if moved > rescue_threshold_deg:
+                    s_old = self._correlation_score(q_start[rx, ry, m], data, ix, meas)
+                    if s_new < s_old - score_tol:
+                        self.quats[rx, ry, m] = q_start[rx, ry, m]
+                        s_new = s_old
+                        n_reverted += int(m == 0)
+                if m == 0:
+                    cscore[rx, ry] = s_new
+        self.metadata["refine"]["n_reverted"] = int(n_reverted)
 
-                def _add(qn, cands=cands):
-                    if all(
-                        float(misorientation_angle_deg(qn, c, self.crystal.sym_quats)) > 0.5
-                        for c in cands
-                    ):
-                        cands.append(qn)
-
-                # where two grains overlap in one probe, the right orientation
-                # is often this position's own second match rather than the
-                # first, so try every candidate here as well as every
-                # candidate of every neighbour
-                for m in range(1, M):
-                    if self.corr[rx, ry, m] > 0:
-                        _add(self.quats[rx, ry, m])
+        if neighbor_rescue:
+            # A wrong local optimum shows as a position disagreeing with a
+            # neighbour. Retry every such position from every distinct
+            # candidate around it -- all matches of the eight neighbours,
+            # this position's own other matches, and its Friedel twin -- and
+            # keep whichever explains the measured peaks best, by the same
+            # correlation; candidates within `consensus_tol` of the best are a
+            # tie, broken by how many neighbours agree. Only matched
+            # neighbours count, and the comparison is in the group the library
+            # was built with, where folded variants are one answer. Repeat
+            # while anything changes, up to `rescue_passes` times.
+            sym_m = self.crystal.sym_quats_matching
+            # 180 degrees about the beam: kinematic spot positions are
+            # centrosymmetric and the excitation errors nearly so, so only the
+            # Ewald curvature tells the two apart
+            q_twin = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=self.quats.dtype)
+            n_retried = n_rescued = 0
+            changed = active.clone()
+            for _pass in range(max(int(rescue_passes), 0)):
+                q0 = self.quats[..., 0, :]
+                miso_max = torch.zeros((R, C), dtype=torch.float64)
+                for dr, dc in ((0, 1), (1, 0)):
+                    both = active[: R - dr, : C - dc] & active[dr:, dc:]
+                    mm = misorientation_angle_deg(
+                        q0[: R - dr, : C - dc].reshape(-1, 4), q0[dr:, dc:].reshape(-1, 4), sym_m
+                    ).reshape(R - dr, C - dc)
+                    mm = torch.where(both, mm, torch.zeros_like(mm))
+                    miso_max[: R - dr, : C - dc] = torch.maximum(miso_max[: R - dr, : C - dc], mm)
+                    miso_max[dr:, dc:] = torch.maximum(miso_max[dr:, dc:], mm)
+                # after the first pass, only where something nearby changed
+                near_change = changed.clone()
                 for dr in (-1, 0, 1):
                     for dc in (-1, 0, 1):
-                        nr, nc = rx + dr, ry + dc
-                        if (dr == 0 and dc == 0) or not (0 <= nr < R and 0 <= nc < C):
-                            continue
-                        for m in range(M):
-                            # neighbour match absent (never run, or skipped)
-                            if self.corr[nr, nc, m] <= 0:
+                        near_change |= torch.roll(torch.roll(changed, dr, 0), dc, 1)
+                retry = torch.nonzero((miso_max > rescue_threshold_deg) & active & near_change)
+                it2 = retry.tolist()
+                if not it2:
+                    break
+                if bar is not None:
+                    bar.set_description(
+                        f"{self.crystal.name} neighbor rescue {_pass + 1}/{rescue_passes}"
+                    )
+                    bar.set_postfix_str(f"{len(it2)} positions")
+                    bar.total += len(it2)
+                    bar.refresh()
+                changed = torch.zeros((R, C), dtype=torch.bool)
+                for rx, ry in it2:
+                    if bar is not None:
+                        bar.update(1)
+                    n_retried += 1
+                    q_exp, w_exp = get_exp(rx, ry)
+                    if q_exp is None:
+                        continue
+                    data = peaks[rx, ry].array
+                    cur_q = self.quats[rx, ry, 0].clone()
+                    cur_s = float(cscore[rx, ry])
+                    cands = [cur_q]
+
+                    def _add(qn, cands=cands):
+                        if all(float(misorientation_angle_deg(qn, c, sym_m)) > 0.5 for c in cands):
+                            cands.append(qn)
+
+                    _add(qmult(q_twin, cur_q))
+                    # none where the twin is a symmetry copy of this orientation
+                    twin_ix = 1 if len(cands) == 2 else None
+                    nbrs = []
+                    for m in range(1, M):
+                        if self.corr[rx, ry, m] > 0:
+                            _add(self.quats[rx, ry, m])
+                    for dr in (-1, 0, 1):
+                        for dc in (-1, 0, 1):
+                            nr, nc = rx + dr, ry + dc
+                            if (dr == 0 and dc == 0) or not (0 <= nr < R and 0 <= nc < C):
                                 continue
-                            _add(self.quats[nr, nc, m])
-                for qc in cands:
-                    q, sc = refine_single(qc.clone(), q_exp, w_exp)
-                    if sc > best_s * 1.02:
-                        best_q, best_s = q, sc
-                if best_s > float(scores[rx, ry]):
-                    n_rescued += 1
-                self.quats[rx, ry, 0] = best_q
-                scores[rx, ry] = best_s
-            self.metadata["refine"]["n_retried"] = len(retry)
+                            if not bool(active[nr, nc]):
+                                continue
+                            nbrs.append(self.quats[nr, nc, 0])
+                            for m in range(M):
+                                if self.corr[nr, nc, m] > 0:
+                                    _add(self.quats[nr, nc, m])
+                    # score every candidate as it stands -- the neighbours'
+                    # were refined on a neighbouring pattern already
+                    cq = torch.stack(cands)
+                    meas = self._measured_term(data, ix)
+                    cs = [cur_s] + [
+                        self._correlation_score(qc, data, ix, meas) for qc in cands[1:]
+                    ]
+                    # polish the best on this pattern, keeping it if it helps
+                    k = int(np.argmax(cs))
+                    if k > 0:
+                        q_ref, _ = refine_single(cq[k].clone(), q_exp, w_exp)
+                        s_ref = self._correlation_score(q_ref, data, ix, meas)
+                        if s_ref > cs[k]:
+                            cq[k], cs[k] = q_ref, s_ref
+                    cs = np.asarray(cs)
+                    # ties within consensus_tol go to the candidate most
+                    # neighbours agree with, then to the higher correlation
+                    support = np.zeros(len(cs), dtype=int)
+                    if nbrs:
+                        nq = torch.stack(nbrs)
+                        miso = misorientation_angle_deg(cq[:, None, :], nq[None], sym_m)
+                        support = (miso <= rescue_threshold_deg).sum(dim=1).numpy()
+                    tied = cs >= cs.max() - consensus_tol
+                    pick = max(np.flatnonzero(tied), key=lambda j: (support[j], cs[j]))
+                    agreed = (
+                        consensus_tol > 0
+                        and support[pick] > support[0]
+                        and cs[pick] >= cur_s - consensus_tol
+                    )
+                    if not agreed:
+                        # by the pattern alone; the twin never wins here, as
+                        # its pattern differs only by the Ewald curvature and
+                        # a higher score is the forward model's error
+                        own = [j for j in range(len(cs)) if j != twin_ix]
+                        pick = max(own, key=lambda j: cs[j])
+                    if pick > 0 and (agreed or cs[pick] > cur_s + score_tol):
+                        n_rescued += 1
+                        changed[rx, ry] = True
+                        self.quats[rx, ry, 0] = cq[pick]
+                        cscore[rx, ry] = float(cs[pick])
+            self.metadata["refine"]["n_retried"] = int(n_retried)
             self.metadata["refine"]["n_rescued"] = int(n_rescued)
+        if bar is not None:
+            bar.set_description(f"refined {self.crystal.name}")
+            bar.set_postfix_str(
+                f"kept the library match at {n_reverted}"
+                + (
+                    f", rescued {self.metadata['refine'].get('n_rescued', 0)}"
+                    if neighbor_rescue
+                    else ""
+                )
+            )
+        self.score = cscore
+        if bar is not None:
+            bar.close()
         return self
 
     # ------------------------------------------------------------------
     # forward simulation of a match
     # ------------------------------------------------------------------
+
+    def _measured_term(self, data: np.ndarray, ix: list[int]) -> tuple:
+        """Measured side of :meth:`_correlation_score`: positions, weights
+        and self-overlap, the same for every candidate at a position."""
+        m_xy = torch.as_tensor(data[:, ix[:2]], dtype=torch.float64)
+        m_i = torch.as_tensor(data[:, ix[2]], dtype=torch.float64).clamp_min(0)
+        w_m = (
+            m_i**self.power_intensity_experiment
+            * torch.linalg.norm(m_xy, dim=1) ** self.power_radial
+        )
+        inv = 1.0 / (4.0 * self.corr_kernel_size**2)
+        mm = float(w_m @ torch.exp(-(torch.cdist(m_xy, m_xy) ** 2) * inv) @ w_m)
+        return m_xy, w_m, max(mm, 0.0)
+
+    def _correlation_score(
+        self, q: torch.Tensor, data: np.ndarray, ix: list[int], measured: tuple | None = None
+    ) -> float:
+        """How well orientation `q` explains the measured peaks `data`.
+
+        The cosine similarity between the measured and the simulated
+        patterns, each a set of Gaussian spots of the library's pairing
+        width: the continuous form of the correlation matching maximizes,
+        with the same intensity and radial weights. Unlike a sum of paired
+        intensity it charges for predicted spots that were not measured, so
+        a denser pattern does not win by pairing more peaks. Simulated
+        reflections outside the detector are left out, as in the library.
+        """
+        pd = float(self.metadata.get("precession_deg", 0.0) or 0.0)
+        sc = float(self.metadata.get("semiconv_mrad", 0.0) or 0.0)
+        sim = self.crystal.generate_pattern(
+            q,
+            energy_ev=self.energy_ev,
+            sigma_excitation=self.sigma_excitation,
+            precession_deg=pd,
+            semiconv_mrad=sc,
+        )
+        s_xy = torch.stack((sim["qx"], sim["qy"]), dim=1).to(torch.float64)
+        s_i = sim["intensity"].to(torch.float64).clamp_min(0)
+        det = (self.metadata.get("plan") or {}).get("detector_q_max")
+        if det is not None and s_xy.shape[0]:
+            det = np.atleast_1d(det).astype(float)
+            qx_max, qy_max = (det[0], det[0]) if det.size == 1 else (det[0], det[1])
+            rot = np.deg2rad(-float(self.peaks.metadata.get("rotation_ccw_deg", 0.0) or 0.0))
+            c, s_ = np.cos(rot), np.sin(rot)
+            r_det = s_xy[:, 0] * c - s_xy[:, 1] * s_
+            c_det = s_xy[:, 0] * s_ + s_xy[:, 1] * c
+            on = (r_det.abs() <= qx_max) & (c_det.abs() <= qy_max)
+            s_xy, s_i = s_xy[on], s_i[on]
+        p_rad = float(self.power_radial)
+        inv = 1.0 / (4.0 * self.corr_kernel_size**2)
+
+        def overlap(a, wa, b, wb):
+            return float(wa @ torch.exp(-(torch.cdist(a, b) ** 2) * inv) @ wb)
+
+        m_xy, w_m, mm = measured if measured is not None else self._measured_term(data, ix)
+        if s_xy.shape[0] == 0 or m_xy.shape[0] == 0:
+            return 0.0
+        w_s = s_i**self.power_intensity * torch.linalg.norm(s_xy, dim=1) ** p_rad
+        norm = np.sqrt(mm * max(overlap(s_xy, w_s, s_xy, w_s), 0.0))
+        return overlap(m_xy, w_m, s_xy, w_s) / norm if norm > 0 else 0.0
 
     def _refine_batched(
         self,
@@ -1654,7 +1895,7 @@ class OrientationMap(AutoSerialize):
         num_iterations: int,
         min_pairs: int,
         refine_zone: bool,
-        progress_bar: bool,
+        progress_bar,
         chunk: int = 64,
         power_env: float = POWER_INTENSITY,
     ) -> None:
@@ -1714,9 +1955,17 @@ class OrientationMap(AutoSerialize):
         valid_pos = torch.as_tensor(counts >= min_pairs) & active.reshape(N)
 
         chunks = [i for i in range(0, N, chunk) if bool(valid_pos[i : i + chunk].any())]
-        if progress_bar:
-            chunks = tqdm(chunks, desc="refining orientations")
+        # `progress_bar` is either a flag or the bar refine_orientations
+        # shares with the neighbour rescue, so one crystal shows one bar
+        bar = progress_bar if hasattr(progress_bar, "update") else None
+        if bar is not None:
+            bar.total = (bar.total or 0) + len(chunks)
+            bar.refresh()
+        elif progress_bar:
+            chunks = tqdm(chunks, desc=f"refining {self.crystal.name}")
         for i0 in chunks:
+            if bar is not None:
+                bar.update(1)
             i1 = min(i0 + chunk, N)
             B = i1 - i0
             qe = q_exp[i0:i1]  # (B, P, 2)
@@ -1996,7 +2245,8 @@ class OrientationMap(AutoSerialize):
             ok &= torch.as_tensor(np.asarray(mask, dtype=float).reshape(-1)) > 0.5
 
         labels = torch.full((R * C,), -1, dtype=torch.long)
-        sym = self.crystal.sym_quats
+        # variants the library folds together belong to one grain
+        sym = self.crystal.sym_quats_matching
         unassigned = ok.clone()
         means, sizes = [], []
         k = 0
@@ -2085,7 +2335,7 @@ class OrientationMap(AutoSerialize):
 
         iterator = list(np.ndindex(R, C))
         if progress_bar:
-            iterator = tqdm(iterator, desc="strain mapping")
+            iterator = tqdm(iterator, desc=f"strain mapping {self.crystal.name}")
         for rx, ry in iterator:
             if mask is not None and not mask[rx, ry]:
                 continue

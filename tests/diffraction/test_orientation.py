@@ -608,3 +608,90 @@ def test_display_smoothing_needs_both_widths():
     plt.close("all")
     # smoothing for display must never touch the stored orientations
     assert torch.equal(before, om.quats)
+
+
+def test_rescue_breaks_friedel_ties_by_neighbours():
+    """At a zone axis the pattern rotated 180 degrees about the beam is the
+    same pattern, so a scattered twin can only be undone by its neighbours."""
+    from quantem.diffraction.rotations import qmult, quat_from_zone_axis
+
+    xtl = Crystal.from_ase(bulk("Ti", "hcp", a=2.95, c=4.686))
+    xtl.calculate_structure_factors(k_max=1.5)
+    zone = torch.tensor([1.0, 0.0, 1.0], dtype=torch.float64) @ xtl.lat_real.to(torch.float64)
+    q = quat_from_zone_axis(zone, 20.0)
+    twin = qmult(torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float64), q)
+    assert float(misorientation_angle_deg(q, twin, xtl.sym_quats_matching)) > 10.0
+
+    R, C = 5, 5
+    peaks = Vector.from_shape(
+        (R, C), fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t"
+    )
+    p = xtl.generate_pattern(q, energy_ev=200e3, sigma_excitation=0.02)
+    for i in range(R):
+        for j in range(C):
+            peaks[i, j] = np.stack(
+                [p["qx"].numpy(), p["qy"].numpy(), p["intensity"].numpy()], axis=1
+            )
+    flipped = torch.zeros((R, C), dtype=torch.bool)
+    flipped[1, 1] = flipped[2, 3] = flipped[3, 1] = True
+
+    def run(consensus_tol):
+        om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+        om.build_plan(angle_step_zone_axis_deg=2.0, verbose=False, progress_bar=False)
+        om.quats = torch.where(flipped[..., None], twin, q).clone()[..., None, :]
+        om.corr = torch.ones((R, C, 1), dtype=torch.float64)
+        om.computed = torch.ones((R, C), dtype=torch.bool)
+        om.refine_orientations(consensus_tol=consensus_tol, progress_bar=False)
+        return misorientation_angle_deg(q, om.quats[..., 0, :], xtl.sym_quats_matching)
+
+    # each pattern alone cannot tell the twin apart ...
+    assert float(run(0.0)[flipped].min()) > 10.0
+    # ... but it is a tie, and every neighbour holds the other variant
+    assert float(run(0.01).max()) < 2.0
+
+
+def test_ipf_key_saturates_edges_and_whitens_only_the_centre():
+    from quantem.diffraction.orientation_visualization import _bary_to_rgb
+
+    corners = _bary_to_rgb(np.eye(3))
+    assert np.allclose(corners, [[1, 0, 0], [0, 1, 0], [0, 0, 1]], atol=1e-9)
+    # every point on an edge is fully saturated: some channel is zero
+    t = np.linspace(0, 1, 11)[:, None]
+    for i, j in ((0, 1), (1, 2), (2, 0)):
+        w = np.zeros((11, 3))
+        w[:, i], w[:, j] = 1 - t[:, 0], t[:, 0]
+        assert np.allclose(_bary_to_rgb(w).min(axis=1), 0, atol=1e-9)
+    assert np.allclose(_bary_to_rgb(np.ones(3) / 3), 1)
+    # halfway from the centre to an edge is still clearly colored
+    assert _bary_to_rgb(np.array([0.5, 0.5, 0.0]) * 0.5 + 1 / 6).min() < 0.7
+
+
+def test_plot_matches_background_norm():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from types import SimpleNamespace
+
+    from quantem.diffraction.orientation_visualization import plot_pattern_matches
+
+    torch.manual_seed(0)
+    xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True))
+    xtl.calculate_structure_factors(k_max=1.5)
+    peaks = _make_peaks(xtl, qnormalize(torch.randn(2, 4, dtype=torch.float64)))
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om.build_plan(angle_step_zone_axis_deg=3.0, angle_step_in_plane_deg=3.0)
+    om.match_orientations(progress_bar=False)
+    img = np.random.default_rng(0).random((1, 2, 32, 32)) ** 4
+    dataset = SimpleNamespace(array=img, shape=img.shape)
+    shown = []
+    for norm in (None, {"power": 0.5, "upper_quantile": 0.9}):
+        fig, axs = plot_pattern_matches(
+            om, [(0, 0)], dataset=dataset, pixel_size=0.05, matches=(0,), norm=norm
+        )
+        # show_2d draws the pattern in the panel, extended to q units
+        im = axs[0, 0].images[0]
+        assert np.allclose(im.get_extent()[:2], (-0.5 * 0.05 - 16 * 0.05, 31.5 * 0.05 - 16 * 0.05))
+        shown.append(np.asarray(im.get_array())[..., 0])
+        matplotlib.pyplot.close(fig)
+    # gray_r: a lower upper quantile saturates more of the pattern to black
+    assert (shown[1] <= shown[1].min() + 1e-6).mean() > (shown[0] <= shown[0].min() + 1e-6).mean()

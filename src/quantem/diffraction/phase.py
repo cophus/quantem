@@ -356,7 +356,9 @@ class PhaseMap(AutoSerialize):
         the phase here. The reliability becomes the cost gap between the
         best candidates of the winning crystal and of the runner-up
         crystal, and the kinematical result is kept under
-        `metadata['kinematical']`.
+        `metadata['kinematical']`. Positions the refinement did not reach
+        (outside its `mask`) keep their current decision, so a refinement
+        of one region, or several in stages, updates only that region.
         """
         cost = torch.nan_to_num(result["cost"], nan=torch.inf)
         n_maps = len(self.orientation_maps)
@@ -372,13 +374,22 @@ class PhaseMap(AutoSerialize):
             else torch.zeros_like(order[..., 0]),
             torch.full_like(order[..., 0], torch.nan),
         )
-        self.metadata["kinematical"] = {
-            "phase_index": self.phase_index,
-            "reliability": self.reliability,
-        }
-        self.phase_index = result["phase_index"]
-        self.reliability = reliability
-        self.cost_best = order[..., 0]
+        done = torch.isfinite(order[..., 0])
+        if self.phase_index is None:
+            self.phase_index = torch.full((R, C), -1, dtype=torch.long)
+            self.reliability = torch.full((R, C), torch.nan, dtype=cost.dtype)
+            self.cost_best = torch.full((R, C), torch.nan, dtype=cost.dtype)
+        # keep the kinematical decision from before the first dynamical pass
+        self.metadata.setdefault(
+            "kinematical",
+            {
+                "phase_index": self.phase_index.clone(),
+                "reliability": self.reliability.clone(),
+            },
+        )
+        self.phase_index = torch.where(done, result["phase_index"], self.phase_index)
+        self.reliability = torch.where(done, reliability, self.reliability)
+        self.cost_best = torch.where(done, order[..., 0], self.cost_best)
         self.metadata["dynamical_applied"] = dict(result.get("metadata", {}))
         return self
 

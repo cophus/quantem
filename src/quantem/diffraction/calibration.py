@@ -17,12 +17,12 @@ from quantem.diffraction.crystal import Crystal
 from quantem.diffraction.defaults import MIN_NUMBER_PEAKS
 
 
-def _measure_raw_origins(bragg_vectors, search_radius: float) -> np.ndarray:
+def _measure_raw_origins(bragg_vectors, search_radius: float, center=None) -> np.ndarray:
     """Brightest-peak origin per position, NaN where nothing is found."""
     peaks = bragg_vectors.peaks
     scan_r, scan_c = peaks.shape[0], peaks.shape[1]
     H, W = int(bragg_vectors.dataset.shape[-2]), int(bragg_vectors.dataset.shape[-1])
-    c0 = np.array([H / 2, W / 2])
+    c0 = np.array([H / 2, W / 2]) if center is None else np.asarray(center, dtype=float)
     meas = np.full((scan_r, scan_c, 2), np.nan)
     for r in range(scan_r):
         for c in range(scan_c):
@@ -38,11 +38,11 @@ def _measure_raw_origins(bragg_vectors, search_radius: float) -> np.ndarray:
     return meas
 
 
-def plot_origin_fit(bragg_vectors, origins: np.ndarray, search_radius: float = 6.0):
+def plot_origin_fit(bragg_vectors, origins: np.ndarray, search_radius: float = 6.0, center=None):
     """Diagnostic for measure_origins: measured vs fit vs residual, both axes."""
     import matplotlib.pyplot as plt
 
-    meas = _measure_raw_origins(bragg_vectors, search_radius)
+    meas = _measure_raw_origins(bragg_vectors, search_radius, center)
     fig, axs = plt.subplots(2, 3, figsize=(13.5, 5.6))
     names = ["row", "col"]
     for k in range(2):
@@ -79,19 +79,34 @@ def measure_origins(
     search_radius: float = 6.0,
     robust: bool = True,
     plot: bool = False,
+    center=None,
+    min_coverage: float = 0.1,
 ):
     """Per-position diffraction origin from the brightest central peak.
 
     At each scan position the most intense detected peak within
-    `search_radius` pixels of the detector center is taken as the direct
-    beam; a plane is fit over the scan (least squares, optionally with one
+    `search_radius` pixels of `center` is taken as the direct beam; a plane
+    is fit over the scan (least squares, optionally with one
     outlier-rejection pass) to model the descan.
 
     Parameters
     ----------
+    search_radius : float, default=6.0
+        Radius in detector pixels searched around `center`.
+    robust : bool, default=True
+        Reject outliers before the plane fit.
     plot : bool, default=False
         Show the fitted origin planes and the residuals of the measured
         origins against the fit.
+    center : tuple of float, optional
+        ``(row, col)`` detector position to search around, e.g. from
+        :func:`~quantem.diffraction.disk_detection.estimate_central_beam`.
+        Defaults to the detector centre, which misses a beam that sits
+        further than `search_radius` from it.
+    min_coverage : float, default=0.1
+        Fraction of scan positions that must yield an origin. Below it the
+        search has missed the beam, and the fit would be meaningless, so an
+        error is raised rather than returning a plane through nothing.
 
     Returns
     -------
@@ -99,9 +114,25 @@ def measure_origins(
         (scan_row, scan_col, 2) plane-fit origins, ready for
         BraggVectors.correct_peak_origins(). With plot=True, also returns
         (fig, axs).
+
+    Raises
+    ------
+    ValueError
+        If fewer than `min_coverage` of the positions have a peak within
+        `search_radius` of `center`.
     """
-    meas = _measure_raw_origins(bragg_vectors, search_radius)
+    meas = _measure_raw_origins(bragg_vectors, search_radius, center)
     scan_r, scan_c = meas.shape[0], meas.shape[1]
+    coverage = float(np.isfinite(meas[..., 0]).mean())
+    if coverage < min_coverage:
+        H, W = int(bragg_vectors.dataset.shape[-2]), int(bragg_vectors.dataset.shape[-1])
+        c0 = (H / 2, W / 2) if center is None else tuple(float(v) for v in center)
+        raise ValueError(
+            f"only {coverage:.1%} of scan positions have a peak within "
+            f"{search_radius:g} px of ({c0[0]:.1f}, {c0[1]:.1f}); the direct beam is "
+            "elsewhere. Pass center= from estimate_central_beam(dataset.dp_mean), "
+            "or widen search_radius."
+        )
     ry, rx = np.mgrid[0:scan_r, 0:scan_c]
 
     def plane(z, ok):
@@ -505,22 +536,30 @@ def measure_scan_rotation(
         Curl-minimizing rotation in [0, 180); the physical answer is either
         this angle or this angle + 180. With returnfig=True, also (fig, ax).
     """
-    arr = np.asarray(dataset.array, dtype=float)
+    arr = dataset.array
     scan_r, scan_c, H, W = arr.shape
-    rows = np.arange(H)[:, None]
-    cols = np.arange(W)[None, :]
+    rows = np.arange(H, dtype=float)[:, None]
+    cols = np.arange(W, dtype=float)[None, :]
     if origins is None:
         origins = np.zeros((scan_r, scan_c, 2))
         origins[..., 0] = H / 2
         origins[..., 1] = W / 2
-    if mask_radius is not None:
-        rr = rows[None, None] - origins[..., 0][..., None, None]
-        cc = cols[None, None] - origins[..., 1][..., None, None]
-        arr = arr * (rr**2 + cc**2 <= mask_radius**2)
-    tot = arr.sum(axis=(-2, -1))
-    tot[tot <= 0] = 1.0
-    com_r = (arr * rows).sum(axis=(-2, -1)) / tot - origins[..., 0]
-    com_c = (arr * cols).sum(axis=(-2, -1)) / tot - origins[..., 1]
+    origins = np.asarray(origins, dtype=float)
+    # one scan row at a time: a float64 copy of a full scan is several times
+    # the size of the data (19 GB for 256 x 256 x 192 x 192), and the center
+    # of mass only ever needs one pattern
+    com_r = np.zeros((scan_r, scan_c))
+    com_c = np.zeros((scan_r, scan_c))
+    for i in range(scan_r):
+        block = np.asarray(arr[i], dtype=float)  # (scan_c, H, W)
+        if mask_radius is not None:
+            rr = rows[None] - origins[i, :, 0][:, None, None]
+            cc = cols[None] - origins[i, :, 1][:, None, None]
+            block = block * (rr**2 + cc**2 <= mask_radius**2)
+        tot = block.sum(axis=(-2, -1))
+        tot[tot <= 0] = 1.0
+        com_r[i] = (block * rows).sum(axis=(-2, -1)) / tot - origins[i, :, 0]
+        com_c[i] = (block * cols).sum(axis=(-2, -1)) / tot - origins[i, :, 1]
 
     # spatial derivatives of both components over the scan
     d_rr = np.gradient(com_r, axis=0)

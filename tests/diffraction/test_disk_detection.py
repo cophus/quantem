@@ -76,3 +76,30 @@ def test_defaults_are_plain_cross_correlation():
     a = detect_disks(dp, tft, **common)
     b = detect_disks(dp, tft, corr_power=1.0, sigma_cc=None, **common)
     assert np.allclose(a, b)
+
+
+def test_measure_origins_off_centre_beam():
+    # a beam further than search_radius from the detector centre used to give
+    # an all-NaN measurement, whose plane fit silently returned zeros
+    import pytest
+
+    from quantem.core.datastructures import Dataset4dstem
+    from quantem.diffraction import BraggVectors
+
+    rows, cols = np.mgrid[0:48, 0:48]
+    arr = np.zeros((6, 6, 48, 48), dtype=np.float32)
+    for r in range(6):
+        for c in range(6):
+            cy, cx = 24.0 + 0.1 * r, 34.0 - 0.1 * c
+            arr[r, c] = 100 * np.exp(-((rows - cy) ** 2 + (cols - cx) ** 2) / 4.0)
+            arr[r, c] += 20 * np.exp(-((rows - cy - 12) ** 2 + (cols - cx) ** 2) / 4.0)
+    bv = BraggVectors.from_dataset(Dataset4dstem.from_array(arr))
+    bv.make_template_synthetic(radius=1.5, edge=1.0)
+    bv.detect_disks(min_abs_intensity=1.0, min_spacing=4.0, progressbar=False)
+
+    with pytest.raises(ValueError, match="direct beam is elsewhere"):
+        bv.measure_origins(search_radius=6.0)
+
+    origins = bv.measure_origins(search_radius=6.0, center=(24.0, 34.0))
+    assert np.abs(origins[..., 0] - (24.0 + 0.1 * np.arange(6)[:, None])).max() < 0.2
+    assert np.abs(origins[..., 1] - (34.0 - 0.1 * np.arange(6)[None, :])).max() < 0.2
