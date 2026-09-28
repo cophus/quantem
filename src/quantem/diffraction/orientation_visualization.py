@@ -444,6 +444,7 @@ def plot_pattern_matches(
     norm=None,
     sigma_plot: float | None = 1.0,
     q_max_plot: float | None = None,
+    q_max_quantile: float = 0.98,
     scalebar: bool = True,
     show_measured: bool = True,
     marker_scale: float = 250.0,
@@ -486,6 +487,15 @@ def plot_pattern_matches(
     sigma_plot : float | None, default=1.0
         Gaussian blur (pixels) of the displayed pattern only, which makes
         the disks easier to see in low-dose data; None shows it raw.
+    q_max_plot : float | None
+        Half-width of every panel, 1/Angstroms. None fits it to the peaks
+        actually plotted, using `q_max_quantile`.
+    q_max_quantile : float, default=0.98
+        Quantile of the measured peak radii that sets the automatic limit,
+        used only when `q_max_plot` is None and no `dataset` is given. A few
+        stray high-angle detections would otherwise set the scale for every
+        panel and leave the pattern in the middle of empty space, so the
+        default trims the furthest 2%. Pass 1.0 to enclose every peak.
     colors : list | None
         One color per crystal; defaults to red, blue, green, purple.
     marker : str | None
@@ -551,11 +561,17 @@ def plot_pattern_matches(
     elif dataset is not None and pixel_size is not None:
         q_lim = dataset.shape[-1] / 2 * pixel_size
     else:
+        if not 0.0 < q_max_quantile <= 1.0:
+            raise ValueError(f"q_max_quantile must be in (0, 1], got {q_max_quantile}")
         q_all = [
             np.hypot(peaks[rx, ry].array[:, ix[0]], peaks[rx, ry].array[:, ix[1]])
             for rx, ry in positions
         ]
-        q_max = max((float(q.max()) for q in q_all if q.size), default=0.0)
+        # the direct beam is at zero and every position has one, so it is
+        # dropped before taking the quantile over the diffracted peaks
+        q_flat = np.concatenate([q for q in q_all if q.size]) if q_all else np.empty(0)
+        q_flat = q_flat[q_flat > 0.05]
+        q_max = float(np.quantile(q_flat, q_max_quantile)) if q_flat.size else 0.0
         q_lim = 1.1 * q_max if q_max > 0 else 1.0
 
     if measured_scale is None:

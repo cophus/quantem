@@ -73,6 +73,26 @@ class CrystalMap(AutoSerialize):
     def __init__(
         self, orientation_maps: list[OrientationMap], _token=None, k_max: float | None = None
     ):
+        """Private constructor; use :meth:`from_vectors` or :meth:`from_orientation_maps`.
+
+        Parameters
+        ----------
+        orientation_maps : list of OrientationMap
+            One per crystal, all sharing a scan shape. Names must be unique,
+            because crystals are indexed by name.
+        _token : object
+            Guard against direct construction.
+        k_max : float, optional
+            Scattering-vector limit shared by the crystals; taken from them
+            when None.
+
+        Raises
+        ------
+        RuntimeError
+            If called without the class token.
+        ValueError
+            If no crystals are given, names repeat, or scan shapes differ.
+        """
         if _token is not self._token:
             raise RuntimeError(
                 "Use CrystalMap.from_vectors() or CrystalMap.from_orientation_maps()."
@@ -173,20 +193,25 @@ class CrystalMap(AutoSerialize):
 
     @property
     def names(self) -> list[str]:
+        """Crystal names, in the order the maps were given."""
         return [om.crystal.name for om in self.orientation_maps]
 
     @property
     def peaks(self):
+        """The shared peak list; every crystal was matched against these."""
         return self.orientation_maps[0].peaks
 
     @property
     def shape(self) -> tuple[int, int]:
+        """Scan shape ``(rows, cols)`` in probe positions."""
         return tuple(self.orientation_maps[0].peaks.shape[:2])
 
     def __len__(self) -> int:
+        """Number of crystals."""
         return len(self.orientation_maps)
 
     def __iter__(self):
+        """Iterate over the per-crystal OrientationMaps."""
         return iter(self.orientation_maps)
 
     def __getitem__(self, key) -> OrientationMap:
@@ -199,6 +224,7 @@ class CrystalMap(AutoSerialize):
         return self.orientation_maps[key]
 
     def __repr__(self) -> str:
+        """Scan shape, how far the analysis has run, and the crystal names."""
         R, C = self.shape
         stage = "unmatched"
         if self.orientation_maps[0].quats is not None:
@@ -290,6 +316,27 @@ class CrystalMap(AutoSerialize):
         return self._fanout("refine_orientations", overrides, **kwargs)
 
     def _fanout(self, method: str, overrides: dict | None, **kwargs) -> "CrystalMap":
+        """Call ``method`` on every OrientationMap, with per-crystal overrides.
+
+        Parameters
+        ----------
+        method : str
+            Name of the OrientationMap method to call.
+        overrides : dict or None
+            Keyword arguments per crystal name, merged over ``kwargs``.
+        **kwargs
+            Arguments common to every crystal.
+
+        Returns
+        -------
+        CrystalMap
+            Self, so stages chain.
+
+        Raises
+        ------
+        KeyError
+            If an override names a crystal not in this map.
+        """
         overrides = overrides or {}
         unknown = set(overrides) - set(self.names)
         if unknown:
@@ -474,6 +521,22 @@ class CrystalMap(AutoSerialize):
     # ------------------------------------------------------------------
 
     def _require_fit(self, what: str) -> PhaseMap:
+        """Return the fitted PhaseMap, or explain which call needs it first.
+
+        Parameters
+        ----------
+        what : str
+            Name of the caller, used in the error message.
+
+        Returns
+        -------
+        PhaseMap
+
+        Raises
+        ------
+        ValueError
+            If :meth:`fit` has not been run.
+        """
         if self.phases is None or self.phases.phase_index is None:
             raise ValueError(f"run fit() before {what}.")
         return self.phases
@@ -562,6 +625,15 @@ class CrystalMap(AutoSerialize):
             there is one.
         shade_range : tuple or "auto", default="auto"
             Values mapped to black ... full color.
+        shade_gamma : float, default=0.5
+            Exponent applied to the brightness. Diffracted intensity is
+            strongly skewed, so below 1 lifts the faint positions and 1.0 is
+            the linear scale. Vacuum stays black at any value.
+        majority_filter : int, default=0
+            Radius in probe positions of a majority filter on the phase
+            decision, for display only. 1 replaces each position by the most
+            common phase in its 3x3 neighbourhood, dropping isolated single
+            positions without moving a real boundary.
         phase_colors : np.ndarray, optional
             One RGB color per crystal.
         scalebar : dict, "auto" or None, default="auto"
@@ -665,6 +737,14 @@ class CrystalMap(AutoSerialize):
             {"power": 0.5, "upper_quantile": 0.98}.
         measured_scale, measured_power : float, optional
             Size and intensity compression of the gray measured peaks.
+        q_max_plot : float, optional
+            Half-width of every panel, 1/Angstroms. The default fits it to
+            the peaks plotted.
+        q_max_quantile : float, default=0.98
+            Quantile of the measured peak radii setting that automatic limit.
+            A few stray high-angle detections would otherwise set the scale
+            for every panel and leave the pattern surrounded by empty space.
+            Lower it to crop in further; 1.0 encloses every peak.
         transpose_plots : bool, default=False
             Panel layout only: rows are positions unless this is True.
         **kwargs
@@ -726,8 +806,15 @@ class CrystalMap(AutoSerialize):
         )
 
     def _k_max_or_crystals(self) -> float:
-        # maps saved before k_max lived on the CrystalMap carry it only on
-        # their crystals
+        """Scattering-vector limit, falling back to the crystals\' own values.
+
+        Maps saved before ``k_max`` lived on the CrystalMap carry it only on
+        their crystals, so this keeps those files loadable.
+
+        Returns
+        -------
+        float
+        """
         k = getattr(self, "k_max", None)
         if k is None:
             k = max(float(om.crystal.k_max or 1.5) for om in self.orientation_maps)
@@ -800,6 +887,17 @@ class CrystalMap(AutoSerialize):
         return show_2d([corr, rel], **kwargs)
 
     def _phase_indices(self, phase) -> list[int]:
+        """Resolve a crystal selector to a list of indices.
+
+        Parameters
+        ----------
+        phase : int, str or None
+            One crystal by index or name, or None for all of them.
+
+        Returns
+        -------
+        list of int
+        """
         if phase is None:
             return list(range(len(self.orientation_maps)))
         i = self.names.index(phase) if isinstance(phase, str) else int(phase)

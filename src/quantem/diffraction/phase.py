@@ -84,6 +84,25 @@ class PhaseMap(AutoSerialize):
     _token = object()
 
     def __init__(self, orientation_maps: list[OrientationMap], _token=None):
+        """Private constructor; use :meth:`from_orientation_maps`.
+
+        Enumerates the candidate list, one entry per (orientation map, match)
+        pair, so that two matched orientations of one crystal compete on equal
+        footing with one orientation of each of two crystals. The fit results
+        are left as None until :meth:`fit` runs.
+
+        Parameters
+        ----------
+        orientation_maps : list of OrientationMap
+            Per-crystal maps sharing one set of peaks.
+        _token : object
+            Guard against direct construction.
+
+        Raises
+        ------
+        RuntimeError
+            If called without the class token.
+        """
         if _token is not self._token:
             raise RuntimeError("Use PhaseMap.from_orientation_maps().")
         self.orientation_maps = orientation_maps
@@ -438,6 +457,7 @@ class PhaseMap(AutoSerialize):
         phase_colors: np.ndarray | None = None,
         shade_by: str = "signal",
         shade_range: tuple[float, float] | str = "auto",
+        shade_gamma: float = 0.5,
         majority_filter: int = 0,
         reliability_range: tuple[float, float] | None = None,
         scalebar: dict | str | None = "auto",
@@ -463,6 +483,14 @@ class PhaseMap(AutoSerialize):
             Values mapped to black ... full color. "auto" takes a high
             percentile over the indexed positions, since the absolute scale
             depends on the data.
+        shade_gamma : float, default=0.5
+            Exponent applied to the brightness, ``alpha ** shade_gamma``.
+            Diffracted intensity is strongly skewed, so a linear scale leaves
+            most indexed positions dark and only the brightest grains
+            readable. Values below 1 lift the faint ones: 0.5 is the default
+            and 1.0 restores the linear scale. Zero brightness is a fixed
+            point, so vacuum and unindexed positions stay black however low
+            this is set, and the colorbars carry the same curve.
         majority_filter : int, default=0
             Radius in probe positions of a majority filter applied to the
             phase decision for display only; the stored decision is
@@ -518,6 +546,11 @@ class PhaseMap(AutoSerialize):
             raise ValueError(
                 f"shade_by must be 'signal', 'reliability' or 'none', got {shade_by!r}"
             )
+        if shade_gamma <= 0:
+            raise ValueError(f"shade_gamma must be positive, got {shade_gamma}")
+        # zero maps to zero under any positive exponent, so unindexed positions
+        # stay black and only the faint indexed ones are lifted
+        alpha = np.power(alpha, shade_gamma)
         rgb = phase_colors[np.where(indexed, phase, 0)] * alpha[..., None]
 
         if figax is None:
@@ -550,7 +583,9 @@ class PhaseMap(AutoSerialize):
 
         n_ph = len(phase_colors)
         for k, color in enumerate(phase_colors):
-            cmap_k = LinearSegmentedColormap.from_list(f"rel{k}", [(0, 0, 0), tuple(color)])
+            cmap_k = LinearSegmentedColormap.from_list(
+                f"rel{k}", [(0, 0, 0), tuple(color)], gamma=shade_gamma
+            )
             cax = ax.inset_axes([1.02 + 0.025 * k, 0.05, 0.025, 0.9])
             cb = fig.colorbar(ScalarMappable(norm=Normalize(lo, hi), cmap=cmap_k), cax=cax)
             if k < n_ph - 1:
