@@ -543,7 +543,7 @@ class PhaseMap(AutoSerialize):
             plt.Line2D([0], [0], marker="s", ls="", color=c, label=n)
             for c, n in zip(phase_colors, self.names)
         ]
-        ax.legend(handles=handles, loc="upper right", fontsize=8)
+        ax.legend(handles=handles, loc="upper left", fontsize=8)
         # stacked reliability colorbars, black -> phase color
         from matplotlib.cm import ScalarMappable
         from matplotlib.colors import LinearSegmentedColormap, Normalize

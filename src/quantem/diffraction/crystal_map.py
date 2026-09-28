@@ -94,6 +94,17 @@ class CrystalMap(AutoSerialize):
         self.metadata: dict = {}
         self.k_max = _common_k_max([om.crystal for om in orientation_maps], k_max)
 
+    def __attrs_post_init__(self):
+        """After loading: the phase map shares this map's orientation maps.
+
+        A saved file holds the phase map's copies of the orientation maps
+        separately, and without this they would load as independent objects:
+        anything computed on one (orientations written back by a refinement,
+        structure factors attached to a crystal) would be missed by the other.
+        """
+        if self.phases is not None:
+            self.phases.orientation_maps = self.orientation_maps
+
     # ------------------------------------------------------------------
     # construction
     # ------------------------------------------------------------------
@@ -299,7 +310,9 @@ class CrystalMap(AutoSerialize):
         self.phases.fit(**kwargs)
         return self
 
-    def refine_dynamical(self, mask=None, **kwargs) -> "CrystalMap":
+    def refine_dynamical(
+        self, mask=None, k_max_coupling: float | None = None, **kwargs
+    ) -> "CrystalMap":
         """Dynamical refinement of orientation, thickness, strain and phase.
 
         Bloch-wave intensities, averaged over the precession ring, are fit to
@@ -312,9 +325,9 @@ class CrystalMap(AutoSerialize):
         ``refine_deformation=False``, then the in-plane strain from those
         orientations with a narrower tilt search.
 
-        Every crystal is given absorptive structure factors out to twice
-        `k_max`, which the couplings between beams need; they are computed
-        here when missing or too short.
+        Every crystal is given absorptive structure factors out to
+        `k_max_coupling`, which the couplings between beams need; they are
+        computed here when missing or too short.
 
         Parameters
         ----------
@@ -326,6 +339,11 @@ class CrystalMap(AutoSerialize):
             Defaults to the k_max of the kinematical simulation. Cutting it
             low saves time but drops beams that carry real dynamical
             coupling.
+        k_max_coupling : float, optional
+            Largest |g| (1/Angstroms) of the structure factors coupling the
+            beams. The couplings g - h reach twice `k_max`, but the factors
+            fall off fast; None uses 1.5 `k_max`. It sets accuracy, not run
+            time, which the number of beams sets.
         **kwargs
             Passed to :func:`~quantem.diffraction.bloch.refine_dynamical`.
             `require_phase_weight` defaults to False here, so a crystal the
@@ -340,15 +358,16 @@ class CrystalMap(AutoSerialize):
 
         pm = self._require_fit("refine_dynamical()")
         k_max = float(kwargs.pop("k_max", None) or self.k_max)
+        k_c = float(k_max_coupling if k_max_coupling is not None else 1.5 * k_max)
         energy_ev = self.orientation_maps[0].energy_ev
         for om in self.orientation_maps:
             xtl = om.crystal
             if (
                 getattr(xtl, "U_dyn", None) is None
-                or getattr(xtl, "dyn_k_max", 0.0) < 2 * k_max - 1e-9
+                or getattr(xtl, "dyn_k_max", 0.0) < k_c - 1e-9
                 or abs(getattr(xtl, "dyn_energy_ev", energy_ev) - energy_ev) > 1.0
             ):
-                xtl.calculate_dynamical_structure_factors(energy_ev, k_max=2 * k_max)
+                xtl.calculate_dynamical_structure_factors(energy_ev, k_max=k_c)
         kwargs["k_max"] = k_max
         kwargs.setdefault("require_phase_weight", False)
         self.dynamical = bloch.refine_dynamical(pm, mask=mask, **kwargs)

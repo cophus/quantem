@@ -651,16 +651,16 @@ def test_rescue_breaks_friedel_ties_by_neighbours():
 
 
 def test_ipf_key_saturates_edges_and_whitens_only_the_centre():
-    from quantem.diffraction.orientation_visualization import _bary_to_rgb
+    from quantem.diffraction.orientation_visualization import IPF_CORNER_COLORS, _bary_to_rgb
 
-    corners = _bary_to_rgb(np.eye(3))
-    assert np.allclose(corners, [[1, 0, 0], [0, 1, 0], [0, 0, 1]], atol=1e-9)
-    # every point on an edge is fully saturated: some channel is zero
-    t = np.linspace(0, 1, 11)[:, None]
+    assert np.allclose(_bary_to_rgb(np.eye(3)), IPF_CORNER_COLORS)
+    # every edge point is the full blend of its two corner colors, no white
+    t = np.linspace(0, 1, 11)
     for i, j in ((0, 1), (1, 2), (2, 0)):
         w = np.zeros((11, 3))
-        w[:, i], w[:, j] = 1 - t[:, 0], t[:, 0]
-        assert np.allclose(_bary_to_rgb(w).min(axis=1), 0, atol=1e-9)
+        w[:, i], w[:, j] = 1 - t, t
+        blend = w / w.max(axis=1, keepdims=True)
+        assert np.allclose(_bary_to_rgb(w), np.clip(blend @ IPF_CORNER_COLORS, 0, 1))
     assert np.allclose(_bary_to_rgb(np.ones(3) / 3), 1)
     # halfway from the centre to an edge is still clearly colored
     assert _bary_to_rgb(np.array([0.5, 0.5, 0.0]) * 0.5 + 1 / 6).min() < 0.7
@@ -689,8 +689,17 @@ def test_plot_matches_background_norm():
             om, [(0, 0)], dataset=dataset, pixel_size=0.05, matches=(0,), norm=norm
         )
         # show_2d draws the pattern in the panel, extended to q units
-        im = axs[0, 0].images[0]
+        ax = axs[0, 0]
+        im = ax.images[0]
         assert np.allclose(im.get_extent()[:2], (-0.5 * 0.05 - 16 * 0.05, 31.5 * 0.05 - 16 * 0.05))
+        # the panel shows the recorded area and no marker outside it
+        assert np.allclose(ax.get_xlim(), im.get_extent()[:2])
+        x0, x1, y1, y0 = im.get_extent()
+        for coll in ax.collections:
+            xy = coll.get_offsets()
+            assert (
+                (xy[:, 0] >= x0) & (xy[:, 0] <= x1) & (xy[:, 1] >= y0) & (xy[:, 1] <= y1)
+            ).all()
         shown.append(np.asarray(im.get_array())[..., 0])
         matplotlib.pyplot.close(fig)
     # gray_r: a lower upper quantile saturates more of the pattern to black

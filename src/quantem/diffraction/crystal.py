@@ -995,8 +995,8 @@ class Crystal(AutoSerialize):
             RMS thermal displacement (Angstroms), scalar or per-element.
         k_max : float | None
             Maximum |g| of stored factors; defaults to the kinematical k_max.
-            For Bloch calculations with beams out to k, this should be 2k so
-            every coupling vector is covered.
+            For Bloch calculations with beams out to k, the couplings reach
+            2k, but the factors fall off fast and 1.5k is enough.
         """
         from quantem.diffraction.wk_scattering_factors import compute_WK_factor
 

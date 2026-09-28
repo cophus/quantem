@@ -150,9 +150,10 @@ def _primitive_lattice_mask(crystal: Crystal, g: torch.Tensor) -> torch.Tensor:
 
 
 def _check_dynamical_factors(crystal: Crystal, energy_ev: float, g_max_beams: float) -> None:
-    """Warn once per crystal when the absorptive factors were computed at
-    another energy or do not cover every coupling g - h of the beam list
-    (which needs factors out to twice the largest beam)."""
+    """Warn once per crystal when the absorptive factors are missing, were
+    computed at another energy, or stop short of 1.5 times the largest beam
+    (the couplings g - h reach twice it, but the factors beyond 1.5 times
+    are negligible)."""
     key = id(crystal)
     if key in _coverage_warned:
         return
@@ -162,10 +163,10 @@ def _check_dynamical_factors(crystal: Crystal, energy_ev: float, g_max_beams: fl
             "no absorptive structure factors (calculate_dynamical_structure_factors), "
             "so the Bloch calculation uses the elastic kinematical factors"
         )
-        if k_kin is not None and 2 * g_max_beams > k_kin + 1e-9:
+        if k_kin is not None and 1.5 * g_max_beams > k_kin + 1e-9:
             msg += (
-                f", which stop at {k_kin:.2f} 1/A while the couplings of this beam list "
-                f"reach {2 * g_max_beams:.2f} 1/A"
+                f", which stop at {k_kin:.2f} 1/A, short of the "
+                f"{1.5 * g_max_beams:.2f} 1/A the couplings of this beam list need"
             )
         _coverage_warned.add(key)
         warnings.warn(f"{crystal.name}: {msg}", stacklevel=3)
@@ -178,12 +179,15 @@ def _check_dynamical_factors(crystal: Crystal, energy_ev: float, g_max_beams: fl
             f"dynamical structure factors were computed at {e_dyn:.0f} eV, the "
             f"calculation runs at {energy_ev:.0f} eV"
         )
-    if k_dyn is not None and 2 * g_max_beams > k_dyn + 1e-9:
+    # couplings g - h reach twice the beam radius, but the factors fall off
+    # fast: 1.5 times it keeps every coupling that matters (to 5%, since the
+    # fitted in-plane strain stretches the beams a little past k_max)
+    if k_dyn is not None and 1.5 * g_max_beams > 1.05 * k_dyn:
         msgs.append(
             f"dynamical structure factors extend to {k_dyn:.2f} 1/A but the beam "
             f"list reaches {g_max_beams:.2f} 1/A, so couplings beyond "
             f"{k_dyn:.2f} 1/A are missing (treated as zero); recompute with "
-            f"k_max >= {2 * g_max_beams:.2f}"
+            f"k_max >= {1.5 * g_max_beams:.2f}"
         )
     if msgs:
         _coverage_warned.add(key)

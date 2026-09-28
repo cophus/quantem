@@ -190,3 +190,27 @@ def test_dynamical_update_is_local_and_examples_are_spread():
     assert all(
         (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 >= 9 for i, a in enumerate(picks) for b in picks[:i]
     )
+
+
+def test_loaded_crystal_map_shares_orientation_maps(tmp_path):
+    from quantem.core.io.serialize import load
+    from quantem.diffraction.crystal_map import CrystalMap
+
+    rng = np.random.default_rng(5)
+    ti_a = Crystal.from_ase(
+        bulk("Ti", "hcp", a=2.9505, c=4.6855), name="Ti alpha", verbose=False
+    ).calculate_structure_factors(k_max=1.5)
+    q = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    cells = [[_pattern(ti_a, q, rng) for _ in range(3)] for _ in range(2)]
+    peaks = Vector.from_data(cells, fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t")
+    om = OrientationMap.from_vectors(peaks, ti_a, energy_ev=200e3)
+    om.build_plan()
+    om.match_orientations(progress_bar=False)
+    cm = CrystalMap.from_orientation_maps([om])
+    cm.fit(progress_bar=False)
+    cm.save(tmp_path / "cm.zip", mode="o")
+    cm2 = load(tmp_path / "cm.zip")
+    # one set of maps: what a refinement writes through the phase map is
+    # what the crystal map shows
+    assert cm2.phases.orientation_maps[0] is cm2.orientation_maps[0]
+    assert cm2.phases.orientation_maps[0].crystal is cm2[0].crystal

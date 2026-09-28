@@ -21,6 +21,16 @@ DEFAULT_PHASE_COLORS = np.array(
 ORIGIN_COLOR = "#2ca02c"
 MEASURED_COLOR = "0.15"
 IPF_SATURATION_POWER = 0.6  # <1 shrinks the white centre of the IPF wedge
+# corner colors: full red, green capped to avoid the fluorescent look, blue
+# lifted off pure dark blue; pairwise blends give near-max-chroma orange,
+# cyan and violet along the edges
+IPF_CORNER_COLORS = np.array(
+    [
+        [1.00, 0.00, 0.00],
+        [0.00, 0.70, 0.00],
+        [0.00, 0.30, 1.00],
+    ]
+)
 # cluster / grain label colors (tab10 cycle)
 CLUSTER_COLORS = [
     (0.122, 0.467, 0.706),
@@ -39,21 +49,20 @@ CLUSTER_COLORS = [
 def _bary_to_rgb(w: np.ndarray) -> np.ndarray:
     """Barycentric wedge weights (..., 3) to RGB.
 
-    Hue runs around the wedge centre, red, green and blue at the corners and
-    yellow, cyan and magenta midway along the edges; saturation is the
-    distance from the centre, full on every edge. Only the centre itself is
-    white, so the whole wedge, edges included, keeps its contrast.
+    Each direction takes the color of the edge point straight out from the
+    wedge centre, a blend of the two nearest corner colors, and fades toward
+    white with its distance from that edge. Every edge is fully colored and
+    only the centre itself is white, so the whole wedge keeps its contrast.
     """
-    from matplotlib.colors import hsv_to_rgb
-
     w = np.clip(w, 0, None)
     w = w / np.clip(w.sum(axis=-1, keepdims=True), 1e-12, None)
-    theta = np.deg2rad([90.0, 210.0, 330.0])
-    x = w @ np.cos(theta)
-    y = w @ np.sin(theta)
-    hue = ((np.rad2deg(np.arctan2(y, x)) - 90.0) / 360.0) % 1.0
-    sat = np.clip(1.0 - 3.0 * w.min(axis=-1), 0, 1) ** IPF_SATURATION_POWER
-    return hsv_to_rgb(np.stack((hue, sat, np.ones_like(hue)), axis=-1))
+    m = w.min(axis=-1, keepdims=True)
+    # the edge point on the ray from the centre (1/3, 1/3, 1/3) through w
+    edge = (w - m) / np.clip(1.0 - 3.0 * m, 1e-12, None)
+    edge = edge / np.clip(edge.max(axis=-1, keepdims=True), 1e-12, None)
+    rgb = np.clip(edge @ IPF_CORNER_COLORS, 0, 1)
+    sat = np.clip(1.0 - 3.0 * m, 0, 1) ** IPF_SATURATION_POWER
+    return 1.0 - sat * (1.0 - rgb)
 
 
 def _parse_direction(direction) -> torch.Tensor:
@@ -233,20 +242,32 @@ def wedge_legend(
     # tall panel with the wedge hanging straight down (the rotation aligns
     # the wedge's angular bisector with the downward direction)
     if orientation == "vertical":
-        az = [np.arctan2(c[k, 1] / (1 + c[k, 2]), c[k, 0] / (1 + c[k, 2])) for k in (1, 2)]
-        th = -np.pi / 2 - (az[0] + az[1]) / 2
+        # bisector from the summed directions, not the mean of two angles,
+        # which jumps by pi when a corner sits at +-180 degrees (-0.0 in y)
+        d = sum(c[k, :2] / (1 + c[k, 2]) / np.linalg.norm(c[k, :2]) for k in (1, 2))
+        th = -np.pi / 2 - np.arctan2(d[1], d[0])
     else:
         th = 0.0
     rot = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
     cxy = np.stack([c[:, 0] / (1 + c[:, 2]), c[:, 1] / (1 + c[:, 2])], axis=1) @ rot.T
     cx, cy = cxy[:, 0], cxy[:, 1]
 
+    # wedge edges: stereographic great-circle arcs, which can bulge past the
+    # corners (the equator arc does once the wedge is rotated upright)
+    tt = np.linspace(0, 1, 60)[:, None]
+    edges = []
+    for i0, i1 in ((0, 1), (1, 2), (2, 0)):
+        e = c[i0][None, :] * (1 - tt) + c[i1][None, :] * tt
+        e = e / np.linalg.norm(e, axis=1, keepdims=True)
+        edges.append(np.stack([e[:, 0] / (1 + e[:, 2]), e[:, 1] / (1 + e[:, 2])], axis=1) @ rot.T)
+    outline = np.concatenate(edges)
+
     # rasterize the wedge interior: invert the stereographic projection on a
-    # pixel grid and alpha-mask outside the wedge, so no color spills past
-    # the outline
+    # pixel grid covering the whole outline and alpha-mask outside the
+    # wedge, so no color spills past it and none is missing inside it
     m = 8
-    x0, x1 = cx.min() - 0.02, cx.max() + 0.02
-    y0, y1 = cy.min() - 0.02, cy.max() + 0.02
+    x0, x1 = outline[:, 0].min() - 0.02, outline[:, 0].max() + 0.02
+    y0, y1 = outline[:, 1].min() - 0.02, outline[:, 1].max() + 0.02
     X, Y = np.meshgrid(np.linspace(x0, x1, n * m), np.linspace(y0, y1, n * m), indexing="xy")
     Xu = np.cos(th) * X + np.sin(th) * Y
     Yu = -np.sin(th) * X + np.cos(th) * Y
@@ -259,12 +280,7 @@ def wedge_legend(
     rgba[..., :3] = _bary_to_rgb(W)
     rgba[..., 3] = inside
     ax.imshow(rgba, extent=(x0, x1, y0, y1), origin="lower", interpolation="nearest")
-    # black outline along the wedge edges (stereographic great-circle arcs)
-    tt = np.linspace(0, 1, 60)[:, None]
-    for i0, i1 in ((0, 1), (1, 2), (2, 0)):
-        e = c[i0][None, :] * (1 - tt) + c[i1][None, :] * tt
-        e = e / np.linalg.norm(e, axis=1, keepdims=True)
-        exy = np.stack([e[:, 0] / (1 + e[:, 2]), e[:, 1] / (1 + e[:, 2])], axis=1) @ rot.T
+    for exy in edges:
         ax.plot(exy[:, 0], exy[:, 1], color="k", lw=1.2)
     if labels:
         names = crystal.zone_axis_wedge_labels() or ["", "", ""]
@@ -276,11 +292,10 @@ def wedge_legend(
             ha = "left" if off[0] > 0.02 else ("right" if off[0] < -0.02 else "center")
             va = "bottom" if off[1] > 0.02 else ("top" if off[1] < -0.02 else "center")
             ax.text(xi + off[0], yi + off[1], name, fontsize=fontsize, ha=ha, va=va)
-    span_x = cx.max() - cx.min()
-    span_y = cy.max() - cy.min()
-    pad = 0.45 * max(span_x, span_y, 0.2)
-    ax.set_xlim(cx.min() - pad, cx.max() + pad)
-    ax.set_ylim(cy.min() - pad, cy.max() + pad)
+    ox, oy = outline[:, 0], outline[:, 1]
+    pad = 0.45 * max(ox.max() - ox.min(), oy.max() - oy.min(), 0.2)
+    ax.set_xlim(ox.min() - pad, ox.max() + pad)
+    ax.set_ylim(oy.min() - pad, oy.max() + pad)
     ax.set_aspect("equal")
     ax.axis("off")
 
@@ -427,6 +442,7 @@ def plot_pattern_matches(
     matches=(0, 1),
     colors=None,
     norm=None,
+    sigma_plot: float | None = 1.0,
     q_max_plot: float | None = None,
     scalebar: bool = True,
     show_measured: bool = True,
@@ -467,6 +483,9 @@ def plot_pattern_matches(
         {"power": 0.5, "upper_quantile": 0.98}. The default,
         {"power": 0.4, "upper_quantile": 0.999}, keeps the direct beam from
         flattening the disks.
+    sigma_plot : float | None, default=1.0
+        Gaussian blur (pixels) of the displayed pattern only, which makes
+        the disks easier to see in low-dose data; None shows it raw.
     colors : list | None
         One color per crystal; defaults to red, blue, green, purple.
     marker : str | None
@@ -492,6 +511,7 @@ def plot_pattern_matches(
     import matplotlib.pyplot as plt
 
     from quantem.core.visualization import show_2d
+    from quantem.diffraction.bragg_vectors_visualization import _blur
 
     oms = (
         list(orientation_maps)
@@ -577,33 +597,38 @@ def plot_pattern_matches(
                     o_r, o_c = origins[rx, ry]
                 else:
                     o_r, o_c = H / 2, W / 2
-                # pixel j has center (j - origin) * pixel_size; array edges
-                # sit half a pixel beyond the first/last centers
                 # the direct beam is orders of magnitude above the disks, so
                 # autoscaling to its peak flattens everything else
+                img = np.clip(np.asarray(dataset.array[rx, ry], dtype=float), 0, None)
                 show_2d(
-                    np.clip(np.asarray(dataset.array[rx, ry], dtype=float), 0, None),
+                    _blur(img, sigma_plot),
                     norm=norm if norm is not None else {"power": 0.4, "upper_quantile": 0.999},
                     cmap="gray_r",
                     figax=(fig, ax),
                     tight_layout=False,
                 )
-                ax.images[-1].set_extent(
-                    (
-                        (-0.5 - o_c) * pixel_size,
-                        (W - 0.5 - o_c) * pixel_size,
-                        (H - 0.5 - o_r) * pixel_size,
-                        (-0.5 - o_r) * pixel_size,
+                # pixel j has center (j - origin) * pixel_size; array edges
+                # sit half a pixel beyond the first/last centers
+                extent = (
+                    (-0.5 - o_c) * pixel_size,
+                    (W - 0.5 - o_c) * pixel_size,
+                    (H - 0.5 - o_r) * pixel_size,
+                    (-0.5 - o_r) * pixel_size,
+                )
+                ax.images[-1].set_extent(extent)
+                # the pattern is off-centre by the origin: show exactly the
+                # recorded area, so nothing is drawn beyond its edges
+                x_lim, y_lim = extent[:2], extent[2:]
+            else:
+                x_lim, y_lim = (-q_lim, q_lim), (q_lim, -q_lim)
+                if show_measured:
+                    ax.scatter(
+                        data[:, ix[1]],
+                        data[:, ix[0]],
+                        s=measured_scale * w_meas,
+                        color="0.75",
+                        lw=0,
                     )
-                )
-            elif show_measured:
-                ax.scatter(
-                    data[:, ix[1]],
-                    data[:, ix[0]],
-                    s=measured_scale * w_meas,
-                    color="0.75",
-                    lw=0,
-                )
             # a position with too few peaks was never matched, and its stored
             # orientation is still the identity; drawing that [001] pattern
             # would look like a fit where none was attempted
@@ -616,7 +641,14 @@ def plot_pattern_matches(
                 inten = sim["intensity"].numpy()
                 sim_rc = np.stack([sim["qx"].numpy(), sim["qy"].numpy()], axis=1) @ rot_back.T
             if inten.size:
+                inside = (
+                    (sim_rc[:, 1] >= min(x_lim))
+                    & (sim_rc[:, 1] <= max(x_lim))
+                    & (sim_rc[:, 0] >= min(y_lim))
+                    & (sim_rc[:, 0] <= max(y_lim))
+                )
                 size = marker_scale * inten / inten.max()
+                sim_rc, size = sim_rc[inside], size[inside]
                 color = colors[i_om % len(colors)]
                 if marker == "o":
                     # open circles leave the measured disk visible inside
@@ -638,8 +670,8 @@ def plot_pattern_matches(
                         color=color,
                         lw=1.8,
                     )
-            ax.set_xlim(-q_lim, q_lim)
-            ax.set_ylim(q_lim, -q_lim)
+            ax.set_xlim(*x_lim)
+            ax.set_ylim(*y_lim)
             ax.set_xticks([])
             ax.set_yticks([])
             ax.set_aspect("equal")
@@ -659,7 +691,7 @@ def plot_pattern_matches(
             if scalebar and last_row and first_col:
                 add_scalebar_to_ax(
                     ax,
-                    array_size=2 * q_lim,
+                    array_size=abs(x_lim[1] - x_lim[0]),
                     sampling=1.0,
                     length_units=0.5,
                     units="A^-1",
