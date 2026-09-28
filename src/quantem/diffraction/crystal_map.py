@@ -26,7 +26,7 @@ import numpy as np
 from quantem.core.io.serialize import AutoSerialize
 from quantem.diffraction.crystal import Crystal
 from quantem.diffraction.orientation import OrientationMap
-from quantem.diffraction.phase import PhaseMap
+from quantem.diffraction.phase import SHADE_GAMMA, PhaseMap
 
 
 def _common_k_max(crystals, k_max: float | None) -> float:
@@ -554,7 +554,7 @@ class CrystalMap(AutoSerialize):
         """
         return self._require_fit("phase_index").phase_index.numpy()
 
-    def signal_confidence(self, signal_range="auto") -> np.ndarray:
+    def signal_confidence(self, signal_range="auto", gamma: float = 1.0) -> np.ndarray:
         """Confidence in [0, 1] that a crystal is present, from the data alone.
 
         The measured intensity beyond the direct beam, scaled to [0, 1].
@@ -568,15 +568,18 @@ class CrystalMap(AutoSerialize):
         signal_range : tuple or "auto", default="auto"
             Diffracted intensity mapped to 0 ... 1. "auto" spans zero to the
             95th percentile over the indexed positions.
+        gamma : float, default=1.0
+            Exponent applied to the result. The default is the raw confidence,
+            which is what a threshold should be taken on.
 
         Returns
         -------
         np.ndarray
             ``(scan_row, scan_col)`` confidence in [0, 1].
         """
-        return self._require_fit("signal_confidence()").signal_confidence(signal_range)
+        return self._require_fit("signal_confidence()").signal_confidence(signal_range, gamma)
 
-    def mask(self, phase=None, signal_range="auto") -> np.ndarray:
+    def mask(self, phase=None, signal_range="auto", gamma: float = SHADE_GAMMA) -> np.ndarray:
         """Display mask in [0, 1] for one crystal, or for all indexed positions.
 
         The phase decision times the diffracted-signal confidence: positions
@@ -588,9 +591,21 @@ class CrystalMap(AutoSerialize):
             Crystal index or name. None (default) keeps every indexed
             position, whichever crystal won.
         signal_range : tuple or "auto"
-            Passed to :meth:`signal_confidence`.
+            Passed to :meth:`signal_confidence`. Set it to override the
+            automatic brightness range, e.g. (0, 500).
+        gamma : float, default=:data:`~quantem.diffraction.phase.SHADE_GAMMA`
+            Brightness exponent, the same one :meth:`plot_phase` shades with,
+            so a masked orientation map and the phase map agree. Diffracted
+            intensity is strongly skewed, so the default lifts the faint
+            positions; 1.0 gives the linear scale. Zero stays zero, so vacuum
+            is black at any value.
+
+        Returns
+        -------
+        np.ndarray
+            ``(scan_row, scan_col)`` mask in [0, 1].
         """
-        conf = self.signal_confidence(signal_range)
+        conf = self.signal_confidence(signal_range, gamma)
         if phase is None:
             return conf
         i = self.names.index(phase) if isinstance(phase, str) else int(phase)
@@ -654,7 +669,15 @@ class CrystalMap(AutoSerialize):
         """
         return self._require_fit("plot_phase()").plot_phase(**kwargs)
 
-    def plot_orientation(self, direction=("z", "r"), phase=None, mask=None, **kwargs):
+    def plot_orientation(
+        self,
+        direction=("z", "r"),
+        phase=None,
+        mask=None,
+        signal_range="auto",
+        shade_gamma: float = SHADE_GAMMA,
+        **kwargs,
+    ):
         """Inverse pole figure maps of every crystal, masked by the phase decision.
 
         Parameters
@@ -664,9 +687,17 @@ class CrystalMap(AutoSerialize):
         phase : int or str, optional
             Restrict to one crystal. None (default) plots all of them.
         mask : np.ndarray, optional
-            Overrides the automatic phase-and-signal mask.
+            Overrides the automatic phase-and-signal mask entirely.
+        signal_range : tuple or "auto", default="auto"
+            Diffracted intensity mapped to black ... full color. Set it to
+            override the automatic range, e.g. (0, 500).
+        shade_gamma : float, default=:data:`~quantem.diffraction.phase.SHADE_GAMMA`
+            Brightness exponent of that mask, the same one :meth:`plot_phase`
+            shades with. Below 1 lifts the faint positions, 1.0 is the linear
+            scale. Both are ignored when `mask` is given.
         **kwargs
-            Passed to :meth:`OrientationMap.plot_orientation`.
+            Passed to :meth:`OrientationMap.plot_orientation`, e.g. `smooth`,
+            and `saturation_power` and `chroma` for the color wedge.
 
         Returns
         -------
@@ -676,14 +707,22 @@ class CrystalMap(AutoSerialize):
         dirs = [direction] if isinstance(direction, str) else list(direction)
         out = []
         for i in self._phase_indices(phase):
-            m = mask if mask is not None else self.mask(i)
+            m = mask if mask is not None else self.mask(i, signal_range, shade_gamma)
             for d in dirs:
                 out.append(
                     self.orientation_maps[i].plot_orientation(direction=d, mask=m, **kwargs)
                 )
         return out
 
-    def plot_pole_figure(self, pole=(0, 0, 1), phase=None, mask=None, **kwargs):
+    def plot_pole_figure(
+        self,
+        pole=(0, 0, 1),
+        phase=None,
+        mask=None,
+        signal_range="auto",
+        shade_gamma: float = SHADE_GAMMA,
+        **kwargs,
+    ):
         """Stereographic pole figure of each crystal, masked by the phase decision.
 
         Parameters
@@ -693,7 +732,11 @@ class CrystalMap(AutoSerialize):
         phase : int or str, optional
             Restrict to one crystal. None (default) plots all of them.
         mask : np.ndarray, optional
-            Overrides the automatic phase-and-signal mask.
+            Overrides the automatic phase-and-signal mask entirely.
+        signal_range : tuple or "auto", default="auto"
+            Diffracted intensity mapped to black ... full color.
+        shade_gamma : float, default=:data:`~quantem.diffraction.phase.SHADE_GAMMA`
+            Brightness exponent of that mask. Ignored when `mask` is given.
         **kwargs
             Passed to :meth:`OrientationMap.plot_pole_figure`, e.g.
             `color_by`, `int_range` and `overlay`.
@@ -705,7 +748,7 @@ class CrystalMap(AutoSerialize):
         """
         out = []
         for i in self._phase_indices(phase):
-            m = mask if mask is not None else self.mask(i)
+            m = mask if mask is not None else self.mask(i, signal_range, shade_gamma)
             out.append(self.orientation_maps[i].plot_pole_figure(pole=pole, mask=m, **kwargs))
         return out
 

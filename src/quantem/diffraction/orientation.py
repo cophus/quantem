@@ -121,31 +121,44 @@ def smooth_quaternions(
     q = torch.as_tensor(quats, dtype=torch.float64)
     R, C = q.shape[:2]
     active = torch.as_tensor(active, dtype=torch.bool)
+    sym = torch.as_tensor(sym_quats, dtype=torch.float64).reshape(-1, 4)
     rad = max(1, int(np.ceil(3 * sigma_px)))
+    cos_max = float(np.cos(np.deg2rad(max_angle_deg) / 2))
+    # accumulate the weighted outer products one neighbour offset at a time,
+    # over the whole map at once
+    M = torch.zeros((R, C, 4, 4), dtype=torch.float64)
+    count = torch.zeros((R, C), dtype=torch.long)
+    for dr in range(-rad, rad + 1):
+        for dc in range(-rad, rad + 1):
+            r0, r1 = max(0, -dr), min(R, R - dr)
+            c0, c1 = max(0, -dc), min(C, C - dc)
+            if r1 <= r0 or c1 <= c0:
+                continue
+            q0 = q[r0:r1, c0:c1]
+            qn = q[r0 + dr : r1 + dr, c0 + dc : c1 + dc]
+            ok = active[r0:r1, c0:c1] & active[r0 + dr : r1 + dr, c0 + dc : c1 + dc]
+            # the symmetry image of the neighbour nearest each centre
+            cand = qmult(qn[..., None, :], sym)  # (r, c, S, 4)
+            dots = torch.einsum("rcsi,rci->rcs", cand, q0)
+            best = dots.abs().argmax(dim=-1)
+            qk = torch.gather(cand, 2, best[..., None, None].expand(*best.shape, 1, 4))[..., 0, :]
+            dot = (qk * q0).sum(-1)
+            qk = qk * torch.sign(dot)[..., None]
+            cos_half = dot.abs().clamp(max=1.0)
+            ok &= cos_half >= cos_max
+            ang = torch.rad2deg(2 * torch.acos(cos_half))
+            w = np.exp(-(dr * dr + dc * dc) / (2 * sigma_px**2)) * torch.exp(
+                -(ang**2) / (2.0 * sigma_deg**2)
+            )
+            w = torch.where(ok, w, torch.zeros_like(w))
+            M[r0:r1, c0:c1] += w[..., None, None] * qk[..., :, None] * qk[..., None, :]
+            count[r0:r1, c0:c1] += ok.to(torch.long)
     out = q.clone()
-    w_ang = 2.0 * sigma_deg**2
-    for rx in range(R):
-        for ry in range(C):
-            if not bool(active[rx, ry]):
-                continue
-            r0, r1 = max(0, rx - rad), min(R, rx + rad + 1)
-            c0, c1 = max(0, ry - rad), min(C, ry + rad + 1)
-            sel = active[r0:r1, c0:c1]
-            if int(sel.sum()) < 2:
-                continue
-            rr, cc = torch.nonzero(sel, as_tuple=True)
-            qn = q[r0:r1, c0:c1][sel]
-            d2 = ((rr + r0 - rx) ** 2 + (cc + c0 - ry) ** 2).to(torch.float64)
-            ang = misorientation_angle_deg(q[rx, ry], qn, sym_quats)
-            keep = ang <= max_angle_deg
-            if int(keep.sum()) < 2:
-                continue
-            w = torch.exp(-d2[keep] / (2 * sigma_px**2)) * torch.exp(-(ang[keep] ** 2) / w_ang)
-            qk = symmetry_aligned(q[rx, ry], qn[keep], sym_quats)
-            qk = qk * torch.sign((qk @ q[rx, ry]).unsqueeze(-1))
-            M = (w[:, None, None] * (qk[:, :, None] * qk[:, None, :])).sum(0)
-            _, evecs = torch.linalg.eigh(M)
-            out[rx, ry] = qnormalize(evecs[:, -1])
+    # a position needs itself and at least one neighbour inside the angle
+    upd = active & (count >= 2)
+    if bool(upd.any()):
+        _, evecs = torch.linalg.eigh(M[upd])
+        out[upd] = qnormalize(evecs[..., -1])
     return out
 
 

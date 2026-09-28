@@ -807,6 +807,21 @@ class Crystal(AutoSerialize):
                 # only to within the distortion of the real cell
                 uvw = direction_indices(self.lat_real, c.numpy(), atol=loose)
                 prefix = "~"
+            if uvw is not None:
+                # v and -v are the same zone axis: name it with the first
+                # nonzero index of the printed symbol positive, [100] rather
+                # than [-100] (for 4-index symbols, [U V T W] with U = 2u - v,
+                # V = 2v - u, T = -(u + v), up to a common factor)
+                uvw = np.asarray(uvw)
+                u, v, w = uvw
+                shown = (
+                    np.array([2 * u - v, 2 * v - u, -(u + v), w])
+                    if self.hexagonal_matching
+                    else uvw
+                )
+                nz = np.flatnonzero(shown)
+                if nz.size and shown[nz[0]] < 0:
+                    uvw = -uvw
             labels.append(
                 prefix
                 + format_direction(uvw, hexagonal=self.hexagonal_matching, mathtext=mathtext)

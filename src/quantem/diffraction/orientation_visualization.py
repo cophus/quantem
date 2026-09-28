@@ -20,7 +20,13 @@ DEFAULT_PHASE_COLORS = np.array(
 )
 ORIGIN_COLOR = "#2ca02c"
 MEASURED_COLOR = "0.15"
-IPF_SATURATION_POWER = 0.6  # <1 shrinks the white centre of the IPF wedge
+# exponent on the distance from the wedge centre: >1 widens the white centre
+# and softens the transition into it, <1 shrinks it (much below 0.5 leaves a
+# bright point at the centre)
+IPF_SATURATION_POWER = 0.5
+# colorfulness relative to the corner colors: 1 keeps them exact, lower values
+# wash the whole wedge toward white
+IPF_CHROMA = 1.0
 # corner colors: full red, green capped to avoid the fluorescent look, blue
 # lifted off pure dark blue; pairwise blends give near-max-chroma orange,
 # cyan and violet along the edges
@@ -46,23 +52,49 @@ CLUSTER_COLORS = [
 ]
 
 
-def _bary_to_rgb(w: np.ndarray) -> np.ndarray:
+def _bary_to_rgb(
+    w: np.ndarray,
+    saturation_power: float | None = None,
+    chroma: float | None = None,
+) -> np.ndarray:
     """Barycentric wedge weights (..., 3) to RGB.
 
-    Each direction takes the color of the edge point straight out from the
-    wedge centre, a blend of the two nearest corner colors, and fades toward
-    white with its distance from that edge. Every edge is fully colored and
-    only the centre itself is white, so the whole wedge keeps its contrast.
+    The corner colors are mixed additively with the weights scaled by their
+    4-norm, a smooth stand-in for dividing by the largest weight: the mix
+    stays bright between corners (orange, cyan and violet midway along the
+    edges) and the corners keep their own colors. The mix is then faded
+    toward white by 1 - 27 w0 w1 w2, which is zero at the wedge centre and
+    one on every edge. Both terms are smooth in the weights, so the colors
+    change gradually across the whole wedge, with no creases where one
+    corner takes over from another, and the mix never leaves the sRGB gamut.
+
+    Parameters
+    ----------
+    w : np.ndarray
+        Barycentric coordinates in the fundamental wedge, (..., 3).
+    saturation_power : float | None
+        Exponent on the distance from the wedge centre. Above 1 the color
+        builds up more slowly away from the centre, widening the white region
+        and softening the transition into it; below 1 shrinks it. None takes
+        `IPF_SATURATION_POWER`.
+    chroma : float | None
+        Colorfulness relative to the corner colors: 1 keeps them exact, lower
+        washes the wedge toward white. None takes `IPF_CHROMA`.
+
+    Returns
+    -------
+    np.ndarray
+        RGB array (..., 3) in [0, 1].
     """
-    w = np.clip(w, 0, None)
+    saturation_power = IPF_SATURATION_POWER if saturation_power is None else saturation_power
+    chroma = IPF_CHROMA if chroma is None else chroma
+    w = np.clip(np.asarray(w, dtype=float), 0, None)
     w = w / np.clip(w.sum(axis=-1, keepdims=True), 1e-12, None)
-    m = w.min(axis=-1, keepdims=True)
-    # the edge point on the ray from the centre (1/3, 1/3, 1/3) through w
-    edge = (w - m) / np.clip(1.0 - 3.0 * m, 1e-12, None)
-    edge = edge / np.clip(edge.max(axis=-1, keepdims=True), 1e-12, None)
-    rgb = np.clip(edge @ IPF_CORNER_COLORS, 0, 1)
-    sat = np.clip(1.0 - 3.0 * m, 0, 1) ** IPF_SATURATION_POWER
-    return 1.0 - sat * (1.0 - rgb)
+    u = w / np.clip((w**4).sum(axis=-1, keepdims=True) ** 0.25, 1e-12, None)
+    rgb = u @ IPF_CORNER_COLORS
+    # distance from the centre: 0 there, 1 on the edges, smooth in w
+    r = np.clip(1.0 - 27.0 * w[..., 0] * w[..., 1] * w[..., 2], 0, 1) ** saturation_power
+    return np.clip(1.0 - np.clip(chroma * r, 0, 1)[..., None] * (1.0 - rgb), 0, 1)
 
 
 def _parse_direction(direction) -> torch.Tensor:
@@ -118,6 +150,8 @@ def ipf_color(
     orientations: torch.Tensor,
     crystal: Crystal,
     direction: str | torch.Tensor = "z",
+    saturation_power: float | None = None,
+    chroma: float | None = None,
 ) -> np.ndarray:
     """Inverse pole figure RGB colors for orientations.
 
@@ -130,6 +164,10 @@ def ipf_color(
     direction : {"x", "y", "z"} | torch.Tensor, default="z"
         Lab direction whose crystal-frame coordinates are colored; "z" is the
         beam direction (zone-axis map).
+    saturation_power : float | None
+        Width of the white centre; see :func:`_bary_to_rgb`.
+    chroma : float | None
+        Colorfulness relative to the corner colors; see :func:`_bary_to_rgb`.
 
     Returns
     -------
@@ -148,12 +186,15 @@ def ipf_color(
 
         az = (torch.atan2(v[..., 1], v[..., 0]) / (2 * np.pi)) % 1.0
         pol = torch.acos(v[..., 2].clamp(-1, 1)) / (np.pi / 2)
-        hsv = torch.stack((az, pol.clamp(0, 1), torch.ones_like(az)), dim=-1)
+        sat = pol.clamp(0, 1) ** (
+            IPF_SATURATION_POWER if saturation_power is None else saturation_power
+        )
+        hsv = torch.stack((az, sat, torch.ones_like(az)), dim=-1)
         return hsv_to_rgb(hsv.numpy())
 
     A_inv = torch.linalg.inv(corners.to(v.dtype).T)
     w = torch.einsum("ij,...j->...i", A_inv, v)
-    return _bary_to_rgb(w.numpy())
+    return _bary_to_rgb(w.numpy(), saturation_power, chroma)
 
 
 def fold_in_plane(quats: torch.Tensor, crystal: Crystal, strict: bool = False) -> torch.Tensor:
@@ -226,12 +267,17 @@ def wedge_legend(
     labels: bool = True,
     orientation: str = "horizontal",
     fontsize: int = 11,
+    saturation_power: float | None = None,
+    chroma: float | None = None,
 ) -> None:
     """Draw the labeled IPF color triangle for the crystal's fundamental wedge.
 
     Corner direction labels use 4-index Miller-Bravais symbols for hexagonal
     and trigonal crystals. orientation="vertical" rotates the wedge 90
     degrees to fill a tall side panel.
+
+    `saturation_power` and `chroma` go to :func:`_bary_to_rgb` and must match
+    the map being labelled, which the plotting functions ensure.
     """
     corners = crystal.zone_axis_wedge()
     if corners is None:
@@ -277,7 +323,7 @@ def wedge_legend(
     W = V @ A_inv.T
     inside = (W > -1e-9).all(axis=-1)
     rgba = np.zeros(X.shape + (4,))
-    rgba[..., :3] = _bary_to_rgb(W)
+    rgba[..., :3] = _bary_to_rgb(W, saturation_power, chroma)
     rgba[..., 3] = inside
     ax.imshow(rgba, extent=(x0, x1, y0, y1), origin="lower", interpolation="nearest")
     for exy in edges:
@@ -313,6 +359,8 @@ def plot_orientation_map(
     title: str | None = None,
     fold: bool | str = "auto",
     smooth: dict | bool | None = None,
+    saturation_power: float | None = None,
+    chroma: float | None = None,
 ):
     """IPF-colored orientation map with the wedge legend in an adjacent panel.
 
@@ -346,6 +394,14 @@ def plot_orientation_map(
         a dict naming the values you want, such as
         {"sigma_px": 1.0, "sigma_deg": 1.0, "max_angle_deg": 5.0}, which is
         also what True uses.
+    saturation_power : float | None
+        Widens or narrows the white centre of the color wedge. Above 1 covers
+        a wider range of orientations near the wedge centre and softens the
+        transition into it. None takes `IPF_SATURATION_POWER`.
+    chroma : float | None
+        Colorfulness relative to the corner colors: 1 keeps them exact, lower
+        washes the map toward white. None takes `IPF_CHROMA`.
+        The legend is drawn with the same values.
     scalebar : dict | None
         Real-space scale bar, e.g. {"sampling": 30, "units": "A"}.
     figax : (fig, (ax_map, ax_legend)) | (fig, ax_map) | None
@@ -367,9 +423,10 @@ def plot_orientation_map(
                 "is the argument that keeps the average inside one grain"
             )
         quats = om.smoothed_quats(match=match, **(smooth if isinstance(smooth, dict) else {}))
-    if fold:
+    if fold and not (isinstance(direction, str) and direction == "z"):
+        # the zone-axis color does not depend on the in-plane angle
         quats = fold_in_plane(quats, om.crystal, strict=fold != "auto")
-    rgb = ipf_color(quats, om.crystal, direction)
+    rgb = ipf_color(quats, om.crystal, direction, saturation_power, chroma)
     if mask is not None:
         rgb = rgb * np.asarray(mask, dtype=float)[..., None]
     if crop is not None:
@@ -429,7 +486,13 @@ def plot_orientation_map(
             loc="lower right",
         )
     if legend and ax_leg is not None:
-        wedge_legend(om.crystal, ax_leg, orientation="vertical")
+        wedge_legend(
+            om.crystal,
+            ax_leg,
+            orientation="vertical",
+            saturation_power=saturation_power,
+            chroma=chroma,
+        )
     return fig, ax
 
 
@@ -907,6 +970,8 @@ def plot_pole_figure(
     label: str | None = None,
     grid: bool = True,
     overlay: dict | None = None,
+    saturation_power: float | None = None,
+    chroma: float | None = None,
     figax=None,
 ):
     """Stereographic pole figure of a crystal direction family over the map.
@@ -937,6 +1002,9 @@ def plot_pole_figure(
         Annotation for the pole family, e.g. "(0001)" or "{110}".
     grid : bool, default=True
         Draw polar-angle circles and azimuth spokes every 30 degrees.
+    saturation_power, chroma : float | None
+        Color wedge shape, used when `color_by` is "ipf"; see
+        :func:`plot_orientation_map`.
     """
     import matplotlib.pyplot as plt
 
@@ -960,7 +1028,9 @@ def plot_pole_figure(
     if color_by == "ipf":
         # white background: blend from white toward the per-position IPF
         # color as the histogram density rises
-        rgb_pos = ipf_color(om.quats[..., match, :], om.crystal, "z").reshape(-1, 3)
+        rgb_pos = ipf_color(
+            om.quats[..., match, :], om.crystal, "z", saturation_power, chroma
+        ).reshape(-1, 3)
         rgb_all = rgb_pos[src]
         img = np.zeros((bins, bins, 3))
         cnt = np.zeros((bins, bins))
@@ -1115,7 +1185,13 @@ def plot_pole_figure(
     ax.set_title(title)
     if ax_leg is not None:
         if color_by == "ipf":
-            wedge_legend(om.crystal, ax_leg, orientation="vertical")
+            wedge_legend(
+                om.crystal,
+                ax_leg,
+                orientation="vertical",
+                saturation_power=saturation_power,
+                chroma=chroma,
+            )
         else:
             ax_leg.axis("off")
     return fig, ax

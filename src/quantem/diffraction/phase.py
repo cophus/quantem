@@ -36,6 +36,11 @@ from quantem.diffraction.defaults import (
 )
 from quantem.diffraction.orientation import OrientationMap, position_mask
 
+# Diffracted intensity is strongly skewed, so a linear brightness leaves most
+# indexed positions nearly black. This exponent is applied wherever a map is
+# shaded by signal, so the phase map and the orientation maps agree.
+SHADE_GAMMA = 0.5
+
 
 def _majority_filter(phase: np.ndarray, radius: int) -> np.ndarray:
     """Replace each position by the most common phase around it.
@@ -415,6 +420,7 @@ class PhaseMap(AutoSerialize):
     def signal_confidence(
         self,
         signal_range: tuple[float, float] | str = "auto",
+        gamma: float = 1.0,
     ) -> np.ndarray:
         """Confidence in [0, 1] that a crystal is present, from the data alone.
 
@@ -434,12 +440,19 @@ class PhaseMap(AutoSerialize):
         signal_range : tuple | "auto", default="auto"
             Diffracted intensity mapped to 0 ... 1. "auto" spans zero to the
             95th percentile over the indexed positions.
+        gamma : float, default=1.0
+            Exponent applied to the result. The default returns the raw
+            confidence, which is what a threshold should be taken on;
+            :attr:`SHADE_GAMMA` is the value used when shading a display, and
+            zero stays zero either way.
 
         Returns
         -------
         np.ndarray
             ``(scan_row, scan_col)`` confidence in [0, 1].
         """
+        if gamma <= 0:
+            raise ValueError(f"gamma must be positive, got {gamma}")
         if self.diffracted_intensity is None:
             raise ValueError("Run fit() before signal_confidence().")
         sig = np.nan_to_num(self.diffracted_intensity.numpy())
@@ -450,14 +463,15 @@ class PhaseMap(AutoSerialize):
             lo, hi = 0.0, max(hi, 1e-12)
         else:
             lo, hi = signal_range
-        return ((sig - lo) / max(hi - lo, 1e-12)).clip(0, 1) * indexed
+        conf = ((sig - lo) / max(hi - lo, 1e-12)).clip(0, 1) * indexed
+        return conf if gamma == 1.0 else np.power(conf, gamma)
 
     def plot_phase(
         self,
         phase_colors: np.ndarray | None = None,
         shade_by: str = "signal",
         shade_range: tuple[float, float] | str = "auto",
-        shade_gamma: float = 0.5,
+        shade_gamma: float = SHADE_GAMMA,
         majority_filter: int = 0,
         reliability_range: tuple[float, float] | None = None,
         scalebar: dict | str | None = "auto",
@@ -483,7 +497,7 @@ class PhaseMap(AutoSerialize):
             Values mapped to black ... full color. "auto" takes a high
             percentile over the indexed positions, since the absolute scale
             depends on the data.
-        shade_gamma : float, default=0.5
+        shade_gamma : float, default=:attr:`SHADE_GAMMA` (0.5)
             Exponent applied to the brightness, ``alpha ** shade_gamma``.
             Diffracted intensity is strongly skewed, so a linear scale leaves
             most indexed positions dark and only the brightest grains
