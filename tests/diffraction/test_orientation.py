@@ -650,20 +650,41 @@ def test_rescue_breaks_friedel_ties_by_neighbours():
     assert float(run(0.01).max()) < 2.0
 
 
-def test_ipf_key_saturates_edges_and_whitens_only_the_centre():
+def test_ipf_key_is_smooth_with_exact_corners_and_white_centre():
     from quantem.diffraction.orientation_visualization import IPF_CORNER_COLORS, _bary_to_rgb
 
     assert np.allclose(_bary_to_rgb(np.eye(3)), IPF_CORNER_COLORS)
-    # every edge point is the full blend of its two corner colors, no white
-    t = np.linspace(0, 1, 11)
-    for i, j in ((0, 1), (1, 2), (2, 0)):
-        w = np.zeros((11, 3))
-        w[:, i], w[:, j] = 1 - t, t
-        blend = w / w.max(axis=1, keepdims=True)
-        assert np.allclose(_bary_to_rgb(w), np.clip(blend @ IPF_CORNER_COLORS, 0, 1))
     assert np.allclose(_bary_to_rgb(np.ones(3) / 3), 1)
-    # halfway from the centre to an edge is still clearly colored
-    assert _bary_to_rgb(np.array([0.5, 0.5, 0.0]) * 0.5 + 1 / 6).min() < 0.7
+    # no creases: along lines across the wedge, including across the lines
+    # where one corner takes over from another, the color turns gently
+    t = np.linspace(0, 1, 801)[:, None]
+    for p0, p1 in (
+        ((0.55, 0.40, 0.05), (0.20, 0.10, 0.70)),
+        ((0.90, 0.05, 0.05), (0.05, 0.90, 0.05)),
+        ((0.70, 0.30, 0.00), (0.00, 0.30, 0.70)),
+    ):
+        c = _bary_to_rgb(np.array(p0) * (1 - t) + np.array(p1) * t)
+        assert np.abs(np.diff(c, 2, axis=0)).max() < 1e-4
+    # the edges stay colored all along: midway between two corners is vivid
+    for i, j in ((0, 1), (1, 2), (2, 0)):
+        w = np.zeros(3)
+        w[i] = w[j] = 0.5
+        rgb = _bary_to_rgb(w)
+        assert rgb.max() - rgb.min() > 0.5
+
+
+def test_wedge_labels_name_zone_axes_with_positive_leading_index():
+    import re
+
+    for xtl in (
+        Crystal.from_ase(bulk("Cu", "fcc", a=3.6, cubic=True), verbose=False),
+        Crystal.from_ase(bulk("Ti", "hcp", a=2.95, c=4.68), verbose=False),
+    ):
+        for label in xtl.zone_axis_wedge_labels(mathtext=False):
+            # the first nonzero digit carries no overbar
+            m = re.search("[1-9]", label)
+            assert m is not None
+            assert label[m.end() : m.end() + 1] != "\u0305", label
 
 
 def test_plot_matches_background_norm():
