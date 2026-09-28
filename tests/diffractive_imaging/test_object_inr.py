@@ -566,6 +566,6 @@ class TestDataCriteria:
 
         preds = torch.tensor([[1.0, 2.0]])  # B = 1
         targets = torch.tensor([[1.5, 2.0]])
-        # n == B -> global scale 1; matches the legacy sum-reduced amplitude losses
-        assert torch.isclose(L2()(preds, targets, n=1), torch.tensor(0.25))
+        # n == B -> global scale 1; L2 is half the sum of squares, L1 the plain sum
+        assert torch.isclose(L2()(preds, targets, n=1), torch.tensor(0.125))
         assert torch.isclose(L1()(preds, targets, n=1), torch.tensor(0.5))
