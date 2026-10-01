@@ -49,7 +49,6 @@ from quantem.diffraction.rotations import (
     quat_from_axis_angle,
     quat_from_zone_axis,
     sample_zone_axes,
-    symmetry_aligned,
 )
 
 
