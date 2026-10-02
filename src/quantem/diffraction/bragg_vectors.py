@@ -1505,7 +1505,8 @@ class BraggVectors(AutoSerialize):
         **kwargs
             Further arguments of
             :func:`~quantem.diffraction.calibration.calibrate`, e.g.
-            `fit_ellipse`, `k_min`, `k_max`, `marker_size` and `figsize`.
+            `zone_axis` to fit only the rings of one zone, `fit_ellipse`,
+            `scale_search`, `k_min`, `k_max`, `marker_size` and `figsize`.
 
         Returns
         -------

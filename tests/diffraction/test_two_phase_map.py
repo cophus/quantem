@@ -245,3 +245,69 @@ def test_plot_calibration_shows_every_crystal():
     labels = [t.get_text() for t in ax.get_legend().get_texts()]
     assert labels == ["Ti alpha rings", "Ti beta rings"]
     matplotlib.pyplot.close(fig)
+
+
+def test_refine_skips_crystals_out_of_the_running():
+    from quantem.diffraction.crystal_map import CrystalMap
+
+    rng = np.random.default_rng(7)
+    ti_a = Crystal.from_ase(
+        bulk("Ti", "hcp", a=2.9505, c=4.6855), name="Ti alpha", verbose=False
+    ).calculate_structure_factors(k_max=1.5)
+    ti_b = Crystal.from_ase(
+        bulk("Ti", "bcc", a=3.26, cubic=True), name="Ti beta", verbose=False
+    ).calculate_structure_factors(k_max=1.5)
+    q_a = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    q_b = quat_from_axis_angle(
+        torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64),
+        torch.tensor(np.deg2rad(20.0), dtype=torch.float64),
+    )
+    cells = [
+        [_pattern(ti_a, q_a, rng) if c < 3 else _pattern(ti_b, q_b, rng) for c in range(6)]
+        for _ in range(2)
+    ]
+    peaks = Vector.from_data(cells, fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t")
+    fractions = []
+    for margin in (None, 0.1):
+        cm = CrystalMap.from_vectors(peaks, [ti_a, ti_b], energy_ev=200e3)
+        cm.build_plan()
+        cm.match_orientations(progress_bar=False)
+        corr = np.stack([om.corr[..., 0].numpy() for om in cm])
+        q_lib = [om.quats.clone() for om in cm]
+        cm.refine_orientations(competitive_margin=margin, progress_bar=False)
+        cm.fit(progress_bar=False)
+        fractions.append(cm.phase_index.copy())
+        if margin is not None:
+            out = corr < corr.max(axis=0) - margin
+            for i, om in enumerate(cm):
+                # where a crystal is out of the running its library match stays
+                assert torch.equal(om.quats[out[i]], q_lib[i][out[i]])
+            assert out.any()
+    assert (fractions[0] == fractions[1]).all()
+
+
+def test_zone_reflections_keep_one_zone():
+    from quantem.diffraction.calibration import plot_calibration, zone_reflections
+
+    ti_a = Crystal.from_ase(
+        bulk("Ti", "hcp", a=2.9505, c=4.6855), name="Ti alpha", verbose=False
+    ).calculate_structure_factors(k_max=1.5)
+    basal = zone_reflections(ti_a, (0, 0, 0, 1))
+    # [0001] keeps exactly the hk0 reflections, and 3- and 4-index agree
+    assert (basal.hkl[:, 2] == 0).all()
+    assert len(basal.hkl) == int((ti_a.hkl[:, 2] == 0).sum())
+    assert torch.equal(zone_reflections(ti_a, (0, 0, 1)).hkl, basal.hkl)
+    assert basal.name == "Ti alpha [0001]" and ti_a.name == "Ti alpha"
+    assert len(ti_a.hkl) > len(basal.hkl)
+    # the plots accept it and title the column by the zone
+    import matplotlib
+
+    matplotlib.use("Agg")
+    rng = np.random.default_rng(8)
+    q = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    peaks = Vector.from_data(
+        [[_pattern(ti_a, q, rng)]], fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t"
+    )
+    fig, axs = plot_calibration(peaks, ti_a, zone_axis=(0, 0, 0, 1))
+    assert axs[0, 0].get_title() == "Ti alpha [0001]"
+    matplotlib.pyplot.close(fig)

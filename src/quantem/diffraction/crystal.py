@@ -1064,6 +1064,23 @@ class Crystal(AutoSerialize):
         self.dyn_k_max = float(k_max)
         return self
 
+    def direction_vector(self, direction) -> torch.Tensor:
+        """Unit Cartesian vector (3,) of a lattice direction in the crystal frame.
+
+        Parameters
+        ----------
+        direction : sequence of float
+            [uvw] in this cell, or [UVTW] for a hexagonal or trigonal cell.
+        """
+        d = np.asarray(direction, dtype=float).ravel()
+        if d.size == 4:
+            U, V, T, W = d
+            d = np.array([U - T, V - T, W])
+        elif d.size != 3:
+            raise ValueError(f"a direction has 3 or 4 indices, got {direction}")
+        v = d @ self.lat_real.numpy()
+        return torch.as_tensor(v / np.linalg.norm(v), dtype=torch.float64)
+
     def generate_pattern(
         self,
         orientation: torch.Tensor,
@@ -1075,6 +1092,7 @@ class Crystal(AutoSerialize):
         semiconv_mrad: float = 0.0,
         excitation_model: str = "gaussian",
         thickness_A: float | None = None,
+        foil_normal=None,
     ) -> dict[str, torch.Tensor]:
         """Kinematical diffraction pattern for one orientation.
 
@@ -1111,25 +1129,42 @@ class Crystal(AutoSerialize):
             of the Bloch wave calculation for thin crystals.
         thickness_A : float | None
             Thickness for the slab model (Angstroms).
+        foil_normal : sequence of float, optional
+            Plate normal of the specimen as a direction in this crystal,
+            [uvw] or [UVTW], e.g. (0, 0, 0, 1) for a 2D material lying in its
+            basal plane. Every reflection is then a rod along that normal: it
+            is excited by its distance along the rod to the Ewald sphere, and
+            its spot sits where the rod meets the sphere rather than at the
+            projection of g. For a tilted flake, whose rods are long, the
+            spots shift by up to s_g tan(tilt). None (default) takes the
+            normal along the beam, the usual geometry.
 
         Returns
         -------
         dict with 'qx', 'qy', 'intensity', 'hkl', 's_g' (the central
-        excitation error), 'a' and 'b' (ring and disk sweep amplitudes).
+        excitation error, along the rod when `foil_normal` is given), 'a'
+        and 'b' (ring and disk sweep amplitudes).
         """
         if self.g_vec is None:
             raise RuntimeError("Run calculate_structure_factors first.")
         from quantem.diffraction.illumination import (
             averaged_gaussian_intensity_envelope,
             excitation_coefficients,
+            relrod_factor,
             slab_envelope,
         )
 
         g = qrotate(orientation, self.g_vec)
+        n_lab = None
+        if foil_normal is not None:
+            n_lab = qrotate(orientation, self.direction_vector(foil_normal)[None])[0]
         if excitation_model == "slab":
             if thickness_A is None:
                 raise ValueError("the slab excitation model needs thickness_A")
             c, a, b = excitation_coefficients(g, energy_ev, precession_deg, semiconv_mrad)
+            if n_lab is not None:
+                f = relrod_factor(g.numpy(), n_lab.numpy(), energy_ev, precession_deg)
+                c, a, b = c * f, a * np.abs(f), b * np.abs(f)
             # the sinc^2 tails are algebraic: keep everything whose main
             # lobe (width 1/z) plus illumination sweep is within the tolerance
             width = tol_excitation_mult / float(thickness_A)
@@ -1152,7 +1187,12 @@ class Crystal(AutoSerialize):
             )
         else:
             env, c, a, b = averaged_gaussian_intensity_envelope(
-                g, energy_ev, sigma_excitation, precession_deg, semiconv_mrad
+                g,
+                energy_ev,
+                sigma_excitation,
+                precession_deg,
+                semiconv_mrad,
+                foil_normal_lab=None if n_lab is None else n_lab.numpy(),
             )
             c_t = torch.as_tensor(c, dtype=torch.float64)
             a_t = torch.as_tensor(a, dtype=torch.float64)
@@ -1165,9 +1205,13 @@ class Crystal(AutoSerialize):
             intensity = (
                 self.struct_factors_int[keep] * torch.as_tensor(env, dtype=torch.float64)[keep]
             )
+        qxy = g[keep, :2]
+        if n_lab is not None:
+            # the spot is where the rod meets the sphere: g + t n, t = -c
+            qxy = qxy - c_t[keep, None] * n_lab[None, :2]
         return {
-            "qx": g[keep, 0],
-            "qy": g[keep, 1],
+            "qx": qxy[:, 0],
+            "qy": qxy[:, 1],
             "intensity": intensity,
             "hkl": self.hkl[keep],
             "s_g": c_t[keep],

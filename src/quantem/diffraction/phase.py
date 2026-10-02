@@ -438,8 +438,9 @@ class PhaseMap(AutoSerialize):
         Parameters
         ----------
         signal_range : tuple | "auto", default="auto"
-            Diffracted intensity mapped to 0 ... 1. "auto" spans zero to the
-            95th percentile over the indexed positions.
+            Diffracted intensity mapped to 0 ... 1. "auto" spans zero to half
+            the median over the indexed positions, so a crystal shows at full
+            strength and only weakly diffracting positions fade.
         gamma : float, default=1.0
             Exponent applied to the result. The default returns the raw
             confidence, which is what a threshold should be taken on;
@@ -458,8 +459,11 @@ class PhaseMap(AutoSerialize):
         sig = np.nan_to_num(self.diffracted_intensity.numpy())
         indexed = self.phase_index.numpy() >= 0
         if isinstance(signal_range, str):
+            # full brightness from half the median signal of the indexed
+            # positions: crystals show at full strength and only positions
+            # that diffract well below typical fade
             vals = sig[indexed]
-            hi = float(np.percentile(vals, 95)) if vals.size else 1.0
+            hi = 0.5 * float(np.median(vals)) if vals.size else 1.0
             lo, hi = 0.0, max(hi, 1e-12)
         else:
             lo, hi = signal_range

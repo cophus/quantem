@@ -10,6 +10,7 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
+import torch
 
 from quantem.core.datastructures.vector import Vector
 from quantem.core.io.serialize import AutoSerialize
@@ -703,6 +704,58 @@ def apply_ellipse(peaks, ellipse):
     return out
 
 
+def zone_reflections(crystal: Crystal, zone_axis) -> Crystal:
+    """The crystal restricted to the reflections of one zone.
+
+    A specimen that sits near one zone axis everywhere -- a flake lying flat,
+    a textured film -- only ever shows the reflections of that zone, so its
+    radial histogram holds those rings and no others. Calibrating or
+    plotting against every ring of the crystal then compares the peaks with
+    rings that cannot appear. This keeps the reflections hkl with
+    h u + k v + l w = 0 for the zone axis [uvw] and drops the rest.
+
+    Parameters
+    ----------
+    crystal : Crystal
+        With structure factors calculated.
+    zone_axis : sequence of int
+        Zone axis direction in the crystal's own cell, [uvw], or [UVTW] for a
+        hexagonal or trigonal cell, e.g. (0, 0, 0, 1) for the basal plane.
+
+    Returns
+    -------
+    Crystal
+        A shallow copy whose reflection list holds only that zone, named
+        after it; the original is unchanged.
+    """
+    import copy
+
+    if crystal.g_vec is None:
+        raise RuntimeError(f"{crystal.name}: run calculate_structure_factors() first")
+    z = np.asarray(zone_axis, dtype=float).ravel()
+    if z.size == 4:
+        U, V, T, W = z
+        uvw = np.array([U - T, V - T, W])
+        label = "[" + "".join(str(int(round(v))) for v in z) + "]"
+    elif z.size == 3:
+        uvw = z
+        label = "[" + "".join(str(int(round(v))) for v in z) + "]"
+    else:
+        raise ValueError(f"zone_axis must have 3 or 4 indices, got {zone_axis}")
+    keep = torch.as_tensor(np.abs(crystal.hkl.numpy() @ uvw) < 1e-6)
+    out = copy.copy(crystal)
+    for name in ("hkl", "g_vec", "g_len", "struct_factors", "struct_factors_int"):
+        setattr(out, name, getattr(crystal, name)[keep])
+    out.name = f"{crystal.name} {label}"
+    return out
+
+
+def _restrict(crystals, zone_axis):
+    """Crystal list, each restricted to `zone_axis` when one is given."""
+    xtls = [crystals] if isinstance(crystals, Crystal) else list(crystals)
+    return xtls if zone_axis is None else [zone_reflections(x, zone_axis) for x in xtls]
+
+
 def _hkl_label(hkl: np.ndarray, hexagonal: bool) -> str:
     """Compact (hkl) / (hkil) plane label with unicode overbars."""
 
@@ -896,6 +949,7 @@ def calibrate(
     plot: bool = True,
     figsize: tuple[float, float] = (13.0, 6.4),
     marker_size: float = 8.0,
+    zone_axis=None,
     returnfig: bool = False,
 ):
     """Measure the reciprocal pixel size and the elliptic distortion.
@@ -937,6 +991,10 @@ def calibrate(
         Area of the brightest peak in the azimuth panels, where every peak is
         drawn with area proportional to its intensity. Raise it to bring out
         weak spots, lower it when strong ones hide the reference lines.
+    zone_axis : sequence of int, optional
+        Fit only the rings of this zone, [uvw] or [UVTW] (see
+        :func:`zone_reflections`). For a specimen near one zone axis
+        everywhere, whose peaks hold no other rings.
 
     Returns
     -------
@@ -953,6 +1011,7 @@ def calibrate(
     for xtl in crystals:
         if xtl.g_vec is None:
             raise RuntimeError(f"{xtl.name}: run calculate_structure_factors() first")
+    crystals = _restrict(crystals, zone_axis)
 
     peaks_0 = peaks_to_calibrated(peaks_px, pixel_size_guess)
     # coarse: broad rings so the score has a single maximum over a wide range
@@ -1154,6 +1213,7 @@ def plot_calibration(
     bragg_k_power: float = 2.0,
     marker_size: float = 8.0,
     n_rings: int = 12,
+    zone_axis=None,
     axsize: tuple[float, float] = (6.0, 6.4),
     figax=None,
 ):
@@ -1183,6 +1243,9 @@ def plot_calibration(
         Rings drawn in the azimuth panels and labeled in the histograms,
         strongest first; a large cell would otherwise fill both with its
         weak superstructure rings.
+    zone_axis : sequence of int, optional
+        Show only the rings of this zone, [uvw] or [UVTW] (see
+        :func:`zone_reflections`).
     axsize : tuple, default=(6.0, 6.4)
         Size of one column.
     figax : (fig, axs) | None
@@ -1195,7 +1258,7 @@ def plot_calibration(
     """
     import matplotlib.pyplot as plt
 
-    xtls = [crystals] if isinstance(crystals, Crystal) else list(crystals)
+    xtls = _restrict(crystals, zone_axis)
     if figax is None:
         fig, axs = plt.subplots(
             2,
@@ -1241,6 +1304,7 @@ def plot_ring_comparison(
     label_hkl: bool = True,
     label_min_intensity: float = 0.05,
     n_labels: int = 12,
+    zone_axis=None,
     figax=None,
 ):
     """Measured radial peak histogram against crystal ring positions.
@@ -1267,10 +1331,13 @@ def plot_ring_comparison(
     n_labels : int, default=12
         Label at most this many rings, strongest first, which keeps a large
         cell with many rings readable.
+    zone_axis : sequence of int, optional
+        Show only the rings of this zone, [uvw] or [UVTW] (see
+        :func:`zone_reflections`).
     """
     import matplotlib.pyplot as plt
 
-    xtls = crystals if isinstance(crystals, (list, tuple)) else [crystals]
+    xtls = _restrict(crystals, zone_axis)
     k, hist = radial_histogram(peaks, k_min=k_min, k_max=k_max)
 
     n = len(xtls)
@@ -1428,6 +1495,7 @@ def plot_bragg_rings(
     q_max: float | None = None,
     bins: int = 400,
     power: float = 0.25,
+    zone_axis=None,
     figax=None,
 ):
     """2D histogram of all Bragg peaks with crystal rings overlaid.
@@ -1447,10 +1515,13 @@ def plot_bragg_rings(
         (solid, then dashed line styles).
     n_rings : int, default=8
         Number of rings per crystal, strongest first.
+    zone_axis : sequence of int, optional
+        Draw only the rings of this zone, [uvw] or [UVTW] (see
+        :func:`zone_reflections`).
     """
     import matplotlib.pyplot as plt
 
-    xtls = crystals if isinstance(crystals, (list, tuple)) else [crystals]
+    xtls = _restrict(crystals, zone_axis)
     flat = peaks.select_fields("qx", "qy", "intensity").numpy().astype(np.float64)
     if q_max is None:
         q_max = float(np.hypot(flat[:, 0], flat[:, 1]).max()) * 1.02

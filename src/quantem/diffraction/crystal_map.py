@@ -138,6 +138,7 @@ class CrystalMap(AutoSerialize):
         precession_deg: float = 0.0,
         semiconv_mrad: float = 0.0,
         k_max: float | None = None,
+        foil_normal=None,
     ) -> "CrystalMap":
         """Build one OrientationMap per crystal from a shared peak table.
 
@@ -157,6 +158,13 @@ class CrystalMap(AutoSerialize):
             beyond it cannot be paired. None keeps the structure factors the
             crystals already have, which must then share one k_max, since two
             phases simulated to different ranges are not compared fairly.
+        foil_normal : sequence or dict, optional
+            Plate normal of a 2D material or thin flake, as a direction in each
+            crystal, [uvw] or [UVTW]; a dict keyed by crystal name sets it per
+            crystal. Reflections are then rods along it, which places the
+            spots of a tilted flake where the rods meet the Ewald sphere (see
+            :meth:`OrientationMap.from_vectors`). None (default) is the usual
+            geometry.
 
         Raises
         ------
@@ -177,6 +185,9 @@ class CrystalMap(AutoSerialize):
                 energy_ev=energy_ev,
                 precession_deg=precession_deg,
                 semiconv_mrad=semiconv_mrad,
+                foil_normal=(
+                    foil_normal.get(xtl.name) if isinstance(foil_normal, dict) else foil_normal
+                ),
             )
             for xtl in xtls
         ]
@@ -291,7 +302,12 @@ class CrystalMap(AutoSerialize):
         """
         return self._fanout("match_orientations", overrides, **kwargs)
 
-    def refine_orientations(self, overrides: dict | None = None, **kwargs) -> "CrystalMap":
+    def refine_orientations(
+        self,
+        overrides: dict | None = None,
+        competitive_margin: float | None = 0.1,
+        **kwargs,
+    ) -> "CrystalMap":
         """Refine every crystal off the library grid.
 
         Least squares on the paired peak positions removes the quantization
@@ -300,20 +316,42 @@ class CrystalMap(AutoSerialize):
         a neighbour are then retried from the candidates around them, and
         ties go to the orientation the neighbours share.
 
+        With several crystals, each is refined only where it is in the
+        running: where its library correlation is within
+        `competitive_margin` of the best crystal's. Elsewhere its
+        orientations are noise -- the crystal is not there -- and refining
+        them, and retrying them against their equally random neighbours, is
+        most of the work in a two-phase map for no change in the phase
+        decision.
+
         Parameters
         ----------
         overrides : dict, optional
             Per-crystal keyword overrides, keyed by crystal name.
+        competitive_margin : float or None, default=0.1
+            Correlation margin behind the best crystal within which a crystal
+            is still refined. None refines every crystal everywhere.
         **kwargs
             Passed to :meth:`OrientationMap.refine_orientations` for every
-            crystal, commonly `num_iterations` and `zone_search_deg`.
+            crystal, commonly `num_iterations` and `zone_search_deg`. An
+            explicit `positions` is used as given.
 
         Returns
         -------
         CrystalMap
             Self, so stages chain.
         """
-        return self._fanout("refine_orientations", overrides, **kwargs)
+        oms = self.orientation_maps
+        if competitive_margin is None or len(oms) < 2 or "positions" in kwargs:
+            return self._fanout("refine_orientations", overrides, **kwargs)
+        corr = np.stack([om.corr[..., 0].numpy() for om in oms])
+        best = corr.max(axis=0)
+        for i, om in enumerate(oms):
+            kw = dict(kwargs)
+            kw.update((overrides or {}).get(om.crystal.name, {}))
+            kw.setdefault("positions", corr[i] >= best - competitive_margin)
+            om.refine_orientations(**kw)
+        return self
 
     def _fanout(self, method: str, overrides: dict | None, **kwargs) -> "CrystalMap":
         """Call ``method`` on every OrientationMap, with per-crystal overrides.
@@ -477,7 +515,8 @@ class CrystalMap(AutoSerialize):
 
         The clearest examples of a crystal are where it won by the largest
         margin (the phase reliability); the ambiguous ones are where the two
-        best crystals scored closest. Only positions that diffract are
+        best crystals scored closest. With a single crystal there is no
+        margin, and positions are ranked by its correlation instead. Only positions that diffract are
         considered, and each pick is at least `min_distance` from the others,
         so the examples come from different parts of the scan.
 
@@ -503,6 +542,13 @@ class CrystalMap(AutoSerialize):
         pm = self._require_fit("example_positions()")
         ph = self.phase_index
         rel = np.asarray(pm.reliability, dtype=float)
+        if not np.isfinite(rel[ph >= 0]).any():
+            # one crystal: no runner-up to compare against, so rank by how
+            # well the crystal itself matches
+            corr = np.stack([om.corr[..., 0].numpy() for om in self.orientation_maps])
+            rel = np.where(
+                ph >= 0, np.take_along_axis(corr, np.clip(ph, 0, None)[None], 0)[0], np.nan
+            )
         ok = (ph >= 0) & np.isfinite(rel) & (self.signal_confidence() >= min_signal)
         if phase is not None:
             ok &= ph == self._phase_indices(phase)[0]
@@ -566,8 +612,8 @@ class CrystalMap(AutoSerialize):
         Parameters
         ----------
         signal_range : tuple or "auto", default="auto"
-            Diffracted intensity mapped to 0 ... 1. "auto" spans zero to the
-            95th percentile over the indexed positions.
+            Diffracted intensity mapped to 0 ... 1. "auto" spans zero to half
+            the median over the indexed positions.
         gamma : float, default=1.0
             Exponent applied to the result. The default is the raw confidence,
             which is what a threshold should be taken on.
@@ -868,7 +914,8 @@ class CrystalMap(AutoSerialize):
         **kwargs
             Further arguments of
             :func:`~quantem.diffraction.calibration.plot_calibration`, e.g.
-            `k_broadening` and `marker_size`.
+            `zone_axis` to show only the rings of one zone, `k_broadening`
+            and `marker_size`.
 
         Returns
         -------
@@ -893,7 +940,7 @@ class CrystalMap(AutoSerialize):
         **kwargs
             Arguments of
             :func:`~quantem.diffraction.calibration.plot_bragg_rings`, e.g.
-            `n_rings` and `q_max`.
+            `n_rings`, `q_max` and `zone_axis`.
 
         Returns
         -------
@@ -975,6 +1022,9 @@ class CrystalMap(AutoSerialize):
                 for row in (corr, rel)
             ]
         kwargs.setdefault("cbar", True)
+        # panels shaped like the scan, so a wide map leaves no gap between rows
+        R, C = self.shape
+        kwargs.setdefault("axsize", (4.5, 4.5 * R / C))
         kwargs.setdefault(
             "title",
             [

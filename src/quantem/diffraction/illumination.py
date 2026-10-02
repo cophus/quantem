@@ -101,12 +101,70 @@ def excitation_coefficients(
     return c, a, b
 
 
+def relrod_factor(g_lab, n_lab, energy_ev: float, precession_deg: float = 0.0):
+    """How far along a relrod the Ewald sphere is, per unit excitation error.
+
+    A plate-shaped crystal spreads every reciprocal lattice point into a rod
+    along the plate normal n, a long one for a 2D material. The sphere meets
+    the rod through g at g + t n, with, to first order,
+
+        t = -f s_g,   f = (K - g_z) / (K n_z - n . g),
+
+    where s_g is the excitation error measured along the beam and
+    K = sqrt(k0^2 - r^2) as in :func:`excitation_coefficients`. For n along
+    the beam f = 1. A rod nearly tangent to the sphere (an edge-on plate) is
+    never excited; f is set huge there so the reflection drops out.
+
+    Parameters
+    ----------
+    g_lab : torch.Tensor | np.ndarray
+        Lab-frame reciprocal vectors (..., 3).
+    n_lab : torch.Tensor | np.ndarray
+        Lab-frame unit plate normal, broadcastable to `g_lab`.
+
+    Returns
+    -------
+    torch.Tensor | np.ndarray
+        f (...,), the same type as `g_lab`.
+    """
+    k0 = 1.0 / electron_wavelength_angstrom(energy_ev)
+    r = k0 * np.sin(np.deg2rad(precession_deg))
+    K = float(np.sqrt(k0**2 - r**2))
+    if isinstance(g_lab, torch.Tensor):
+        n = torch.as_tensor(n_lab, dtype=g_lab.dtype, device=g_lab.device)
+        den_n = K * n[..., 2] - (g_lab * n).sum(-1)
+        tangent = den_n.abs() < 0.05 * K
+        f = (K - g_lab[..., 2]) / torch.where(tangent, torch.ones_like(den_n), den_n)
+        return torch.where(tangent, torch.full_like(f, 1e6), f)
+    g = np.asarray(g_lab, dtype=float)
+    n = np.asarray(n_lab, dtype=float)
+    den_n = K * n[..., 2] - (g * n).sum(-1)
+    tangent = np.abs(den_n) < 0.05 * K
+    f = (K - g[..., 2]) / np.where(tangent, 1.0, den_n)
+    return np.where(tangent, 1e6, f)
+
+
 def averaged_gaussian_intensity_envelope(
-    g_lab, energy_ev: float, sigma: float, precession_deg: float = 0.0, semiconv_mrad: float = 0.0
+    g_lab,
+    energy_ev: float,
+    sigma: float,
+    precession_deg: float = 0.0,
+    semiconv_mrad: float = 0.0,
+    foil_normal_lab=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Envelope, central excitation error and support half-width of every
-    reflection under the illumination: returns (envelope, c, a, b)."""
+    reflection under the illumination: returns (envelope, c, a, b).
+
+    With `foil_normal_lab` (a lab-frame unit plate normal) the excitation is
+    measured along the relrod instead of along the beam: c, a and b are the
+    distances along the rod (see :func:`relrod_factor`)."""
     c, a, b = excitation_coefficients(g_lab, energy_ev, precession_deg, semiconv_mrad)
+    if foil_normal_lab is not None:
+        g_np = g_lab.detach().cpu().numpy() if isinstance(g_lab, torch.Tensor) else g_lab
+        f = relrod_factor(
+            np.asarray(g_np, dtype=float), foil_normal_lab, energy_ev, precession_deg
+        )
+        c, a, b = c * f, a * np.abs(f), b * np.abs(f)
     if precession_deg <= 0 and semiconv_mrad <= 0:
         return np.exp(-0.5 * (c / sigma) ** 2), c, a, b
     # A reflection farther from the Ewald sphere than the illumination sweeps
@@ -227,7 +285,7 @@ def gaussian_envelope_ring_torch(c: torch.Tensor, a: torch.Tensor, sigma: float)
     after the I_4 term, with I_n(u) from the I_0 / I_1 recurrences (and
     their small-argument series where the recurrence would cancel). Below
     v = a^2 / 4 sigma^2 = 0.3 the truncation error is under 1e-5; larger
-    sweeps fall back to the reference series."""
+    sweeps are averaged over the ring directly by quadrature."""
     c = c.to(torch.float64)
     a = torch.as_tensor(a, dtype=torch.float64)
     u = c * a / sigma**2
@@ -252,8 +310,14 @@ def gaussian_envelope_ring_torch(c: torch.Tensor, a: torch.Tensor, sigma: float)
     big = torch.broadcast_to(v > 0.3, out.shape)
     if bool(big.any()):
         out = out.clone()
-        c_b = torch.broadcast_to(c, out.shape)
-        a_b = torch.broadcast_to(a, out.shape)
-        ref = gaussian_envelope_ring_series(c_b[big], a_b[big], sigma)
-        out[big] = ref.to(out.dtype)
+        c_b = torch.broadcast_to(c, out.shape)[big]
+        a_b = torch.broadcast_to(a, out.shape)[big]
+        # the ring average itself, (1/pi) int_0^pi exp(-(c - a cos phi)^2 /
+        # 2 sigma^2) dphi, by the midpoint rule: exact to rounding for this
+        # periodic integrand once the nodes resolve a / sigma, and it stays
+        # in torch on the input's device
+        n = int(min(256, max(16, np.ceil(8 + 4 * float(a_b.max()) / sigma))))
+        phi = (torch.arange(n, dtype=torch.float64, device=c_b.device) + 0.5) * (np.pi / n)
+        d = c_b[:, None] - a_b[:, None] * torch.cos(phi)
+        out[big] = torch.exp(-0.5 * (d / sigma) ** 2).mean(dim=-1).to(out.dtype)
     return out.clamp(0.0, 1.0)
