@@ -182,9 +182,9 @@ def cluster_vector(
         Copy of `vector` with the integer labels appended as a new field
         (-1 = noise).
     labels : np.ndarray
-        The flat label array, aligned with vector.flatten().
+        The flat label array, aligned with vector.numpy().astype(np.float64).
     """
-    flat = vector.select_fields(*fields).flatten().astype(float)
+    flat = vector.select_fields(*fields).numpy().astype(float)
     if field_scales is not None:
         flat = flat * np.asarray(field_scales, dtype=float)[None, :]
     dims = [flat]
@@ -201,7 +201,7 @@ def cluster_vector(
 
     labeled = vector.copy()
     labeled.add_fields([label_field], units=["index"])
-    full = labeled.flatten()
+    full = labeled.numpy().astype(np.float64)
     full[:, -1] = labels
     labeled.set_flattened(full)
     return labeled, labels
@@ -214,7 +214,7 @@ def filter_rows(vector, mask):
     """
     mask = np.asarray(mask, dtype=bool)
     counts = np.asarray(vector.row_counts(), dtype=int)
-    flat = vector.flatten()
+    flat = vector.numpy().astype(np.float64)
     starts = np.concatenate([[0], np.cumsum(counts)])
     shape = vector.shape[:2]
     nested = []
@@ -229,7 +229,7 @@ def filter_rows(vector, mask):
 
     out = Vector.from_data(
         nested, fields=list(vector.fields), units=list(vector.units),
-        name=vector.name,
+        name=vector.name, dtype=vector.dtype,
     )
     out.metadata.update(vector.metadata)
     return out

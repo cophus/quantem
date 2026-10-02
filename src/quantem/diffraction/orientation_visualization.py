@@ -627,7 +627,10 @@ def plot_pattern_matches(
         if not 0.0 < q_max_quantile <= 1.0:
             raise ValueError(f"q_max_quantile must be in (0, 1], got {q_max_quantile}")
         q_all = [
-            np.hypot(peaks[rx, ry].array[:, ix[0]], peaks[rx, ry].array[:, ix[1]])
+            np.hypot(
+                peaks[rx, ry].numpy().astype(np.float64)[:, ix[0]],
+                peaks[rx, ry].numpy().astype(np.float64)[:, ix[1]],
+            )
             for rx, ry in positions
         ]
         # the direct beam is at zero and every position has one, so it is
@@ -642,7 +645,7 @@ def plot_pattern_matches(
         # dense pattern does not turn into overlapping blobs
         spacings = []
         for rx, ry in positions:
-            xy = peaks[rx, ry].array[:, [ix[0], ix[1]]]
+            xy = peaks[rx, ry].numpy().astype(np.float64)[:, [ix[0], ix[1]]]
             xy = xy[(np.abs(xy) <= q_lim).all(axis=1)]
             if xy.shape[0] > 2:
                 d = np.hypot(xy[:, None, 0] - xy[None, :, 0], xy[:, None, 1] - xy[None, :, 1])
@@ -655,7 +658,7 @@ def plot_pattern_matches(
             measured_scale = 1.5 * marker_scale
 
     for pi, (rx, ry) in enumerate(positions):
-        data = peaks[rx, ry].array.copy()
+        data = peaks[rx, ry].numpy().astype(np.float64)
         rc = data[:, [ix[0], ix[1]]] @ rot_back.T
         data[:, ix[0]] = rc[:, 0]
         data[:, ix[1]] = rc[:, 1]

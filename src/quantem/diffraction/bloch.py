@@ -392,7 +392,7 @@ def refine_thickness(
     if progress_bar:
         iterator = tqdm(iterator, desc="dynamical refinement")
     for rx, ry in iterator:
-        data = peaks[rx, ry].array
+        data = peaks[rx, ry].numpy().astype(np.float64)
         if data.shape[0] < min_number_peaks:
             continue
         qxy = torch.as_tensor(data[:, ix[:2]], dtype=torch.float64)
@@ -2591,7 +2591,7 @@ def refine_dynamical(
             cost0_out[rx, ry, f] = sol["cost0"]
 
     def peaks_at(rx, ry):
-        data = peaks[rx, ry].array
+        data = peaks[rx, ry].numpy().astype(np.float64)
         if data.shape[0] < min_number_peaks:
             return None
         qxy = torch.as_tensor(data[:, ix[:2]], dtype=torch.float64)

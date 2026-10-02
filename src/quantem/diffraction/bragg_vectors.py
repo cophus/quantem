@@ -498,19 +498,22 @@ class BraggVectors(AutoSerialize):
                 raise ValueError("positions must contain at least one (row, col) to test on.")
             coords = [(int(r), int(c)) for r, c in positions]
             results = self._detect_positions(coords, detect_kwargs, batch_size, progressbar=False)
-            return Vector.from_data(results, fields=PEAK_FIELDS, name="bragg_peaks_test")
+            return Vector.from_data(
+                results, fields=PEAK_FIELDS, name="bragg_peaks_test", dtype=torch.float64
+            )
 
         scan_r, scan_c = int(self.dataset.shape[0]), int(self.dataset.shape[1])
         coords = list(np.ndindex(scan_r, scan_c))
         results = self._detect_positions(
             coords, detect_kwargs, batch_size, progressbar=progressbar
         )
-        # Store every cell in a single bulk pass. Per-cell assignment
-        # (peaks[r, c] = arr) re-concatenates the entire backing buffer on every
-        # write -- O(N^2) over the scan, which is the stall at the end of
-        # detection. from_data stacks all cells with one _replace_cells call.
+        # Store every cell in one pass. Per-cell assignment (peaks[r, c] = arr)
+        # appends to the backing buffer on every write, while from_data joins all
+        # cells with a single concatenation.
         nested = [results[r * scan_c : (r + 1) * scan_c] for r in range(scan_r)]
-        peaks = Vector.from_data(nested, fields=PEAK_FIELDS, name="bragg_peaks")
+        peaks = Vector.from_data(
+            nested, fields=PEAK_FIELDS, name="bragg_peaks", dtype=torch.float64
+        )
         peaks.metadata.update(self._scan_calibration())
 
         self.peaks = peaks
@@ -578,7 +581,7 @@ class BraggVectors(AutoSerialize):
         peaks = bv.peaks
         # rowwise transform on the flat peak table: one shift per scan cell,
         # repeated per detected peak (cells and shifts share raster order)
-        flat = peaks.flatten()
+        flat = peaks.numpy().astype(np.float64)
         counts = np.asarray(peaks.row_counts(), dtype=int)
         shifts = np.repeat(origin_ref[None, :] - origins.reshape(-1, 2), counts, axis=0)
         flat[:, :2] += shifts
@@ -610,7 +613,7 @@ class BraggVectors(AutoSerialize):
         if self.peaks is None:
             raise ValueError("Run detect_disks() before compute_bvm().")
         H, W = (int(self.dataset.shape[-2]), int(self.dataset.shape[-1]))
-        flat = self.peaks.select_fields("q_row", "q_col", "intensity").flatten()
+        flat = self.peaks.select_fields("q_row", "q_col", "intensity").numpy().astype(np.float64)
 
         bvm = np.zeros((H, W), dtype=float)
         if flat.shape[0] > 0:
@@ -952,7 +955,7 @@ class BraggVectors(AutoSerialize):
                 pass
 
         for r, c in coords:
-            cell = self.peaks[r, c].array
+            cell = self.peaks[r, c].numpy().astype(np.float64)
             if cell.shape[0] == 0:
                 continue
             qpos = cell[:, [i_qr, i_qc]]
@@ -1320,7 +1323,7 @@ class BraggVectors(AutoSerialize):
             image_title = getattr(image, "name", None) or "virtual image"
             image_arr = np.asarray(image.array if hasattr(image, "array") else image)
         dps = [np.asarray(self.dataset.array[r, c], dtype=float) for r, c in positions]
-        peaks = [sub[i].array for i in range(len(positions))]
+        peaks = [sub[i].numpy().astype(np.float64) for i in range(len(positions))]
         fig, ax = plot_detection(
             image_arr,
             dps,

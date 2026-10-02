@@ -443,7 +443,7 @@ def test_refine_dynamical_recovery():
         progress_bar=False,
     )
     # positions with too few beams cannot constrain a 2x2 deformation
-    valid = np.array([peaks[0, i].array.shape[0] >= 6 for i in range(N)])
+    valid = np.array([peaks[0, i].numpy().shape[0] >= 6 for i in range(N)])
     assert valid.sum() >= 4
     err = misorientation_angle_deg(q_expect, om.quats[0, :, 0], xtl.sym_quats).numpy()[valid]
     t_err = np.abs(res["thickness"][0].numpy() - t_true.numpy())[valid]
@@ -534,7 +534,7 @@ def test_image_refinement_round_trip():
         k_max=1.0,
         progress_bar=False,
     )
-    valid = [i for i in range(N) if peaks[0, i].array.shape[0] >= 6]
+    valid = [i for i in range(N) if peaks[0, i].numpy().shape[0] >= 6]
     assert len(valid) >= 2
     shape_fit = bloch.fit_disk_shape(
         dataset,
@@ -707,7 +707,7 @@ def test_refine_dynamical_reported_cost_reproducible():
         progress_bar=False,
     )
     for i in range(3):
-        if not torch.isfinite(res["cost"][0, i, 0]) or peaks[0, i].array.shape[0] < 5:
+        if not torch.isfinite(res["cost"][0, i, 0]) or peaks[0, i].numpy().shape[0] < 5:
             continue
         q = res["quats"][0, i, 0]
         d3 = torch.eye(3, dtype=torch.float64)
@@ -727,7 +727,7 @@ def test_refine_dynamical_reported_cost_reproducible():
             deform=d3,
             beams=beams,
         )
-        data = peaks[0, i].array
+        data = peaks[0, i].numpy().astype(np.float64)
         qxy = torch.as_tensor(data[:, :2])
         im = torch.as_tensor(data[:, 2]).clamp_min(0) ** 0.25
         cost, _, _, _ = bloch._dynamical_cost(inten[:, :, 1:], g_xy[1:], qxy, im, 0.05, 0.25, 0.02)
@@ -840,7 +840,7 @@ def test_refine_dynamical_with_precession_and_convergence():
         progress_bar=False,
     )
     assert res["metadata"]["precession_deg"] == 0.4 and res["metadata"]["semiconv_mrad"] == 1.5
-    valid = np.array([peaks[0, i].array.shape[0] >= 6 for i in range(N)])
+    valid = np.array([peaks[0, i].numpy().shape[0] >= 6 for i in range(N)])
     assert valid.sum() >= 2
     err = misorientation_angle_deg(q_true, om.quats[0, :, 0], xtl.sym_quats).numpy()[valid]
     t_err = np.abs(res["thickness"][0].numpy() - t_true.numpy())[valid]

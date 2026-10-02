@@ -517,7 +517,7 @@ class OrientationMap(AutoSerialize):
         # the square aperture in the calibrated (qx, qy) frame.
         rot_deg = float(self.peaks.metadata.get("rotation_ccw_deg", 0.0) or 0.0)
         if isinstance(detector_q_max, str) and detector_q_max == "auto":
-            flat = self.peaks.select_fields("qx", "qy", "intensity").flatten()
+            flat = self.peaks.select_fields("qx", "qy", "intensity").numpy().astype(np.float64)
             if flat.shape[0] == 0:
                 detector_q_max = None
             else:
@@ -957,7 +957,8 @@ class OrientationMap(AutoSerialize):
         valid_rc = [
             (rx, ry)
             for rx, ry in np.ndindex(R, C)
-            if wanted[rx, ry] and peaks[rx, ry].array.shape[0] >= min_number_peaks
+            if wanted[rx, ry]
+            and peaks[rx, ry].numpy().astype(np.float64).shape[0] >= min_number_peaks
         ]
         if not valid_rc:
             raise RuntimeError(
@@ -975,7 +976,9 @@ class OrientationMap(AutoSerialize):
         gamma_grid = self.gamma
         for batch in batches:
             im_stack = (
-                self._polar_images([peaks[rx, ry].array for rx, ry in batch], ix)
+                self._polar_images(
+                    [peaks[rx, ry].numpy().astype(np.float64) for rx, ry in batch], ix
+                )
                 .to(dtype)
                 .to(device)
             )
@@ -1603,7 +1606,7 @@ class OrientationMap(AutoSerialize):
             return q, score
 
         def get_exp(rx, ry):
-            data = peaks[rx, ry].array
+            data = peaks[rx, ry].numpy().astype(np.float64)
             if data.shape[0] < min_pairs:
                 return None, None
             q_exp = torch.as_tensor(data[:, ix[:2]], dtype=torch.float64)
@@ -1673,7 +1676,7 @@ class OrientationMap(AutoSerialize):
         for rx, ry in act_list:
             if bar is not None:
                 bar.update(1)
-            data = peaks[rx, ry].array
+            data = peaks[rx, ry].numpy().astype(np.float64)
             meas = self._measured_term(data, ix)
             for m in range(M):
                 if self.corr[rx, ry, m] <= 0:
@@ -1747,7 +1750,7 @@ class OrientationMap(AutoSerialize):
                     q_exp, w_exp = get_exp(rx, ry)
                     if q_exp is None:
                         continue
-                    data = peaks[rx, ry].array
+                    data = peaks[rx, ry].numpy().astype(np.float64)
                     cur_q = self.quats[rx, ry, 0].clone()
                     cur_s = float(cscore[rx, ry])
                     cands = [cur_q]
@@ -1948,7 +1951,7 @@ class OrientationMap(AutoSerialize):
             )
 
         # flatten measured peaks once, padded per position
-        cells = [peaks[r, c].array for r, c in np.ndindex(R, C)]
+        cells = [peaks[r, c].numpy().astype(np.float64) for r, c in np.ndindex(R, C)]
         counts = np.array([c.shape[0] for c in cells])
         Pmax = max(1, counts.max())
         N = R * C
@@ -2154,7 +2157,7 @@ class OrientationMap(AutoSerialize):
         )
         cells = []
         for rx, ry in np.ndindex(R, C):
-            data = peaks[rx, ry].array
+            data = peaks[rx, ry].numpy().astype(np.float64)
             if data.shape[0] < min_number_peaks or other.corr[rx, ry, 0] <= min_corr_other:
                 cells.append(np.zeros((0, 3)))
                 continue
@@ -2173,6 +2176,7 @@ class OrientationMap(AutoSerialize):
             fields=["qx", "qy", "intensity"],
             units=["A^-1", "A^-1", "counts"],
             name="residual_peaks",
+            dtype=peaks.dtype,
         )
 
         om_res = OrientationMap.from_vectors(residual, self.crystal, self.energy_ev)
@@ -2353,7 +2357,7 @@ class OrientationMap(AutoSerialize):
                 continue
             if self.corr[rx, ry, match] <= 0:
                 continue
-            data = peaks[rx, ry].array
+            data = peaks[rx, ry].numpy().astype(np.float64)
             if data.shape[0] < min_pairs:
                 continue
             q_exp = torch.as_tensor(data[:, ix[:2]], dtype=torch.float64)

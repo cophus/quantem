@@ -265,7 +265,7 @@ class PhaseMap(AutoSerialize):
         if progress_bar:
             iterator = tqdm(iterator, desc="phase mapping")
         for rx, ry in iterator:
-            data = peaks[rx, ry].array
+            data = peaks[rx, ry].numpy().astype(np.float64)
             if data.shape[0] < min_number_peaks:
                 continue
             # null hypothesis: no diffracted signal, so no phase to decide.

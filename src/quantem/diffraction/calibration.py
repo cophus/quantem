@@ -26,7 +26,7 @@ def _measure_raw_origins(bragg_vectors, search_radius: float, center=None) -> np
     meas = np.full((scan_r, scan_c, 2), np.nan)
     for r in range(scan_r):
         for c in range(scan_c):
-            arr = peaks[r, c].array
+            arr = peaks[r, c].numpy().astype(np.float64)
             if arr.shape[0] == 0:
                 continue
             d = np.hypot(arr[:, 0] - c0[0], arr[:, 1] - c0[1])
@@ -218,7 +218,7 @@ def peaks_to_calibrated(
         Fields (qx, qy, intensity) in 1/Angstroms.
     """
     scan_r, scan_c = peaks_px.shape[0], peaks_px.shape[1]
-    flat = peaks_px.select_fields("q_row", "q_col", "intensity").flatten()
+    flat = peaks_px.select_fields("q_row", "q_col", "intensity").numpy().astype(np.float64)
     row_counts = np.asarray(peaks_px.row_counts(), dtype=int)
     qrc = flat[:, :2] * pixel_size_inv_A
     if ellipse is not None:
@@ -237,6 +237,7 @@ def peaks_to_calibrated(
         fields=["qx", "qy", "intensity"],
         units=["A^-1", "A^-1", "counts"],
         name=name,
+        dtype=peaks_px.dtype,
     )
     # carry the scan calibration through, so maps keep their scale bar, and
     # record the detector-to-scan rotation so pattern-overlay plots can put
@@ -251,7 +252,7 @@ def peaks_to_calibrated(
 def scale_peaks(peaks, scale: float):
     """Return a copy of a (qx, qy, intensity) Vector with q scaled."""
     out = peaks.copy()
-    flat = out.flatten()
+    flat = out.numpy().astype(np.float64)
     flat[:, :2] *= scale
     out.set_flattened(flat)
     return out
@@ -274,7 +275,7 @@ def radial_histogram(
     hist : np.ndarray
         Weighted counts, with linear interpolation between adjacent bins.
     """
-    flat = peaks.select_fields("qx", "qy", "intensity").flatten()
+    flat = peaks.select_fields("qx", "qy", "intensity").numpy().astype(np.float64)
     qr = np.hypot(flat[:, 0], flat[:, 1])
     weight = flat[:, 2] ** bragg_intensity_power * qr**bragg_k_power
 
@@ -636,7 +637,7 @@ def calibrate_ellipse(
     """
     from scipy.optimize import minimize
 
-    flat = peaks.select_fields("qx", "qy", "intensity").flatten()
+    flat = peaks.select_fields("qx", "qy", "intensity").numpy().astype(np.float64)
     q = flat[:, :2]
     log_lo, log_hi = np.log(k_min), np.log(k_max)
     bin_w = (log_hi - log_lo) / n_bins
@@ -694,7 +695,7 @@ def calibrate_ellipse(
 def apply_ellipse(peaks, ellipse):
     """Return a copy of (qx, qy, intensity) peaks with the ellipse applied."""
     out = peaks.copy()
-    flat = out.flatten()
+    flat = out.numpy().astype(np.float64)
     e11, e12 = float(ellipse[0]), float(ellipse[1])
     A = np.array([[1 + e11, e12], [e12, 1 - e11]])
     flat[:, :2] = flat[:, :2] @ A.T
@@ -841,7 +842,7 @@ def _ring_profile_scores(
     truth. Dividing by the total weight, counted once and independent of the
     scale, makes a lost peak a loss.
     """
-    flat = peaks.select_fields("qx", "qy", "intensity").flatten()
+    flat = peaks.select_fields("qx", "qy", "intensity").numpy().astype(np.float64)
     qr = np.hypot(flat[:, 0], flat[:, 1])
     weight = flat[:, 2] * qr**bragg_k_power
     k_step = 0.002
@@ -1119,7 +1120,7 @@ def _calibration_panels(
     ax_hist.set_xlabel("")
     # azimuth against scattering vector: a pixel size error shifts every
     # ring, the elliptic distortion is a cos(2 phi) wobble of each one
-    flat = peaks.select_fields("qx", "qy", "intensity").flatten()
+    flat = peaks.select_fields("qx", "qy", "intensity").numpy().astype(np.float64)
     r = np.hypot(flat[:, 0], flat[:, 1])
     phi = np.degrees(np.arctan2(flat[:, 1], flat[:, 0]))
     sel = (r > k_min) & (r < k_max)
@@ -1347,7 +1348,7 @@ def plot_ring_comparison(
 def transform_peaks(peaks, M: np.ndarray):
     """Return a copy of a (qx, qy, intensity) Vector with q mapped by M (2x2)."""
     out = peaks.copy()
-    flat = out.flatten()
+    flat = out.numpy().astype(np.float64)
     flat[:, :2] = flat[:, :2] @ np.asarray(M, dtype=float).T
     out.set_flattened(flat)
     return out
@@ -1450,7 +1451,7 @@ def plot_bragg_rings(
     import matplotlib.pyplot as plt
 
     xtls = crystals if isinstance(crystals, (list, tuple)) else [crystals]
-    flat = peaks.select_fields("qx", "qy", "intensity").flatten()
+    flat = peaks.select_fields("qx", "qy", "intensity").numpy().astype(np.float64)
     if q_max is None:
         q_max = float(np.hypot(flat[:, 0], flat[:, 1]).max()) * 1.02
     H, xe, ye = np.histogram2d(

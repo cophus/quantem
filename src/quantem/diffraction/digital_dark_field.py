@@ -53,7 +53,7 @@ def cluster_coms(
         (K,) number of peaks per cluster.
     """
     fields = labeled.fields
-    flat = labeled.flatten()
+    flat = labeled.numpy().astype(np.float64)
     labels = flat[:, fields.index(label_field)].astype(int)
     w = flat[:, fields.index(intensity_field)].clip(min=0) if weighted else None
     rc = _scan_cells(labeled).astype(float)
@@ -87,7 +87,7 @@ def ddf_images(
         (len(cluster_ids), scan_row, scan_col) images.
     """
     fields = labeled.fields
-    flat = labeled.flatten()
+    flat = labeled.numpy().astype(np.float64)
     labels = flat[:, fields.index(label_field)].astype(int)
     inten = flat[:, fields.index(intensity_field)].clip(min=0)
     rc = _scan_cells(labeled)
@@ -172,7 +172,7 @@ def plot_cluster_scatter(
     import matplotlib.pyplot as plt
 
     fields = labeled.fields
-    flat = labeled.flatten()
+    flat = labeled.numpy().astype(np.float64)
     labels = flat[:, fields.index(label_field)].astype(int)
     qx = flat[:, fields.index(q_fields[0])]
     qy = flat[:, fields.index(q_fields[1])]

@@ -49,7 +49,7 @@ def test_cluster_vector_and_filter():
     )
     assert "cluster" in labeled.fields
     assert labels.max() == 0  # exactly one cluster found
-    got = labeled[1, 2].array
+    got = labeled[1, 2].numpy()
     assert (got[:, -1] == 0).sum() >= 28
 
     kept = filter_rows(vec, labels == 0)
