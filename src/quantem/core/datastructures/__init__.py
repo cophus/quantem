@@ -6,3 +6,4 @@ from quantem.core.datastructures.polar4dstem import Polar4dstem as Polar4dstem
 from quantem.core.datastructures.dataset4d import Dataset4d as Dataset4d
 from quantem.core.datastructures.dataset3d import Dataset3d as Dataset3d
 from quantem.core.datastructures.dataset2d import Dataset2d as Dataset2d
+from quantem.core.datastructures.dataset1d import Dataset1d as Dataset1d

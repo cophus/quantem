@@ -10,6 +10,20 @@ from quantem.core.datastructures import Dataset as Dataset
 from quantem.core.datastructures import Dataset2d as Dataset2d
 from quantem.core.datastructures import Dataset3d as Dataset3d
 from quantem.core.datastructures import Dataset4dstem as Dataset4dstem
+from quantem.spectroscopy import (
+    Dataset3deels as Dataset3deels,
+)
+from quantem.spectroscopy import Dataset3dspectroscopy as Dataset3dspectroscopy
+from quantem.spectroscopy import (
+    Dataset3dxeds as Dataset3dxeds,
+)
+
+
+def _print_available_datasets(data_list):
+    print("Available datasets:")
+    for index, entry in enumerate(data_list):
+        array = entry["data"]
+        print(f"  Dataset {index}: shape {array.shape}, ndim={array.ndim}")
 
 
 def read_4dstem(
@@ -17,6 +31,9 @@ def read_4dstem(
     file_type: str | None = None,
     dataset_index: int | None = None,
     hot_pixel_filter: bool = False,
+    scan_length: int | None = None,
+    scan_axis: int = 0,
+    transpose_scan_axes: bool = False,
     **kwargs,
 ) -> Dataset4dstem:
     """
@@ -32,10 +49,13 @@ def read_4dstem(
     dataset_index : int, optional
         Index of the dataset to load if file contains multiple datasets.
         If None, automatically selects the first 4D dataset found.
-<<<<<<< HEAD
-<<<<<<< HEAD
         If no 4D dataset is found but a 3D stack exists, a 3D dataset can be
         interpreted as 4D if `scan_length` is provided.
+    hot_pixel_filter : bool, default False
+        If True, detect and replace hot detector pixels immediately after
+        loading using `quantem.core.utils.filter.filter_hot_pixels` with its
+        default parameters. For custom thresholds, call `filter_hot_pixels`
+        directly on the array.
     scan_length : int, optional
         For 3D datasets shaped (n_frames, ny, nx) (after possibly moving the
         scan axis to the front), interpret the data as a raster scan with shape
@@ -50,17 +70,6 @@ def read_4dstem(
         If True, transpose the scan axes after reshaping so that
         (scan_y, scan_x) -> (scan_x, scan_y). This effectively swaps the
         interpretation of scan rows and columns in the final 4D array.
-
-    **kwargs : dict
-        Additional keyword arguments to pass to the Dataset4dstem constructor.
-=======
-=======
-    hot_pixel_filter: bool, optional
-        If True, detect and replace hot detector pixels immediately after
-        loading using `quantem.core.utils.filter.filter_hot_pixels` with its
-        default parameters. For custom thresholds, call `filter_hot_pixels`
-        directly on the array.
->>>>>>> dev
     **kwargs: dict
         Additional keyword arguments to pass to the file reader.
 
@@ -76,7 +85,6 @@ def read_4dstem(
         Units for each dimension. If None, defaults to ["pixels"] * 4
     signal_units : str, optional
         Units for the array values, by default "arb. units"
->>>>>>> upstream/fitting_models_clean
 
     Returns
     -------
@@ -114,8 +122,7 @@ def read_4dstem(
         data = imported_data["data"]
         if data.ndim != 3:
             raise ValueError(
-                f"Expected 3D data to reshape, got ndim={data.ndim} "
-                f"with shape {data.shape}"
+                f"Expected 3D data to reshape, got ndim={data.ndim} with shape {data.shape}"
             )
 
         if scan_axis_local not in (0, 1):
@@ -147,8 +154,7 @@ def read_4dstem(
         old_axes = imported_data.get("axes", None)
         if old_axes is None or len(old_axes) != 3:
             raise ValueError(
-                "Expected 3 axes for 3D data when reshaping to 4D; "
-                f"got axes={old_axes}"
+                f"Expected 3 axes for 3D data when reshaping to 4D; got axes={old_axes}"
             )
 
         ax_scan_y = {
@@ -234,6 +240,7 @@ def read_4dstem(
     else:
         # Case 2: auto-select dataset
         four_d_datasets = [(i, d) for i, d in enumerate(data_list) if d["data"].ndim == 4]
+        _print_available_datasets(data_list)
 
         if four_d_datasets:
             dataset_index, imported_data = four_d_datasets[0]
@@ -246,15 +253,11 @@ def read_4dstem(
             three_d_datasets = [(i, d) for i, d in enumerate(data_list) if d["data"].ndim == 3]
 
             if not three_d_datasets:
-                print(f"No 4D datasets found in {file_path}. Available datasets:")
-                for i, d in enumerate(data_list):
-                    print(f"  Dataset {i}: shape {d['data'].shape}, ndim={d['data'].ndim}")
+                print(f"No 4D datasets found in {file_path}.")
                 raise ValueError("No 4D or 3D dataset found in file")
 
             if scan_length is None:
-                print(f"No 4D datasets found in {file_path}. Available datasets:")
-                for i, d in enumerate(data_list):
-                    print(f"  Dataset {i}: shape {d['data'].shape}, ndim={d['data'].ndim}")
+                print(f"No 4D datasets found in {file_path}.")
                 raise ValueError(
                     "File contains only 3D datasets. To interpret one as 4D-STEM, "
                     "please specify scan_length so that n_frames % scan_length == 0."
@@ -325,6 +328,94 @@ def read_4dstem(
         origin=origin,
         units=units,
         name=name_override,
+    )
+
+    return dataset
+
+
+def read_3d_spectroscopy(
+    file_path: str, file_type: str, data_type: str, dataset_index: int | None = None
+) -> Dataset3dspectroscopy:
+    """
+    File reader for 3D spectroscopy data
+
+    Parameters
+    ----------
+    file_path: str
+        Path to data
+    file_type: str
+        The type of file reader needed. See rosettasciio for supported formats
+        https://hyperspy.org/rosettasciio/supported_formats/index.html
+    data_type: str
+        type of spectroscopy data 'EELS' or 'XEDS'
+    Returns
+    --------
+    Dataset3dspectroscopy
+    """
+    data_type_normalized = str(data_type).upper()
+
+    file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader  # type: ignore
+    data_list = file_reader(file_path)
+
+    # If specific index provided, use it
+    if dataset_index is not None:
+        imported_data = data_list[dataset_index]
+        if imported_data["data"].ndim != 3:
+            raise ValueError(
+                f"Dataset at index {dataset_index} has {imported_data['data'].ndim} dimensions, "
+                f"expected 3D. Shape: {imported_data['data'].shape}"
+            )
+    else:
+        # Automatically find first 3D dataset
+        three_d_datasets = [(i, d) for i, d in enumerate(data_list) if d["data"].ndim == 3]
+        _print_available_datasets(data_list)
+
+        if len(three_d_datasets) == 0:
+            print(f"No 3D datasets found in {file_path}.")
+            raise ValueError("No 3D dataset found in file")
+
+        dataset_index, imported_data = three_d_datasets[0]
+
+        dataset_indices = [entry[0] for entry in three_d_datasets]
+        print(
+            f"Using first 3D dataset at index {dataset_index} with shape {imported_data['data'].shape}. "
+            f"3D dataset indices: {', '.join(map(str, dataset_indices))}"
+        )
+
+    imported_axes = imported_data["axes"]
+    # axis_order = (0, 1, 2) if file_type == "digitalmicrograph" else (2, 0, 1)
+    axis_order = (1, 2, 0) if file_type == "digitalmicrograph" else (0, 1, 2)
+    array = (
+        imported_data["data"].transpose(axis_order)
+        if file_type == "digitalmicrograph"
+        else imported_data["data"]
+    )
+    ordered_axes = [imported_axes[idx] for idx in axis_order]
+    sampling = [ax.get("scale", 1) for ax in ordered_axes]
+    origin = [ax.get("offset", 0) for ax in ordered_axes]
+    units = [
+        "pixels" if ax.get("units", "1") == "1" else ax.get("units", "pixels")
+        for ax in ordered_axes
+    ]
+
+    for i, unit in enumerate(units):
+        if unit == "eV" and data_type_normalized == "XEDS":
+            sampling[i] = sampling[i] / 1000
+            origin[i] = origin[i] / 1000
+            units[i] = "keV"
+
+    if data_type_normalized == "EELS":
+        dataset_cls = Dataset3deels
+    elif data_type_normalized == "XEDS":
+        dataset_cls = Dataset3dxeds
+    else:
+        raise ValueError(f"`data_type` must be `XEDS` or `EELS` not `{data_type}`")
+
+    dataset = dataset_cls.from_array(
+        array=array,
+        sampling=sampling,
+        origin=origin,
+        units=units,
     )
 
     return dataset
