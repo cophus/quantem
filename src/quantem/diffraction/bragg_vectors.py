@@ -1500,7 +1500,9 @@ class BraggVectors(AutoSerialize):
         rotation_ccw_deg : float, default=0.0
             Diffraction-to-scan rotation, recorded for later use.
         plot : bool, default=True
-            Show the ring comparison before and after.
+            Show the ring comparison before and after, for the first
+            reference crystal. :meth:`CrystalMap.plot_calibration` checks
+            every candidate phase afterwards.
         **kwargs
             Further arguments of
             :func:`~quantem.diffraction.calibration.calibrate`, e.g.

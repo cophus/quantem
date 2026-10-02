@@ -188,7 +188,9 @@ def test_dynamical_update_is_local_and_examples_are_spread():
     picks = cm.example_positions(phase="Ti beta", num=3, min_distance=3)
     assert all(cm.phase_index[p] == 1 for p in picks)
     assert all(
-        (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 >= 9 for i, a in enumerate(picks) for b in picks[:i]
+        (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 >= 9
+        for i, a in enumerate(picks)
+        for b in picks[:i]
     )
 
 
@@ -214,3 +216,32 @@ def test_loaded_crystal_map_shares_orientation_maps(tmp_path):
     # what the crystal map shows
     assert cm2.phases.orientation_maps[0] is cm2.orientation_maps[0]
     assert cm2.phases.orientation_maps[0].crystal is cm2[0].crystal
+
+
+def test_plot_calibration_shows_every_crystal():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from quantem.diffraction.crystal_map import CrystalMap
+
+    rng = np.random.default_rng(6)
+    ti_a = Crystal.from_ase(
+        bulk("Ti", "hcp", a=2.9505, c=4.6855), name="Ti alpha", verbose=False
+    ).calculate_structure_factors(k_max=1.5)
+    ti_b = Crystal.from_ase(
+        bulk("Ti", "bcc", a=3.26, cubic=True), name="Ti beta", verbose=False
+    ).calculate_structure_factors(k_max=1.5)
+    q = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    cells = [[_pattern(ti_a, q, rng) for _ in range(3)] for _ in range(2)]
+    peaks = Vector.from_data(cells, fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t")
+    cm = CrystalMap.from_vectors(peaks, [ti_a, ti_b], energy_ev=200e3)
+    fig, axs = cm.plot_calibration()
+    # one column per crystal, the histogram above the azimuth panel
+    assert axs.shape == (2, 2)
+    assert [ax.get_title() for ax in axs[0]] == ["Ti alpha", "Ti beta"]
+    assert all(len(ax.collections) > 0 for ax in axs[1])
+    matplotlib.pyplot.close(fig)
+    fig, ax = cm.plot_bragg_rings()
+    labels = [t.get_text() for t in ax.get_legend().get_texts()]
+    assert labels == ["Ti alpha rings", "Ti beta rings"]
+    matplotlib.pyplot.close(fig)

@@ -404,7 +404,7 @@ class CrystalMap(AutoSerialize):
         from quantem.diffraction import bloch
 
         pm = self._require_fit("refine_dynamical()")
-        k_max = float(kwargs.pop("k_max", None) or self.k_max)
+        k_max = float(kwargs.pop("k_max", None) or self._k_max_or_crystals())
         k_c = float(k_max_coupling if k_max_coupling is not None else 1.5 * k_max)
         energy_ev = self.orientation_maps[0].energy_ev
         for om in self.orientation_maps:
@@ -743,14 +743,15 @@ class CrystalMap(AutoSerialize):
 
         Returns
         -------
-        list of tuple
-            One ``(fig, ax)`` per crystal.
+        tuple or list of tuple
+            ``(fig, ax)`` when `phase` names one crystal, otherwise one
+            ``(fig, ax)`` per crystal.
         """
         out = []
         for i in self._phase_indices(phase):
             m = mask if mask is not None else self.mask(i, signal_range, shade_gamma)
             out.append(self.orientation_maps[i].plot_pole_figure(pole=pole, mask=m, **kwargs))
-        return out
+        return out[0] if phase is not None else out
 
     def plot_matches(self, positions, phase=None, **kwargs):
         """Matched patterns at a few probe positions, over the measured peaks.
@@ -846,6 +847,63 @@ class CrystalMap(AutoSerialize):
             k_min=k_min,
             k_max=k_max if k_max is not None else self._k_max_or_crystals(),
             **kwargs,
+        )
+
+    def plot_calibration(self, k_min: float = 0.05, k_max: float | None = None, **kwargs):
+        """Calibrated peaks against the rings of every crystal in the map.
+
+        One column per crystal: the radial histogram of every peak against
+        that crystal's rings, and every peak as azimuth against scattering
+        vector with the same rings. Run it after calibrating, whichever
+        phase the calibration was fit to: every candidate should line up,
+        and one that does not has the wrong lattice parameter for this
+        specimen, which matching cannot recover from.
+
+        Parameters
+        ----------
+        k_min : float, default=0.05
+            Smallest scattering vector shown, 1/Angstroms.
+        k_max : float, optional
+            Largest scattering vector shown; defaults to the map's own k_max.
+        **kwargs
+            Further arguments of
+            :func:`~quantem.diffraction.calibration.plot_calibration`, e.g.
+            `k_broadening` and `marker_size`.
+
+        Returns
+        -------
+        tuple
+            ``(fig, axs)``, axs of shape (2, number of crystals).
+        """
+        from quantem.diffraction import calibration
+
+        return calibration.plot_calibration(
+            self.peaks,
+            [om.crystal for om in self.orientation_maps],
+            k_min=k_min,
+            k_max=k_max if k_max is not None else self._k_max_or_crystals(),
+            **kwargs,
+        )
+
+    def plot_bragg_rings(self, **kwargs):
+        """Bragg vector map of every peak with the rings of every crystal.
+
+        Parameters
+        ----------
+        **kwargs
+            Arguments of
+            :func:`~quantem.diffraction.calibration.plot_bragg_rings`, e.g.
+            `n_rings` and `q_max`.
+
+        Returns
+        -------
+        tuple
+            ``(fig, ax)``.
+        """
+        from quantem.diffraction import calibration
+
+        return calibration.plot_bragg_rings(
+            self.peaks, [om.crystal for om in self.orientation_maps], **kwargs
         )
 
     def _k_max_or_crystals(self) -> float:

@@ -940,6 +940,13 @@ def calibrate(
     Returns
     -------
     DiffractionCalibration
+
+    Notes
+    -----
+    The figure shows the first reference crystal before and after the fit.
+    To check every candidate phase against the result, including phases the
+    calibration was not fit to, plot :func:`plot_calibration` on the
+    calibrated peaks, or :meth:`CrystalMap.plot_calibration`.
     """
     crystals = [crystal] if isinstance(crystal, Crystal) else list(crystal)
     for xtl in crystals:
@@ -1030,51 +1037,25 @@ def calibrate(
         sharex="col",
         gridspec_kw={"height_ratios": [1, 1.3]},
     )
-    rings_ref = _crystal_rings(crystals[0], max(k_min, 0.12), k_hi)
-
-    for col, (pk, ttl) in enumerate(
+    for col, (pk, ttl, kb) in enumerate(
         (
-            (peaks_0, f"before: {pixel_size_guess:.5f} " + r"$\mathrm{\AA}^{-1}$/px"),
-            (peaks, f"after: {pixel_size:.5f} " + r"$\mathrm{\AA}^{-1}$/px"),
+            (peaks_0, f"before: {pixel_size_guess:.5f} " + r"$\mathrm{\AA}^{-1}$/px", None),
+            (peaks, f"after: {pixel_size:.5f} " + r"$\mathrm{\AA}^{-1}$/px", k_broadening),
         )
     ):
-        plot_ring_comparison(
+        _calibration_panels(
+            axs[0, col],
+            axs[1, col],
             pk,
-            crystals,
+            crystals[0],
             k_min=k_min,
             k_max=k_hi,
-            k_broadening=None if col == 0 else k_broadening,
+            k_broadening=kb,
             bragg_k_power=bragg_k_power,
-            figax=(fig, [axs[0, col]]),
+            marker_size=marker_size,
         )
         axs[0, col].set_title(ttl, fontsize=10)
-        axs[0, col].set_xlabel("")
-
-        # azimuth against scattering vector: the elliptic distortion is the
-        # cos(2 phi) wobble of every ring, read off against the black lines
-        ax = axs[1, col]
-        flat = pk.select_fields("qx", "qy", "intensity").flatten()
-        r = np.hypot(flat[:, 0], flat[:, 1])
-        phi = np.degrees(np.arctan2(flat[:, 1], flat[:, 0]))
-        sel = (r > k_min) & (r < k_hi)
-        w = flat[sel, 2]
-        hi = float(np.percentile(w, 99.5)) if w.size else 1.0
-        ax.scatter(
-            r[sel],
-            phi[sel],
-            s=marker_size * np.clip(w / max(hi, 1e-12), 0.03, 1.0),
-            c="r",
-            alpha=0.5,
-            lw=0,
-            rasterized=True,
-        )
-        for g0 in rings_ref:
-            ax.axvline(g0, color="k", lw=0.7, alpha=0.8)
-        ax.set_xlim(k_min, k_hi)
-        ax.set_ylim(-180, 180)
-        ax.set_yticks([-180, -90, 0, 90, 180])
-        ax.set_xlabel(r"scattering vector (1/$\mathrm{\AA}$)")
-    axs[1, 0].set_ylabel("azimuth (deg)")
+    axs[1, 1].set_ylabel("")
     if ellipse is not None:
         axs[1, 0].text(
             0.02,
@@ -1099,6 +1080,156 @@ def calibrate(
     return (cal, fig, axs) if returnfig else cal
 
 
+def _ring_shells(crystal: Crystal, k_min: float, k_max: float, bragg_k_power: float):
+    """Ring radii of a crystal in (k_min, k_max) and their summed intensity,
+    relative to the strongest ring in that range."""
+    g = crystal.g_len.numpy()
+    ints = crystal.struct_factors_int.numpy() * g**bragg_k_power
+    shells = np.round(g / 0.005) * 0.005
+    keep = (shells > k_min) & (shells < k_max)
+    uniq = np.unique(shells[keep])
+    tot = np.array([ints[keep][shells[keep] == u].sum() for u in uniq])
+    return uniq, tot / max(float(tot.max()), 1e-30) if tot.size else tot
+
+
+def _calibration_panels(
+    ax_hist,
+    ax_az,
+    peaks,
+    crystal: Crystal,
+    k_min: float,
+    k_max: float,
+    k_broadening: float | None = None,
+    bragg_k_power: float = 2.0,
+    marker_size: float = 8.0,
+    n_rings: int = 12,
+) -> None:
+    """The radial histogram against one crystal's rings (top) and every peak
+    as azimuth against scattering vector with its strongest rings (bottom)."""
+    plot_ring_comparison(
+        peaks,
+        [crystal],
+        k_min=k_min,
+        k_max=k_max,
+        k_broadening=k_broadening,
+        bragg_k_power=bragg_k_power,
+        n_labels=n_rings,
+        figax=(ax_hist.figure, [ax_hist]),
+    )
+    ax_hist.set_xlabel("")
+    # azimuth against scattering vector: a pixel size error shifts every
+    # ring, the elliptic distortion is a cos(2 phi) wobble of each one
+    flat = peaks.select_fields("qx", "qy", "intensity").flatten()
+    r = np.hypot(flat[:, 0], flat[:, 1])
+    phi = np.degrees(np.arctan2(flat[:, 1], flat[:, 0]))
+    sel = (r > k_min) & (r < k_max)
+    w = flat[sel, 2]
+    hi = float(np.percentile(w, 99.5)) if w.size else 1.0
+    ax_az.scatter(
+        r[sel],
+        phi[sel],
+        s=marker_size * np.clip(w / max(hi, 1e-12), 0.03, 1.0),
+        c="r",
+        alpha=0.5,
+        lw=0,
+        rasterized=True,
+    )
+    radii, rel = _ring_shells(crystal, k_min, k_max, bragg_k_power)
+    for g0 in radii[np.argsort(-rel)[:n_rings]]:
+        ax_az.axvline(g0, color="k", lw=0.7, alpha=0.8)
+    ax_az.set_xlim(k_min, k_max)
+    ax_az.set_ylim(-180, 180)
+    ax_az.set_yticks([-180, -90, 0, 90, 180])
+    ax_az.set_xlabel(r"scattering vector (1/$\mathrm{\AA}$)")
+    ax_az.set_ylabel("azimuth (deg)")
+
+
+def plot_calibration(
+    peaks,
+    crystals,
+    k_min: float = 0.05,
+    k_max: float = 1.5,
+    k_broadening: float | None = None,
+    bragg_k_power: float = 2.0,
+    marker_size: float = 8.0,
+    n_rings: int = 12,
+    axsize: tuple[float, float] = (6.0, 6.4),
+    figax=None,
+):
+    """Calibrated peaks against the rings of every crystal, one column each.
+
+    The calibration check for all candidate phases, however many of them the
+    calibration itself was fit to. Each column holds the radial histogram of
+    every peak against that crystal's rings (top) and every peak as azimuth
+    against scattering vector with the same rings (bottom). A ring beside the
+    measured peaks in every direction is a lattice parameter or pixel size
+    error; a ring that wobbles with azimuth is elliptic distortion.
+
+    Parameters
+    ----------
+    peaks : Vector
+        Calibrated peaks (qx, qy, intensity) in 1/Angstroms.
+    crystals : Crystal | list[Crystal]
+        Candidate phases, structure factors calculated.
+    k_min, k_max : float
+        Range of scattering vectors shown, 1/Angstroms.
+    k_broadening : float | None
+        None draws sharp ring lines in the histograms; a width (1/Angstroms)
+        draws the broadened ring profile instead.
+    marker_size : float, default=8.0
+        Area of the brightest peak in the azimuth panels.
+    n_rings : int, default=12
+        Rings drawn in the azimuth panels and labeled in the histograms,
+        strongest first; a large cell would otherwise fill both with its
+        weak superstructure rings.
+    axsize : tuple, default=(6.0, 6.4)
+        Size of one column.
+    figax : (fig, axs) | None
+        Existing figure and a (2, n_crystals) array of axes.
+
+    Returns
+    -------
+    tuple
+        ``(fig, axs)``, axs of shape (2, n_crystals).
+    """
+    import matplotlib.pyplot as plt
+
+    xtls = [crystals] if isinstance(crystals, Crystal) else list(crystals)
+    if figax is None:
+        fig, axs = plt.subplots(
+            2,
+            len(xtls),
+            figsize=(axsize[0] * len(xtls), axsize[1]),
+            sharex=True,
+            squeeze=False,
+            gridspec_kw={"height_ratios": [1, 1.3]},
+        )
+    else:
+        fig, axs = figax
+        axs = np.asarray(axs).reshape(2, len(xtls))
+    for col, xtl in enumerate(xtls):
+        _calibration_panels(
+            axs[0, col],
+            axs[1, col],
+            peaks,
+            xtl,
+            k_min=k_min,
+            k_max=k_max,
+            k_broadening=k_broadening,
+            bragg_k_power=bragg_k_power,
+            marker_size=marker_size,
+            n_rings=n_rings,
+        )
+        axs[0, col].set_title(xtl.name, fontsize=10)
+        if col:
+            axs[0, col].set_ylabel("")
+            axs[1, col].set_ylabel("")
+    if figax is None:
+        fig.tight_layout()
+        fig.subplots_adjust(hspace=0.08)
+    return fig, axs
+
+
 def plot_ring_comparison(
     peaks,
     crystals,
@@ -1108,6 +1239,7 @@ def plot_ring_comparison(
     bragg_k_power: float = 2.0,
     label_hkl: bool = True,
     label_min_intensity: float = 0.05,
+    n_labels: int = 12,
     figax=None,
 ):
     """Measured radial peak histogram against crystal ring positions.
@@ -1131,6 +1263,9 @@ def plot_ring_comparison(
     label_min_intensity : float, default=0.05
         Label rings whose summed intensity exceeds this fraction of the
         strongest ring.
+    n_labels : int, default=12
+        Label at most this many rings, strongest first, which keeps a large
+        cell with many rings readable.
     """
     import matplotlib.pyplot as plt
 
@@ -1171,21 +1306,26 @@ def plot_ring_comparison(
             )
 
         if label_hkl:
-            rows = 0
+            # the strongest rings first, each at least 0.03 1/A from the
+            # last, then drawn left to right
             labeled_g: list[float] = []
-            for u, si in zip(uniq, shell_int):
+            for j in np.argsort(-shell_int):
+                u, si = uniq[j], shell_int[j]
+                if len(labeled_g) >= n_labels:
+                    break
                 if u < k_min or u > k_max or si < label_min_intensity:
                     continue
                 if any(abs(u - g0) < 0.03 for g0 in labeled_g):
                     continue
+                labeled_g.append(u)
+            for rows, u in enumerate(sorted(labeled_g)):
                 in_shell = shells == u
                 idx = np.nonzero(in_shell)[0]
                 idx = idx[ints[idx] > 0.99 * ints[idx].max()]
                 key = [tuple(-hkl_np[i]) for i in idx]
                 best = idx[int(np.lexsort(np.array(key).T[::-1])[0])]
-                labeled_g.append(u)
-                y = 1.05 + 0.11 * (rows % 2)
-                rows += 1
+                # three staggered rows keep neighbouring labels apart
+                y = 1.04 + 0.1 * (rows % 3)
                 ax.text(
                     u,
                     y,
@@ -1195,8 +1335,9 @@ def plot_ring_comparison(
                     va="bottom",
                 )
         ax.set_ylabel("intensity (norm.)")
-        ax.set_ylim(0, 1.32)
-        ax.legend(loc="upper right", fontsize=9)
+        ax.set_ylim(0, 1.42)
+        # below the band of ring labels at the top
+        ax.legend(loc="upper right", bbox_to_anchor=(1.0, 0.72), fontsize=8)
     axs[-1].set_xlabel(r"scattering vector (1/$\mathrm{\AA}$)")
     if figax is None:
         fig.tight_layout()
