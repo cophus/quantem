@@ -3,6 +3,7 @@ from quantem.diffraction.crystal import Crystal as Crystal
 from quantem.diffraction.crystal_map import CrystalMap as CrystalMap
 from quantem.diffraction.orientation import OrientationMap as OrientationMap
 from quantem.diffraction.phase import PhaseMap as PhaseMap
+from quantem.diffraction.reverse_monte_carlo import ReverseMonteCarlo as ReverseMonteCarlo
 from quantem.diffraction.strain import StrainMap as StrainMap
 from quantem.diffraction import bloch as bloch
 from quantem.diffraction import calibration as calibration

@@ -19,6 +19,21 @@ from quantem.spectroscopy import (
 )
 
 
+def _rsciio_reader(file_path: str | PathLike, file_type: str | None = None):
+    """rosettasciio file_reader from a plugin name ("digitalmicrograph") or extension ("dm3")."""
+    if file_type is None:
+        file_type = Path(file_path).suffix.lstrip(".")
+    try:
+        return importlib.import_module(f"rsciio.{file_type.lower()}").file_reader
+    except ModuleNotFoundError:
+        import rsciio
+
+        for plugin in rsciio.IO_PLUGINS:
+            if file_type.lower() in (ext.lower() for ext in plugin["file_extensions"]):
+                return importlib.import_module(plugin["api"]).file_reader
+        raise ValueError(f"No rosettasciio reader for file type '{file_type}'")
+
+
 def _print_available_datasets(data_list):
     print("Available datasets:")
     for index, entry in enumerate(data_list):
@@ -196,15 +211,12 @@ def read_4dstem(
 
         return imported_data_4d
 
-    if file_type is None:
-        file_type = Path(file_path).suffix.lower().lstrip(".")
-
     sampling_override = kwargs.pop("sampling", None)
     origin_override = kwargs.pop("origin", None)
     units_override = kwargs.pop("units", None)
     name_override = kwargs.pop("name", None)
 
-    file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
+    file_reader = _rsciio_reader(file_path, file_type)
     data_list = file_reader(file_path, **kwargs)
 
     if not data_list:
@@ -354,7 +366,7 @@ def read_3d_spectroscopy(
     """
     data_type_normalized = str(data_type).upper()
 
-    file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader  # type: ignore
+    file_reader = _rsciio_reader(file_path, file_type)
     data_list = file_reader(file_path)
 
     # If specific index provided, use it
@@ -440,10 +452,7 @@ def read_2d(
     --------
     Dataset
     """
-    if file_type is None:
-        file_type = Path(file_path).suffix.lower().lstrip(".")
-
-    file_reader = importlib.import_module(f"rsciio.{file_type}").file_reader
+    file_reader = _rsciio_reader(file_path, file_type)
     imported_data = file_reader(file_path)[0]
 
     dataset = Dataset2d.from_array(
