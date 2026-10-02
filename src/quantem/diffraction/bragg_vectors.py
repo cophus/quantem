@@ -498,9 +498,7 @@ class BraggVectors(AutoSerialize):
                 raise ValueError("positions must contain at least one (row, col) to test on.")
             coords = [(int(r), int(c)) for r, c in positions]
             results = self._detect_positions(coords, detect_kwargs, batch_size, progressbar=False)
-            return Vector.from_data(
-                results, fields=PEAK_FIELDS, name="bragg_peaks_test", dtype=torch.float64
-            )
+            return Vector.from_data(results, fields=PEAK_FIELDS, name="bragg_peaks_test")
 
         scan_r, scan_c = int(self.dataset.shape[0]), int(self.dataset.shape[1])
         coords = list(np.ndindex(scan_r, scan_c))
@@ -511,9 +509,7 @@ class BraggVectors(AutoSerialize):
         # appends to the backing buffer on every write, while from_data joins all
         # cells with a single concatenation.
         nested = [results[r * scan_c : (r + 1) * scan_c] for r in range(scan_r)]
-        peaks = Vector.from_data(
-            nested, fields=PEAK_FIELDS, name="bragg_peaks", dtype=torch.float64
-        )
+        peaks = Vector.from_data(nested, fields=PEAK_FIELDS, name="bragg_peaks")
         peaks.metadata.update(self._scan_calibration())
 
         self.peaks = peaks
