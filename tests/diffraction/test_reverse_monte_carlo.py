@@ -21,8 +21,9 @@ _atom_site_fract_x
 _atom_site_fract_y
 _atom_site_fract_z
 _atom_site_occupancy
-Nb1 Nb 0 0 0 0.7
+Nb1 Nb 0 0 0 0.4
 V1 V 0 0 0 0.3
+Zr1 Zr 0 0 0 0.3
 """
 
 
@@ -54,44 +55,68 @@ def test_cubic_rotations():
     assert len({o.tobytes() for o in ops}) == 24
 
 
-def test_binary_site_and_composition(rmc):
-    assert rmc.species == ["Nb", "V"]
-    assert rmc.concentration == pytest.approx(0.3)
-    assert len(rmc.sigma) == 2 * 4**3
-    assert rmc.sigma.sum() == round(0.3 * len(rmc.sigma))
+def test_ternary_site_and_composition(rmc):
+    assert rmc.species == ["Nb", "V", "Zr"]
+    assert np.allclose(rmc.concentrations, [0.4, 0.3, 0.3])
+    assert len(rmc.site_x) == 2 * 4**3
+    counts = np.bincount(rmc.species_index, minlength=3)
+    assert counts.sum() == 128
+    assert np.all(np.abs(counts - 128 * rmc.concentrations) <= 1)
+
+
+def _score(rmc, d_fr, d_fi):
+    keep = rmc._keep / len(rmc.site_x)
+    d_int = (2 * (rmc._Fr * d_fr + rmc._Fi * d_fi) + d_fr**2 + d_fi**2) * keep
+    dm = rmc._scale * rmc._u * rmc._read(d_int[:, rmc._sym_index].mean(dim=1))
+    return float((rmc._w * (dm**2 - 2 * rmc._r * dm)).sum())
 
 
 def test_swap_score_matches_recompute(rmc):
-    """The incremental loss change of one swap equals the loss after recomputing G from scratch."""
+    """The incremental loss change of one swap equals the loss after recomputing F from scratch."""
     loss0 = rmc._update_residual()
-    j_on = int(np.nonzero(~rmc.sigma)[0][0])
-    j_off = int(np.nonzero(rmc.sigma)[0][0])
-    n_sites = len(rmc.sigma)
-    c1, s1 = rmc._phases(torch.tensor([j_on]))
-    c2, s2 = rmc._phases(torch.tensor([j_off]))
-    dGr, dGi = c1 - c2, -s1 + s2
-    d_int = (2 * (rmc._Gr * dGr + rmc._Gi * dGi) + dGr**2 + dGi**2) / n_sites
-    d_used = d_int[:, rmc._sym_index].mean(dim=1)
-    dm = rmc._scale * rmc._u * rmc._read(d_used)
-    dL = float((rmc._w * (dm**2 - 2 * rmc._r * dm)).sum())
+    spec = rmc.species_index
+    j1 = int(np.nonzero(spec == 0)[0][0])
+    j2 = int(np.nonzero(spec == 1)[0][0])
+    c1, s1 = rmc._phases(rmc._positions(np.array([j1])))
+    c2, s2 = rmc._phases(rmc._positions(np.array([j2])))
+    df = rmc._fs[1] - rmc._fs[0]
+    dL = _score(rmc, df * (c1 - c2), df * (s2 - s1))
+    spec[j1], spec[j2] = 1, 0
+    rmc._recompute_F()
+    assert rmc._update_residual() - loss0 == pytest.approx(dL, rel=1e-3, abs=1e-4 * loss0)
 
-    rmc.sigma[j_on], rmc.sigma[j_off] = True, False
-    rmc._recompute_G()
-    loss1 = rmc._update_residual()
-    assert loss1 - loss0 == pytest.approx(dL, rel=1e-3, abs=1e-4 * loss0)
+
+def test_displacement_score_matches_recompute(rmc):
+    loss0 = rmc._update_residual()
+    j = np.array([5])
+    new = np.array([[1, -1, 1]])
+    co, so = rmc._phases(rmc._positions(j))
+    cn, sn = rmc._phases(rmc._positions(j, new))
+    f = rmc._fs[int(rmc.species_index[5])]
+    dL = _score(rmc, f * (cn - co), f * (so - sn))
+    rmc.displacement[5] = new[0]
+    rmc._recompute_F()
+    assert rmc._update_residual() - loss0 == pytest.approx(dL, rel=1e-3, abs=1e-4 * loss0)
 
 
 def test_run_lowers_loss_and_keeps_composition(rmc):
-    n_b = rmc.sigma.sum()
+    counts = np.bincount(rmc.species_index)
     rmc.run(n_sweeps=3, batch=8, progress=False)
-    assert rmc.sigma.sum() == n_b
+    assert np.array_equal(np.bincount(rmc.species_index), counts)
     assert rmc.loss_history[-1] <= rmc.loss_history[0] + 1e-6
 
 
 def test_warren_cowley_random_is_near_zero(rmc):
     sro = rmc.warren_cowley(n_shells=2)
     assert np.allclose(sro["radius"], [3.2 * np.sqrt(3) / 2, 3.2], atol=1e-3)
-    assert np.all(np.abs(sro["alpha"]) < 0.15)
+    assert sro["alpha"].shape == (2, 3, 3)
+    assert np.all(np.abs(sro["alpha"]) < 0.35)
+
+
+def test_refine_tilts_runs(rmc):
+    rmc.refine_tilts(max_tilt_deg=0.5, step_deg=0.25, verbose=False)
+    rmc.refine_tilts(max_tilt_deg=0.5, step_deg=0.25, max_grid=rmc.grid_size // 2, verbose=False)
+    assert all(np.rad2deg(np.linalg.norm(t)) <= 0.6 for t in rmc.geometry["tilts"])
 
 
 def test_mask_is_zero_on_bragg_peaks(rmc):
@@ -107,3 +132,74 @@ def test_sro_section_random_is_near_laue(rmc):
     img, _, node_dist = rmc.diffuse_section((0, 0, 1), extent=1.0, smooth=True)
     between = img[node_dist > 0.2]
     assert 0.5 < between.mean() < 1.5
+
+
+def test_omega_embryo_is_a_collapsed_row_and_scores_exactly(rmc):
+    sites, new = rmc._omega_proposals(4)
+    assert sites.shape[1] == 3 and len(set(sites.ravel())) == sites.size
+    xc = rmc.site_x[sites] // rmc.refine
+    step = np.mod(xc[:, 1] - xc[:, 0], rmc.cells * 2)
+    step = np.where(step > rmc.cells, step - 2 * rmc.cells, step)
+    assert np.all(np.abs(step) == 1)  # nearest neighbours along <111>
+    vec = new
+    assert np.all(vec[:, 0] == 0) and np.all(vec[:, 1] == -vec[:, 2])
+
+    loss0 = rmc._update_residual()
+    d_fr = torch.zeros(len(rmc._needed))
+    d_fi = torch.zeros(len(rmc._needed))
+    for k in range(3):
+        j = sites[:1, k]
+        co, so = rmc._phases(rmc._positions(j))
+        cn, sn = rmc._phases(rmc._positions(j, new[:1, k]))
+        f = rmc._fs[int(rmc.species_index[j[0]])]
+        d_fr += (f * (cn - co))[0]
+        d_fi += (f * (so - sn))[0]
+    dL = _score(rmc, d_fr[None], d_fi[None])
+    rmc.displacement[sites[0]] = new[0]
+    rmc._recompute_F()
+    assert rmc._update_residual() - loss0 == pytest.approx(dL, rel=1e-3, abs=1e-4 * loss0)
+
+
+def test_fitted_envelope_does_not_raise_loss(rmc):
+    loss_measured = rmc._update_residual()
+    rmc.envelope = "fitted"
+    rmc._setup_forward()
+    rmc._solve_linear(rmc._model_diffuse())
+    assert rmc._update_residual() <= loss_measured * (1 + 1e-6)
+    assert all(np.all(p >= 0) for p in rmc._env_p)
+
+
+def test_static_b_cap_holds(rmc):
+    rmc.run(n_sweeps=3, batch=8, omega_fraction=1.0, max_static_b=0.2, progress=False)
+    assert rmc.static_b() <= 0.2 + 1e-9
+    assert len(rmc._omega_vectors) == 16  # two amplitudes x eight <111> senses
+
+
+def test_omega_chain_repeats_along_one_row(rmc):
+    sites, new = rmc._omega_proposals(2, repeats=2)
+    assert sites.shape[1] == 6
+    assert np.array_equal(new[:, :3], new[:, 3:])
+    xc = rmc.site_x[sites] // rmc.refine
+    n = rmc.cells * 2
+    steps = np.mod(np.diff(xc, axis=1), n)
+    steps = np.where(steps > n // 2, steps - n, steps)
+    assert np.all(steps == steps[:, :1])  # one straight <111> row
+
+
+def test_size_effect_chi_is_odd_about_bragg_nodes(rmc):
+    a = rmc.lattice_parameter
+    g = np.array([1.0, 1.0, 0.0]) / a  # allowed BCC reflection
+    kappa = np.array([[0.02, 0.005, -0.01], [0.0, 0.03, 0.01]])
+    plus = rmc._size_chi(g + kappa)
+    minus = rmc._size_chi(g - kappa)
+    assert np.all(np.abs(plus) > 0)
+    assert np.allclose(plus, -minus, rtol=0.2)
+    far = rmc._size_chi(g + 4 * kappa)
+    assert np.all(np.abs(far) < np.abs(plus))  # grows toward the node
+
+
+def test_size_effect_radii_orders_species(rmc):
+    rmc.set_size_effect("radii")
+    eta = dict(zip(rmc.species, rmc.size_eta))
+    assert eta["V"] < eta["Nb"] < eta["Zr"]
+    assert abs((rmc.concentrations * rmc.size_eta).sum()) < 1e-12
