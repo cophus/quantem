@@ -740,6 +740,8 @@ class ReverseMonteCarlo(AutoSerialize):
         cells: int = 16,
         seed: int | None = 0,
         displacements: bool = True,
+        displacement_grid: int = 24,
+        max_displacement: float = 0.3,
         omega_amplitudes: Sequence[int] = (1, 2),
         symmetrize: bool = True,
         debye_waller: float = 0.5,
@@ -762,9 +764,14 @@ class ReverseMonteCarlo(AutoSerialize):
             Unit cells along each cube edge. The diffuse model is sampled
             every ``1 / (cells a)`` in reciprocal space.
         displacements : bool
-            Allow omega displacements: atoms move along a <111> sense, two of
-            every three {111} planes collapsing toward each other. Positions
-            live on a grid a/24 fine, so moves are still scored exactly.
+            Allow static displacements. Positions live on a grid
+            ``a / displacement_grid`` fine, so every move is still scored
+            exactly.
+        displacement_grid : int
+            Steps per lattice parameter of the displacement grid (a multiple
+            of 24): 24 gives 0.15 A steps, 48 gives 0.076 A for a = 3.66 A.
+        max_displacement : float
+            Largest displacement component (A) reached by random moves.
         omega_amplitudes : sequence of int
             Allowed displacements in units of a/24 along each axis: 2 is the
             ideal omega collapse (a/12, 0.53 A along <111> for a = 3.66 A), 1
@@ -810,8 +817,10 @@ class ReverseMonteCarlo(AutoSerialize):
             and len(self.site_grid) == 2
             and np.array_equal(np.sort(self.site_grid.sum(1)), [0, 3])
         ):
-            raise NotImplementedError("Omega displacements are implemented for BCC sites only.")
-        m = 24 // d if displacements else 1
+            raise NotImplementedError("Displacements are implemented for BCC sites only.")
+        if displacement_grid % 24:
+            raise ValueError("displacement_grid must be a multiple of 24.")
+        m = displacement_grid // d if displacements else 1
         unit = m * d // 24  # fine-grid steps per a/24
         self._omega_vectors = np.array(
             [k * unit * np.array(v) for k in omega_amplitudes for v in product((1, -1), repeat=3)],
@@ -835,6 +844,7 @@ class ReverseMonteCarlo(AutoSerialize):
         xc = x0 // m
         self._site_lookup[xc[:, 0], xc[:, 1], xc[:, 2]] = np.arange(n_sites)
         self.displacements = bool(displacements)
+        self._max_steps = int(np.floor(max_displacement / (self._a_crystal / (d * m)) + 1e-9))
         self.size_eta = np.zeros(len(self.species))
         self.debye_waller = float(debye_waller)
         self.symmetrize = bool(symmetrize)
@@ -1415,20 +1425,24 @@ class ReverseMonteCarlo(AutoSerialize):
         n_sweeps: int = 20,
         batch: int = 32,
         temperature: float = 0.05,
-        omega_fraction: float = 0.5,
+        random_fraction: float = 0.5,
+        omega_fraction: float = 0.0,
         max_static_b: float | None = 0.5,
         refit_every: int = 2,
         progress: bool = True,
     ) -> "ReverseMonteCarlo":
-        """Species swaps and omega embryos until the diffuse fit converges.
+        """Species swaps and displacements until the diffuse fit converges.
 
         Each batch proposes ``batch`` moves on distinct sites against the
-        current supercell and scores each exactly: either swaps of two
-        unlike atoms (composition conserved) or, with probability
-        ``omega_fraction``, an omega embryo on three consecutive atoms of a
-        <111> row: the first stays and the next two collapse toward each
-        other by a/24 or a/12 each, (0, +v, -v). Proposing an embryo where it
-        already stands clears it instead. ``max_static_b`` (A^2) caps the
+        current supercell and scores each exactly. With probability
+        ``random_fraction`` the batch moves single atoms by one grid step
+        (-1, 0 or +1 along each axis, up to ``max_displacement``), with no
+        assumed pattern, so any displacement correlation has to come from the
+        data. With probability ``omega_fraction`` it proposes omega embryos
+        instead: three consecutive atoms of a <111> row, the first fixed and
+        the next two collapsed toward each other, (0, +v, -v), or cleared
+        where one already stands. Otherwise it swaps two unlike atoms
+        (composition conserved). ``max_static_b`` (A^2) caps the
         static Debye-Waller factor of all displacements, 8 pi^2 <u^2> / 3, so
         they stay consistent with how slowly the Bragg intensities fall off
         (a displacement field this strong would damp them; the diffuse scale
@@ -1449,6 +1463,7 @@ class ReverseMonteCarlo(AutoSerialize):
         t0 = None
         n_batches = max(n_sites // batch, 1)
         p_omega = omega_fraction if self.displacements else 0.0
+        p_random = random_fraction if self.displacements else 0.0
         budget = (
             3 * max_static_b / (8 * np.pi**2) * n_sites if max_static_b is not None else np.inf
         )
@@ -1456,13 +1471,16 @@ class ReverseMonteCarlo(AutoSerialize):
         sweeps = tqdm(range(n_sweeps), desc="RMC sweeps", disable=not progress)
         su = None
         for sweep in sweeps:
-            accepted = {"swap": 0, "omega": 0}
+            accepted = {"swap": 0, "random": 0, "omega": 0}
             for _ in range(n_batches):
                 if su is None:
                     su = self._scale * self._u
                 spec = self.species_index
                 roll = self.rng.random()
-                if roll < p_omega:
+                if roll < p_random:
+                    kind = "random"
+                    sites, new = self._random_proposals(batch)
+                elif roll < p_random + p_omega:
                     kind = "omega"
                     sites, new = self._omega_proposals(batch)
                 else:
@@ -1554,11 +1572,23 @@ class ReverseMonteCarlo(AutoSerialize):
                 loss = self._update_residual()
                 su = None
             self.loss_history.append(loss)
-            sweeps.set_postfix(loss=f"{loss:.4g}", swaps=accepted["swap"], omega=accepted["omega"])
+            sweeps.set_postfix(loss=f"{loss:.4g}", **accepted)
         self._recompute_F()
         self._solve_linear(self._model_diffuse())
         self.loss_history[-1] = self._update_residual()
         return self
+
+    def _random_proposals(self, batch: int):
+        """Single atoms moved by -1, 0 or +1 grid steps along each axis (not all zero), within
+        ``max_displacement``: sites (B, 1) and new displacement vectors (B, 1, 3)."""
+        n_sites = len(self.site_x)
+        j = self.rng.choice(n_sites, batch, replace=False)
+        delta = self.rng.integers(-1, 2, (batch, 3))
+        zero = ~np.any(delta, axis=1)
+        delta[zero, self.rng.integers(0, 3, zero.sum())] = self.rng.choice((-1, 1), zero.sum())
+        new = self.displacement[j] + delta
+        ok = np.all(np.abs(new) <= self._max_steps, axis=1)
+        return j[ok][:, None], new[ok][:, None, :]
 
     def _omega_proposals(self, batch: int):
         """Disjoint omega embryos along <111> rows: sites (B, 3) and their new displacement
@@ -1978,8 +2008,14 @@ class ReverseMonteCarlo(AutoSerialize):
         u = self.displacement * step
         nc = self._site_lookup.shape[0]
         xc = self.site_x // self.refine
-        out = dict(radius=[], longitudinal=[], transverse=[])
+        out = dict(radius=[], shell=[], longitudinal=[], transverse=[])
         for offs in self._shells(n_shells):
+            v = np.sort(np.abs(offs[0]))[::-1]
+            out["shell"].append(
+                "<" + "".join(str(int(x)) for x in v // 2) + ">"
+                if np.all(v % 2 == 0)
+                else "1/2<" + "".join(str(int(x)) for x in v) + ">"
+            )
             rhat = offs / np.linalg.norm(offs, axis=1, keepdims=True)
             nb = np.stack([self._site_lookup[tuple(np.mod(xc + o, nc).T)] for o in offs], 1)
             ui = u[:, None, :]
@@ -1996,18 +2032,25 @@ class ReverseMonteCarlo(AutoSerialize):
         out["radius"] = np.asarray(out["radius"])
         return out
 
-    def plot_displacement_correlations(self, n_shells: int = 6):
+    def plot_displacement_correlations(self, n_shells: int = 8):
         """Displacement short-range order: longitudinal and transverse displacement
-        correlations by neighbour shell."""
+        correlations for each neighbour shell, labelled by the shell's bond vector in units of
+        a. BCC has no shell between a (second neighbours) and a sqrt(2) (third)."""
         import matplotlib.pyplot as plt
 
         c = self.displacement_correlations(n_shells)
-        fig, ax = plt.subplots(figsize=(5.5, 4))
+        fig, ax = plt.subplots(figsize=(9, 4.5))
         ax.axhline(0, color="0.6", lw=0.8)
-        ax.plot(c["radius"], c["longitudinal"], "o-", label="longitudinal (along bond)")
-        ax.plot(c["radius"], c["transverse"], "s--", label="transverse")
-        ax.set_xlabel("neighbour distance (A)")
+        ax.plot(c["radius"], c["longitudinal"], "o-", ms=5, label="longitudinal (along bond)")
+        ax.plot(c["radius"], c["transverse"], "s--", ms=5, label="transverse")
+        ax.set_xticks(c["radius"])
+        ax.set_xticklabels(c["shell"], rotation=45, fontsize=8)
+        ax.set_xlabel("neighbour shell (bond vector / a)")
         ax.set_ylabel("displacement correlation")
+        top = ax.secondary_xaxis("top")
+        top.set_xticks(c["radius"])
+        top.set_xticklabels([f"{r:.2f}" for r in c["radius"]], fontsize=7)
+        top.set_xlabel("distance (A)")
         ax.legend(fontsize=8)
         fig.tight_layout()
         return fig, ax
@@ -2037,31 +2080,26 @@ class ReverseMonteCarlo(AutoSerialize):
 
     def plot_displacements(self, **kwargs):
         """Probability distribution of the static displacement of each species projected on
-        <100>, <110> and <111> (pooled over equivalent directions and both senses). Omega
-        displacements are discrete, so the distributions are a central peak at 0 with side
-        peaks at the half and full collapse."""
+        <100>, <110> and <111> (pooled over equivalent directions and both senses), on a log
+        scale. Displacements live on a grid, so each curve connects the grid values."""
         import matplotlib.pyplot as plt
 
         dist = self.displacement_distributions()
         fig, axs = plt.subplots(1, 3, figsize=kwargs.pop("figsize", (14, 3.8)), sharey=True)
         colors = plt.get_cmap("tab10")(np.arange(len(self.species)))
-        width = (
-            0.8 * self.lattice_parameter / (self.grid_divisor * self.refine) / len(self.species)
-        )
         for ax, (name, per_species) in zip(axs, dist.items()):
             for k, sp in enumerate(self.species):
                 vals, prob = per_species[sp]
-                offset = (k - (len(self.species) - 1) / 2) * width
-                ax.bar(vals + offset, prob, width=width, color=colors[k], label=sp)
+                ax.plot(vals, prob, "o-", ms=4, lw=1.2, color=colors[k], label=sp)
             ax.set_yscale("log")
             ax.set_xlabel(f"u . n, n along {name} (A)")
             ax.set_title(name)
         axs[0].set_ylabel("probability")
         axs[0].legend()
-        s = self.displacement_summary()
+        summary = self.displacement_summary()
         fig.suptitle(
-            f"static B = {s['static_b']:.3f} A^2; omega fraction "
-            + ", ".join(f"{k} {100 * v:.1f}%" for k, v in s["omega_fraction"].items())
+            f"static B = {summary['static_b']:.3f} A^2; mean |u| "
+            + ", ".join(f"{k} {v:.3f} A" for k, v in summary["mean_displacement"].items())
         )
         fig.tight_layout()
         return fig, axs

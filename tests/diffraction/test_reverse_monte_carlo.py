@@ -221,3 +221,23 @@ def test_displacement_correlations_see_omega(rmc):
     assert c["longitudinal"][0] < 0  # collapsing nearest-neighbour pairs move toward each other
     dist = rmc.displacement_distributions()
     assert set(dist) == {"<100>", "<110>", "<111>"}
+
+
+def test_random_displacement_scores_exactly_and_stays_bounded(rmc):
+    loss0 = rmc._update_residual()
+    sites, new = rmc._random_proposals(16)
+    assert np.all(np.abs(new) <= rmc._max_steps)
+    assert np.all(np.any(new[:, 0] != rmc.displacement[sites[:, 0]], axis=1))
+    j = sites[:1, 0]
+    co, so = rmc._phases(rmc._positions(j))
+    cn, sn = rmc._phases(rmc._positions(j, new[:1, 0]))
+    f = rmc._fs[int(rmc.species_index[j[0]])]
+    dL = _score(rmc, f * (cn - co), f * (so - sn))
+    rmc.displacement[j[0]] = new[0, 0]
+    rmc._recompute_F()
+    assert rmc._update_residual() - loss0 == pytest.approx(dL, rel=1e-3, abs=1e-4 * loss0)
+
+
+def test_shell_labels(rmc):
+    c = rmc.displacement_correlations(n_shells=4)
+    assert c["shell"] == ["1/2<111>", "<100>", "<110>", "1/2<311>"]
