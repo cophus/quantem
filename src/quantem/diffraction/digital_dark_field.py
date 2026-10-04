@@ -1,26 +1,40 @@
-"""Clustering-based digital dark field imaging.
+"""Digital dark field imaging from detected Bragg peaks.
 
-Implements the workflow of MacLaren and co-workers: DBSCAN in the joint
-(diffraction, scan) space groups the detected Bragg peaks into single-spot,
-single-crystallite clusters (L1); clustering the real-space centers of mass
-of those clusters groups the g-vectors of each grain (L2); clustering the
-remaining unindexed peaks in diffraction space alone isolates ring-like
-nanocrystalline or amorphous components (L3). Each cluster's summed
-intensity per probe position is a digital dark field image.
+A digital dark field (DDF) image is the summed intensity of a selected subset
+of the detected Bragg peaks at each probe position. These functions select
+the peaks in three ways, following MacLaren and co-workers
+(https://doi.org/10.1093/mam/ozae104):
 
-The clustering itself is the generic quantem.core.utils.clustering.dbscan /
-cluster_vector; this module holds the diffraction-specific pieces: centers
-of mass, DDF image formation, and composite color rendering.
+- Virtual apertures: peaks within a radius of a set of aperture positions,
+  usually a lattice built from two reciprocal lattice vectors
+  (aperture_array, aperture_array_subtract, aperture_ddf_image).
+- Polar selection: peaks within a ring of radius q, optionally restricted to
+  a range of azimuthal angles (add_polar_fields, polar_mask,
+  radial_ddf_image).
+- Clustering: DBSCAN in the joint (diffraction, scan) space groups the peaks
+  into single-spot, single-crystallite clusters (L1), clustering the
+  real-space centers of mass of those clusters groups the spots of each grain
+  (L2), and clustering the remaining peaks in diffraction space alone
+  isolates ring-like nanocrystalline or amorphous components (L3)
+  (cluster_coms, ddf_images, assign_grain_labels).
+
+All functions read the peaks from a Vector with one cell per probe position.
+The diffraction coordinates are given by `q_fields`, which defaults to
+("qx", "qy") for calibrated peaks or ("q_row", "q_col") for peaks in detector
+pixels. Boolean masks are aligned with the flattened rows of the Vector, so
+they can be combined with & and | and passed to ddf_image or to
+quantem.core.utils.clustering.filter_rows.
 """
 
 from __future__ import annotations
 
-import numpy as np
+from collections.abc import Sequence
 
 import matplotlib.pyplot as plt
-from matplotlib.colors import hsv_to_rgb   
+import numpy as np
+from matplotlib.collections import EllipseCollection
+from matplotlib.colors import hsv_to_rgb
 
-from quantem.core.datastructures.vector import Vector
 from quantem.core.utils.clustering import cluster_vector, dbscan  # noqa: F401
 
 
@@ -29,9 +43,454 @@ def _scan_cells(vector) -> np.ndarray:
     counts = np.asarray(vector.row_counts(), dtype=int)
     shape = vector.shape[:2]
     cell_r, cell_c = np.divmod(np.arange(counts.size), shape[1])
-    return np.stack(
-        [np.repeat(cell_r, counts), np.repeat(cell_c, counts)], axis=1
+    return np.stack([np.repeat(cell_r, counts), np.repeat(cell_c, counts)], axis=1)
+
+
+def _resolve_q_fields(vector, q_fields) -> tuple[str, str]:
+    """The two diffraction coordinate fields of a peak Vector."""
+    if q_fields is not None:
+        return tuple(q_fields)
+    for candidate in (("qx", "qy"), ("q_row", "q_col")):
+        if all(f in vector.fields for f in candidate):
+            return candidate
+    raise KeyError(
+        f"No diffraction coordinate fields found in {vector.fields}; pass q_fields explicitly."
     )
+
+
+def _q_coordinates(vector, q_fields=None, center=(0.0, 0.0)) -> np.ndarray:
+    """(N, 2) diffraction coordinates of every flattened row, relative to center."""
+    q_fields = _resolve_q_fields(vector, q_fields)
+    q = vector.select_fields(*q_fields).numpy().astype(np.float64)
+    return q - np.asarray(center, dtype=np.float64)[None, :]
+
+
+# --------------------------------------------------------------------------- #
+# DDF images
+# --------------------------------------------------------------------------- #
+
+
+def ddf_image(
+    peaks,
+    mask=None,
+    intensity_field: str = "intensity",
+) -> np.ndarray:
+    """Digital dark field image from a subset of the peaks.
+
+    Parameters
+    ----------
+    peaks : Vector
+        Peaks with one cell per probe position.
+    mask : array-like of bool, optional
+        (N,) selection aligned with the flattened rows of `peaks`, for
+        example from aperture_mask or polar_mask. None uses every peak.
+    intensity_field : str, default="intensity"
+        Field summed at each probe position. Negative values are clipped to 0.
+
+    Returns
+    -------
+    np.ndarray
+        (scan_row, scan_col) image.
+    """
+    inten = peaks.select_fields(intensity_field).numpy()[:, 0].astype(np.float64).clip(min=0)
+    rc = _scan_cells(peaks)
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool)
+        inten, rc = inten[mask], rc[mask]
+    R, C = peaks.shape[:2]
+    image = np.zeros((R, C))
+    np.add.at(image, (rc[:, 0], rc[:, 1]), inten)
+    return image
+
+
+# --------------------------------------------------------------------------- #
+# Virtual apertures
+# --------------------------------------------------------------------------- #
+
+
+def aperture_array(
+    g1,
+    g2=None,
+    mode: str = "array",
+    center=(0.0, 0.0),
+    shift=(0, 0),
+    n1_range: tuple[int, int] = (-5, 5),
+    n2_range: tuple[int, int] = (-5, 5),
+    radius_range: tuple[float, float] = (0.0, np.inf),
+    shape=None,
+    edge: float = 0.0,
+) -> np.ndarray:
+    """Virtual aperture positions on a lattice of diffraction vectors.
+
+    Each aperture sits at center + (n1 + s1) g1 + (n2 + s2) g2, where (s1, s2)
+    is `shift`. We keep the positions whose distance from `center` falls
+    inside `radius_range`, which is how the direct beam is usually excluded.
+    When the peaks were shifted to a common origin with
+    BraggVectors.correct_peak_origins, setting `center` to that origin puts
+    the apertures in detector pixels, so they can be drawn over the mean
+    pattern or the Bragg vector map.
+
+    Parameters
+    ----------
+    g1, g2 : array-like of float
+        (2,) lattice vectors in the same coordinates as the peaks. g2 is not
+        needed for mode="line".
+    mode : {"array", "line", "single"}, default="array"
+        "array" places a 2D lattice of apertures over n1_range and n2_range,
+        "line" places a row of apertures along g1 over n1_range (a systematic
+        row, such as a two-beam condition), and "single" places one aperture
+        at (s1 g1 + s2 g2).
+    center : array-like of float, default=(0, 0)
+        (2,) origin of the lattice, normally the direct beam.
+    shift : (int, int), default=(0, 0)
+        Lattice offset (s1, s2) in multiples of g1 and g2.
+    n1_range, n2_range : (int, int), default=(-5, 5)
+        Inclusive range of lattice multiples of g1 and g2.
+    radius_range : (float, float), default=(0, inf)
+        Inner and outer distance from `center` of the apertures kept.
+    shape : (int, int), optional
+        Detector shape. When given, apertures closer than `edge` to the
+        detector boundary are removed, which requires `center` to be in
+        detector pixels.
+    edge : float, default=0
+        Boundary width in pixels, used only with `shape`.
+
+    Returns
+    -------
+    np.ndarray
+        (N, 2) aperture positions.
+    """
+    g1 = np.asarray(g1, dtype=np.float64)
+    g2 = np.zeros(2) if g2 is None else np.asarray(g2, dtype=np.float64)
+    s1, s2 = shift
+    if mode == "single":
+        n1 = np.array([0])
+        n2 = np.array([0])
+    elif mode in ("line", "2-beam"):
+        n1 = np.arange(n1_range[0], n1_range[1] + 1)
+        n2 = np.zeros_like(n1)
+    elif mode == "array":
+        n1, n2 = np.meshgrid(
+            np.arange(n1_range[0], n1_range[1] + 1),
+            np.arange(n2_range[0], n2_range[1] + 1),
+            indexing="ij",
+        )
+        n1, n2 = n1.ravel(), n2.ravel()
+    else:
+        raise ValueError(f"mode must be 'array', 'line' or 'single', got {mode!r}.")
+
+    offsets = (n1[:, None] + s1) * g1[None, :] + (n2[:, None] + s2) * g2[None, :]
+    r = np.hypot(offsets[:, 0], offsets[:, 1])
+    keep = (r >= radius_range[0]) & (r <= radius_range[1])
+    positions = offsets + np.asarray(center, dtype=np.float64)[None, :]
+    if shape is not None:
+        keep &= (
+            (positions[:, 0] > edge)
+            & (positions[:, 0] < shape[0] - edge)
+            & (positions[:, 1] > edge)
+            & (positions[:, 1] < shape[1] - edge)
+        )
+    return positions[keep]
+
+
+def aperture_array_subtract(
+    positions,
+    positions_remove,
+    tol: float = 1.0,
+) -> np.ndarray:
+    """Remove the apertures that coincide with a second set.
+
+    Subtracting the fundamental lattice from a finer lattice leaves only the
+    superlattice positions, for example.
+
+    Parameters
+    ----------
+    positions : array-like of float
+        (N, 2) aperture positions.
+    positions_remove : array-like of float
+        (M, 2) aperture positions to remove from `positions`.
+    tol : float, default=1.0
+        Apertures within this distance of any position in
+        `positions_remove` are removed.
+
+    Returns
+    -------
+    np.ndarray
+        (N', 2) remaining aperture positions.
+    """
+    positions = np.atleast_2d(np.asarray(positions, dtype=np.float64))
+    positions_remove = np.atleast_2d(np.asarray(positions_remove, dtype=np.float64))
+    if positions_remove.size == 0:
+        return positions
+    d2 = ((positions[:, None, :] - positions_remove[None, :, :]) ** 2).sum(axis=-1)
+    return positions[d2.min(axis=1) > tol**2]
+
+
+def aperture_mask(
+    peaks,
+    positions,
+    radius: float = 1.0,
+    q_fields=None,
+) -> np.ndarray:
+    """Peaks that fall inside any of a set of virtual apertures.
+
+    Parameters
+    ----------
+    peaks : Vector
+        Peaks with one cell per probe position.
+    positions : array-like of float
+        (M, 2) aperture positions, in the coordinates of `q_fields`.
+    radius : float, default=1.0
+        Aperture radius.
+    q_fields : (str, str), optional
+        Diffraction coordinate fields. Defaults to ("qx", "qy") or
+        ("q_row", "q_col"), whichever are present.
+
+    Returns
+    -------
+    np.ndarray
+        (N,) bool mask aligned with the flattened rows of `peaks`. A peak
+        inside two overlapping apertures is selected once.
+    """
+    q = _q_coordinates(peaks, q_fields)
+    positions = np.atleast_2d(np.asarray(positions, dtype=np.float64))
+    mask = np.zeros(q.shape[0], dtype=bool)
+    r2 = radius**2
+    for p in positions:
+        mask |= ((q - p[None, :]) ** 2).sum(axis=1) <= r2
+    return mask
+
+
+def aperture_ddf_image(
+    peaks,
+    positions,
+    radius: float = 1.0,
+    q_fields=None,
+    intensity_field: str = "intensity",
+) -> np.ndarray:
+    """Digital dark field image through a set of virtual apertures.
+
+    Equivalent to ddf_image(peaks, aperture_mask(peaks, positions, radius)).
+
+    Parameters
+    ----------
+    peaks : Vector
+        Peaks with one cell per probe position.
+    positions : array-like of float
+        (M, 2) aperture positions, from aperture_array for example.
+    radius : float, default=1.0
+        Aperture radius, in the units of the peak coordinates.
+    q_fields : (str, str), optional
+        Diffraction coordinate fields.
+    intensity_field : str, default="intensity"
+        Field summed at each probe position.
+
+    Returns
+    -------
+    np.ndarray
+        (scan_row, scan_col) image.
+    """
+    mask = aperture_mask(peaks, positions, radius=radius, q_fields=q_fields)
+    return ddf_image(peaks, mask, intensity_field=intensity_field)
+
+
+def plot_apertures(
+    positions,
+    image=None,
+    radius: float | None = None,
+    positions_removed=None,
+    color="tab:green",
+    color_removed="tab:red",
+    marker_size: float = 60.0,
+    figax=None,
+    **show_kwargs,
+):
+    """Aperture positions drawn over a diffraction image.
+
+    Parameters
+    ----------
+    positions : array-like of float
+        (N, 2) aperture positions in (row, col) pixels of `image`.
+    image : array-like, optional
+        Background image, such as the mean pattern or the Bragg vector map.
+    radius : float, optional
+        Draw each aperture as a circle of this radius in pixels. None draws
+        markers of size `marker_size`.
+    positions_removed : array-like of float, optional
+        (M, 2) positions drawn in `color_removed`, for example the apertures
+        removed by aperture_array_subtract.
+    color, color_removed : matplotlib color
+        Colors of the kept and removed apertures.
+    marker_size : float, default=60
+        Marker size in points squared, used when radius is None.
+    figax : (Figure, Axes), optional
+        Axes to draw into.
+    **show_kwargs :
+        Passed to quantem.core.visualization.show_2d, for example
+        norm={"power": 0.5}.
+
+    Returns
+    -------
+    fig, ax
+    """
+    from quantem.core.visualization import show_2d
+
+    if image is not None:
+        show_kwargs.setdefault("axsize", (6, 6))
+        fig, ax = show_2d(np.asarray(image), figax=figax, **show_kwargs)
+    elif figax is not None:
+        fig, ax = figax
+    else:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.set_aspect("equal")
+        ax.invert_yaxis()
+
+    def draw(p, c):
+        p = np.atleast_2d(np.asarray(p, dtype=np.float64))
+        if p.size == 0:
+            return
+        if radius is None:
+            ax.scatter(p[:, 1], p[:, 0], s=marker_size, color=c, alpha=0.5, lw=0)
+        else:
+            ax.add_collection(
+                EllipseCollection(
+                    widths=2.0 * radius,
+                    heights=2.0 * radius,
+                    angles=0,
+                    units="xy",
+                    facecolors=c,
+                    alpha=0.4,
+                    offsets=p[:, ::-1],
+                    offset_transform=ax.transData,
+                )
+            )
+
+    if positions_removed is not None:
+        draw(positions_removed, color_removed)
+    draw(positions, color)
+    return fig, ax
+
+
+# --------------------------------------------------------------------------- #
+# Polar selection
+# --------------------------------------------------------------------------- #
+
+
+def _polar_coordinates(peaks, q_fields=None, center=(0.0, 0.0)):
+    """(qr, qphi) of every flattened row, with qphi in degrees."""
+    q = _q_coordinates(peaks, q_fields, center)
+    qr = np.hypot(q[:, 0], q[:, 1])
+    qphi = np.degrees(np.arctan2(-q[:, 0], q[:, 1]))
+    return qr, qphi
+
+
+def add_polar_fields(
+    peaks,
+    q_fields=None,
+    center=(0.0, 0.0),
+    names: tuple[str, str] = ("qr", "qphi"),
+):
+    """Copy of the peaks with polar coordinate fields added.
+
+    The radius qr has the units of the diffraction coordinates. The angle
+    qphi is in degrees, measured anticlockwise from the +col (right) direction
+    as the pattern is displayed with rows increasing downward, over the range
+    (-180, 180].
+
+    Parameters
+    ----------
+    peaks : Vector
+        Peaks with one cell per probe position.
+    q_fields : (str, str), optional
+        Diffraction coordinate fields.
+    center : array-like of float, default=(0, 0)
+        (2,) origin of the polar coordinates, normally the direct beam.
+    names : (str, str), default=("qr", "qphi")
+        Names of the new fields.
+
+    Returns
+    -------
+    Vector
+    """
+    q_fields = _resolve_q_fields(peaks, q_fields)
+    qr, qphi = _polar_coordinates(peaks, q_fields, center)
+    q_unit = peaks.units[peaks.fields.index(q_fields[0])]
+    out = peaks.copy()
+    out.add_fields(list(names), values=np.stack([qr, qphi], axis=1), units=[q_unit, "deg"])
+    return out
+
+
+def polar_mask(
+    peaks,
+    q_radius: float,
+    tol: float = 1.0,
+    phi_range: tuple[float, float] | None = None,
+    q_fields=None,
+    center=(0.0, 0.0),
+) -> np.ndarray:
+    """Peaks inside a ring, optionally restricted to a range of angles.
+
+    Parameters
+    ----------
+    peaks : Vector
+        Peaks with one cell per probe position.
+    q_radius : float
+        Ring radius, in the units of the diffraction coordinates.
+    tol : float, default=1.0
+        Half width of the ring: peaks with |qr - q_radius| <= tol are kept.
+    phi_range : (float, float), optional
+        Angular range (phi_0, phi_1) in degrees, using the qphi convention of
+        add_polar_fields. Peaks with phi_0 <= qphi < phi_1 are kept. When
+        phi_0 > phi_1 the range wraps through 180 degrees.
+    q_fields : (str, str), optional
+        Diffraction coordinate fields.
+    center : array-like of float, default=(0, 0)
+        (2,) origin of the polar coordinates.
+
+    Returns
+    -------
+    np.ndarray
+        (N,) bool mask aligned with the flattened rows of `peaks`.
+    """
+    qr, qphi = _polar_coordinates(peaks, q_fields, center)
+    mask = np.abs(qr - q_radius) <= tol
+    if phi_range is not None:
+        phi_0, phi_1 = phi_range
+        if phi_0 <= phi_1:
+            mask &= (qphi >= phi_0) & (qphi < phi_1)
+        else:
+            mask &= (qphi >= phi_0) | (qphi < phi_1)
+    return mask
+
+
+def radial_ddf_image(
+    peaks,
+    q_radius: float,
+    tol: float = 1.0,
+    phi_range: tuple[float, float] | None = None,
+    q_fields=None,
+    center=(0.0, 0.0),
+    intensity_field: str = "intensity",
+) -> np.ndarray:
+    """Digital dark field image from a ring of diffraction space.
+
+    Equivalent to ddf_image(peaks, polar_mask(peaks, q_radius, tol, phi_range)).
+    See polar_mask for the parameters.
+
+    Returns
+    -------
+    np.ndarray
+        (scan_row, scan_col) image.
+    """
+    mask = polar_mask(
+        peaks, q_radius, tol=tol, phi_range=phi_range, q_fields=q_fields, center=center
+    )
+    return ddf_image(peaks, mask, intensity_field=intensity_field)
+
+
+# --------------------------------------------------------------------------- #
+# Clustering
+# --------------------------------------------------------------------------- #
 
 
 def cluster_coms(
@@ -97,11 +556,52 @@ def ddf_images(
     rc = _scan_cells(labeled)
     R, C = labeled.shape[:2]
 
+    cluster_ids = np.atleast_1d(cluster_ids)
     out = np.zeros((len(cluster_ids), R, C))
-    for i, k in enumerate(np.atleast_1d(cluster_ids)):
+    for i, k in enumerate(cluster_ids):
         m = labels == k
         np.add.at(out[i], (rc[m, 0], rc[m, 1]), inten[m])
     return out
+
+
+def assign_grain_labels(
+    labeled,
+    grain_labels,
+    label_field: str = "cluster",
+    grain_field: str = "grain_label",
+):
+    """Copy of the L1-labeled peaks with the L2 grain of every peak added.
+
+    Parameters
+    ----------
+    labeled : Vector
+        Peaks carrying L1 cluster labels (from cluster_vector).
+    grain_labels : array-like of int
+        (K,) L2 grain label of each L1 cluster, for example
+        dbscan(cluster_coms(labeled)[0], ...).
+    label_field : str, default="cluster"
+        Field holding the L1 cluster labels.
+    grain_field : str, default="grain_label"
+        Name of the new field.
+
+    Returns
+    -------
+    Vector
+        Copy of `labeled` with `grain_field` added. Peaks outside every L1
+        cluster get -2, and peaks whose L1 cluster joined no grain get -1.
+    """
+    l1 = labeled.select_fields(label_field).numpy()[:, 0].astype(int)
+    grain_labels = np.asarray(grain_labels, dtype=int)
+    grains = np.where(l1 >= 0, grain_labels[l1.clip(min=0)], -2)
+
+    out = labeled.copy()
+    out.add_fields(grain_field, values=grains[:, None], units="index")
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Display
+# --------------------------------------------------------------------------- #
 
 
 def composite_ddf(
@@ -128,13 +628,10 @@ def composite_ddf(
     np.ndarray
         (R, C, 3) RGB image in [0, 1].
     """
-
     K = images.shape[0]
     if colors is None:
         hues = np.linspace(0, 1, K, endpoint=False)
-        colors = hsv_to_rgb(
-            np.stack([hues, np.ones(K), np.ones(K)], axis=1)
-        )
+        colors = hsv_to_rgb(np.stack([hues, np.ones(K), np.ones(K)], axis=1))
     colors = np.asarray(colors, dtype=float)
 
     if normalize == "global":
@@ -147,142 +644,99 @@ def composite_ddf(
 
 
 def color_wheel(n: int = 256, saturation: float = 1.0) -> np.ndarray:
-    """
-    (n, n, 4) RGBA hue wheel for labeling composite images.
+    """Hue wheel for labeling composite images.
 
     Parameters
-    n: int
-        Size of the output image.
-    saturation: float
-        Saturation of the hue wheel (0=gray, 1=full color).
+    ----------
+    n : int, default=256
+        Size of the output image in pixels.
+    saturation : float, default=1.0
+        Saturation of the hues, from 0 (gray) to 1 (full color).
 
     Returns
     -------
     np.ndarray
-        (n, n, 4) RGBA image in [0, 1].
+        (n, n, 4) RGBA image in [0, 1], transparent outside the wheel.
     """
-     
-
     y, x = np.mgrid[-1 : 1 : n * 1j, -1 : 1 : n * 1j]
     r = np.hypot(x, y)
     hue = (np.arctan2(y, x) / (2 * np.pi)) % 1.0
-    hsv = np.stack(
-        [hue, np.full_like(hue, saturation), np.clip(r, 0, 1)], axis=-1
-    )
-    rgba = np.concatenate(
-        [hsv_to_rgb(hsv), (r <= 1.0)[..., None].astype(float)], axis=-1
-    )
+    hsv = np.stack([hue, np.full_like(hue, saturation), np.clip(r, 0, 1)], axis=-1)
+    rgba = np.concatenate([hsv_to_rgb(hsv), (r <= 1.0)[..., None].astype(float)], axis=-1)
     return rgba
 
 
 def plot_cluster_scatter(
     labeled,
-    q_fields=("qx", "qy"),
+    q_fields=None,
     label_field: str = "cluster",
-    specific_cluster: int | None = None,
+    specific_cluster: int | Sequence[int] | None = None,
     max_clusters: int | None = None,
     show_unclustered: bool = True,
     point_size: float = 2.0,
     alpha: float = 0.2,
     figax=None,
 ):
-    """
-    All peaks in diffraction space, colored by cluster (unclustered in gray).
+    """All peaks in diffraction space, colored by cluster.
 
     Parameters
     ----------
     labeled : Vector
-        Labeled diffraction data.
-    q_fields: tuple of str
-        Field names for the diffraction-space coordinates to plot.
-    label_field: str
-        Field name for the cluster label.
-    specific_cluster: int | None
-        If given, plot only this cluster (unclustered points are not shown).
-    max_clusters: int | None
-        Maximum number of clusters to plot (for large datasets).
-    show_unclustered: bool
-        Whether to show unclustered points (label < 0) in gray.
-    point_size: float
-        Size of the scatter points.
-    alpha: float
-        Transparency of the scatter points.  Recommended to be << 1.0 for large datasets so only dense
-        regions are visible.
-    figax: tuple of (matplotlib.figure.Figure, matplotlib.axes.Axes) | None
-        If provided, plot into this figure and axes instead of creating a new one.
+        Peaks carrying a label field.
+    q_fields : (str, str), optional
+        Diffraction coordinate fields, drawn as (vertical, horizontal).
+    label_field : str, default="cluster"
+        Field holding the labels, for example "grain_label" from
+        assign_grain_labels.
+    specific_cluster : int or sequence of int, optional
+        Draw only these clusters, in one color, without the unclustered peaks.
+    max_clusters : int, optional
+        Draw only the first max_clusters clusters (the largest, since dbscan
+        sorts clusters by size).
+    show_unclustered : bool, default=True
+        Draw the peaks with a negative label in gray.
+    point_size : float, default=2.0
+        Marker size.
+    alpha : float, default=0.2
+        Marker opacity. Values well below 1 show the dense regions of large
+        datasets.
+    figax : (Figure, Axes), optional
+        Axes to draw into.
 
     Returns
     -------
-    fig: matplotlib.figure.Figure
-        The figure containing the scatter plot.
-    ax: matplotlib.axes.Axes
-        The axes containing the scatter plot.
+    fig, ax
     """
-
-    fields = labeled.fields
-    flat = labeled.numpy().astype(np.float64)
-    labels = flat[:, fields.index(label_field)].astype(int)
-    qx = flat[:, fields.index(q_fields[0])]
-    qy = flat[:, fields.index(q_fields[1])]
+    q_fields = _resolve_q_fields(labeled, q_fields)
+    q = labeled.select_fields(*q_fields).numpy().astype(np.float64)
+    labels = labeled.select_fields(label_field).numpy()[:, 0].astype(int)
+    q0, q1 = q[:, 0], q[:, 1]
 
     if figax is None:
         fig, ax = plt.subplots(figsize=(6.5, 6.5))
     else:
         fig, ax = figax
-    q_max = np.max(np.abs([qx, qy]))*1.05
+    q_max = 1.05 * float(np.abs(q).max()) if q.size else 1.0
     ax.set_xlim(-q_max, q_max)
-    ax.set_ylim(-q_max, q_max)
+    ax.set_ylim(q_max, -q_max)
     ax.set_aspect("equal")
-    ax.invert_yaxis()
-    ax.set_xlabel("$q_y$")
-    ax.set_ylabel("$q_x$")
+    ax.set_xlabel(q_fields[1])
+    ax.set_ylabel(q_fields[0])
 
     if specific_cluster is not None:
-        m = labels == specific_cluster
-        ax.scatter(qy[m], qx[m], s=point_size, color="C0", lw=0, alpha=alpha)
+        m = np.isin(labels, np.atleast_1d(specific_cluster))
+        ax.scatter(q1[m], q0[m], s=point_size, color="C0", lw=0, alpha=alpha)
         return fig, ax
-    
+
     if show_unclustered:
         m = labels < 0
-        ax.scatter(qy[m], qx[m], s=point_size, color="0.85", lw=0)
+        ax.scatter(q1[m], q0[m], s=point_size, color="0.85", lw=0)
     n = labels.max() + 1
-    ids = range(n if max_clusters is None else min(n, max_clusters))
+    n_show = n if max_clusters is None else min(n, max_clusters)
     cmap = plt.get_cmap("hsv")
     rng = np.random.default_rng(0)
-    hues = rng.permutation(np.linspace(0, 1, len(list(ids)), endpoint=False))
-    for k in ids:
+    hues = rng.permutation(np.linspace(0, 1, n_show, endpoint=False))
+    for k in range(n_show):
         m = labels == k
-        ax.scatter(qy[m], qx[m], s=point_size, color=cmap(hues[k]), lw=0, alpha=alpha)
+        ax.scatter(q1[m], q0[m], s=point_size, color=cmap(hues[k]), lw=0, alpha=alpha)
     return fig, ax
-
-def assign_grain_labels(L1, L2_labels,label_field: str = "cluster"):
-    """Assign L2 grain labels to L1 clusters based on their centers of mass.
-
-    Parameters
-    ----------
-    L1 : Vector
-        Labeled diffraction data with L1 cluster labels.
-    L2_labels : np.ndarray
-        (K,) array of L2 grain labels corresponding to each L1 cluster.
-
-    Returns
-    -------
-    L2 : Vector
-        Labeled diffraction data with L2 grain labels assigned.
-    L2_labels : np.ndarray
-        Updated array of L2 grain labels.
-    """
-    fields = L1.fields
-    flat = L1.flatten()
-    L1_labels = flat[:, fields.index(label_field)].astype(int)
-    L1_unique = np.unique(L1_labels)
-
-    L1_to_L2 = np.insert(L2_labels,0,-2)
-    mapper = dict(zip(L1_unique, L1_to_L2))
-    L2_labels_full = np.array([mapper[label] for label in L1_labels])
-    
-    L2 = L1.copy()
-    L2.add_fields("grain_label", values = L2_labels_full)
-    
-    # Return the new Vector with L2 labels
-    return L2
