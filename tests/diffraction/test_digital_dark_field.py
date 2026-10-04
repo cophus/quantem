@@ -84,3 +84,32 @@ def test_assign_grain_labels():
     out = ddf.assign_grain_labels(labeled, grain_labels=np.array([3, -1, 4]))
     grains = out.select_fields("grain_label").numpy()[:, 0]
     np.testing.assert_array_equal(grains, [3, 3, -1, -1, -2, 4, 4, 4, -2])
+
+
+def test_fit_lattice_and_group_images():
+    rng = np.random.default_rng(0)
+    g1, g2 = np.array([20.0, 3.0]), np.array([4.0, 21.0])
+    nested = []
+    for r in range(3):
+        row = []
+        for c in range(3):
+            n = np.array([[i, j] for i in (-2, -1, 0, 1, 2) for j in (-2, -1, 0, 1, 2)], float)
+            q = n @ np.stack([g1, g2]) + rng.normal(0, 0.2, (len(n), 2))
+            row.append(np.concatenate([q, np.ones((len(n), 1))], axis=1))
+        nested.append(row)
+    peaks = Vector.from_data(nested, fields=["q_row", "q_col", "intensity"])
+    f1, f2 = ddf.fit_lattice(
+        peaks, (19.0, 2.0), (5.0, 20.0), radius=4.0, n1_range=(-2, 2), n2_range=(-2, 2)
+    )
+    np.testing.assert_allclose(f1, g1, atol=0.1)
+    np.testing.assert_allclose(f2, g2, atol=0.1)
+
+    a = np.zeros((4, 4))
+    a[:2] = 1
+    b = np.zeros((4, 4))
+    b[2:] = 1
+    images = np.stack([a, 2 * a, a + 0.05 * b, b, 3 * b, np.eye(4)])
+    labels = ddf.group_ddf_images(images, min_correlation=0.9)
+    assert labels[0] == labels[1] == labels[2] >= 0
+    assert labels[3] == labels[4] >= 0 and labels[3] != labels[0]
+    assert labels[5] == -1

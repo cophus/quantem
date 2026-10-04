@@ -7,16 +7,17 @@ the peaks in three ways, following MacLaren and co-workers
 
 - Virtual apertures: peaks within a radius of a set of aperture positions,
   usually a lattice built from two reciprocal lattice vectors
-  (aperture_array, aperture_array_subtract, aperture_ddf_image).
+  (fit_lattice, aperture_array, aperture_array_subtract, aperture_ddf_image).
 - Polar selection: peaks within a ring of radius q, optionally restricted to
   a range of azimuthal angles (add_polar_fields, polar_mask,
   radial_ddf_image).
 - Clustering: DBSCAN in the joint (diffraction, scan) space groups the peaks
-  into single-spot, single-crystallite clusters (L1), clustering the
-  real-space centers of mass of those clusters groups the spots of each grain
-  (L2), and clustering the remaining peaks in diffraction space alone
-  isolates ring-like nanocrystalline or amorphous components (L3)
-  (cluster_coms, ddf_images, assign_grain_labels).
+  into single-spot, single-crystallite clusters (L1), clustering either the
+  real-space centers of mass or the dark field images of those clusters
+  groups the spots of each grain (L2), and clustering the remaining peaks in
+  diffraction space alone isolates ring-like nanocrystalline or amorphous
+  components (L3) (ddf_images, cluster_coms, group_ddf_images,
+  assign_grain_labels).
 
 All functions read the peaks from a Vector with one cell per probe position.
 The diffraction coordinates are given by `q_fields`, which defaults to
@@ -191,6 +192,85 @@ def aperture_array(
             & (positions[:, 1] < shape[1] - edge)
         )
     return positions[keep]
+
+
+def fit_lattice(
+    peaks,
+    g1,
+    g2,
+    center=(0.0, 0.0),
+    radius: float = 6.0,
+    n1_range: tuple[int, int] = (-5, 5),
+    n2_range: tuple[int, int] = (-5, 5),
+    num_iterations: int = 3,
+    q_fields=None,
+    intensity_field: str = "intensity",
+):
+    """Refine two lattice vectors against the peaks of every probe position.
+
+    For each lattice point n1 g1 + n2 g2 (excluding the origin) we take the
+    intensity-weighted mean position of all peaks within `radius` of it,
+    summed over the scan, then solve for g1 and g2 by weighted least squares
+    with each point weighted by its summed intensity. Repeating this a few
+    times lets the fit follow lattice points that start near the edge of
+    `radius`. The lattice with the most total intensity dominates, so the
+    starting vectors should be close to the orientation of interest.
+
+    Parameters
+    ----------
+    peaks : Vector
+        Peaks with one cell per probe position.
+    g1, g2 : array-like of float
+        (2,) starting lattice vectors.
+    center : array-like of float, default=(0, 0)
+        (2,) lattice origin, held fixed.
+    radius : float, default=6.0
+        Search radius around each lattice point.
+    n1_range, n2_range : (int, int), default=(-5, 5)
+        Inclusive range of lattice multiples used in the fit.
+    num_iterations : int, default=3
+        Number of search and fit passes.
+    q_fields : (str, str), optional
+        Diffraction coordinate fields.
+    intensity_field : str, default="intensity"
+        Field used as the weight of each peak.
+
+    Returns
+    -------
+    g1, g2 : np.ndarray
+        (2,) refined lattice vectors.
+    """
+    q = _q_coordinates(peaks, q_fields, center)
+    w = peaks.select_fields(intensity_field).numpy()[:, 0].astype(np.float64).clip(min=0)
+    n1, n2 = np.meshgrid(
+        np.arange(n1_range[0], n1_range[1] + 1),
+        np.arange(n2_range[0], n2_range[1] + 1),
+        indexing="ij",
+    )
+    n = np.stack([n1.ravel(), n2.ravel()], axis=1)
+    n = n[np.any(n != 0, axis=1)].astype(np.float64)
+
+    g = np.stack([np.asarray(g1, dtype=np.float64), np.asarray(g2, dtype=np.float64)])
+    order = np.argsort(q[:, 0])
+    q_sorted, w_sorted = q[order], w[order]
+    for _ in range(num_iterations):
+        targets = n @ g
+        means = np.full_like(targets, np.nan)
+        weights = np.zeros(targets.shape[0])
+        for k, t in enumerate(targets):
+            # peaks sorted along the first coordinate, so each search is a slice
+            i0, i1 = np.searchsorted(q_sorted[:, 0], [t[0] - radius, t[0] + radius])
+            qs, ws = q_sorted[i0:i1], w_sorted[i0:i1]
+            m = ((qs - t[None, :]) ** 2).sum(axis=1) <= radius**2
+            if ws[m].sum() > 0:
+                weights[k] = ws[m].sum()
+                means[k] = (qs[m] * ws[m, None]).sum(axis=0) / weights[k]
+        ok = weights > 0
+        if ok.sum() < 2:
+            raise ValueError("Fewer than two lattice points have peaks within radius.")
+        sw = np.sqrt(weights[ok])[:, None]
+        g, *_ = np.linalg.lstsq(n[ok] * sw, means[ok] * sw, rcond=None)
+    return g[0], g[1]
 
 
 def aperture_array_subtract(
@@ -599,6 +679,46 @@ def assign_grain_labels(
     return out
 
 
+def group_ddf_images(
+    images: np.ndarray,
+    min_correlation: float = 0.7,
+    min_samples: int = 2,
+    device: str = "cpu",
+) -> np.ndarray:
+    """Group DDF images that show the same region of the sample.
+
+    The spots of one grain or lath share the same dark field image, so we
+    cluster the images by their cosine similarity. Each image is normalized
+    to unit length, and DBSCAN runs with eps = sqrt(2 (1 - min_correlation)),
+    so that neighbors have a cosine similarity of at least min_correlation.
+    Unlike clustering the centers of mass (cluster_coms), this separates
+    grains that extend across the whole field of view, such as a matrix
+    phase.
+
+    Parameters
+    ----------
+    images : np.ndarray
+        (K, R, C) DDF images, for example ddf_images(labeled, range(K)).
+    min_correlation : float, default=0.7
+        Cosine similarity between neighboring images, from 0 to 1.
+    min_samples : int, default=2
+        DBSCAN min_samples, counting the image itself.
+    device : str, default="cpu"
+        Torch device for the distance computations.
+
+    Returns
+    -------
+    np.ndarray
+        (K,) group label of each image, -1 for images that joined no group.
+        Groups are numbered largest first.
+    """
+    K = images.shape[0]
+    v = images.reshape(K, -1).astype(np.float64)
+    v = v / np.maximum(np.linalg.norm(v, axis=1, keepdims=True), 1e-12)
+    eps = float(np.sqrt(2.0 * (1.0 - min_correlation)))
+    return dbscan(v, eps=eps, min_samples=min_samples, device=device)
+
+
 # --------------------------------------------------------------------------- #
 # Display
 # --------------------------------------------------------------------------- #
@@ -675,6 +795,7 @@ def plot_cluster_scatter(
     show_unclustered: bool = True,
     point_size: float = 2.0,
     alpha: float = 0.2,
+    center=None,
     figax=None,
 ):
     """All peaks in diffraction space, colored by cluster.
@@ -700,6 +821,9 @@ def plot_cluster_scatter(
     alpha : float, default=0.2
         Marker opacity. Values well below 1 show the dense regions of large
         datasets.
+    center : array-like of float, optional
+        (2,) diffraction origin at the middle of the plot. Defaults to the
+        "origin_ref" stored by BraggVectors.correct_peak_origins, or (0, 0).
     figax : (Figure, Axes), optional
         Axes to draw into.
 
@@ -708,6 +832,9 @@ def plot_cluster_scatter(
     fig, ax
     """
     q_fields = _resolve_q_fields(labeled, q_fields)
+    if center is None:
+        center = labeled.metadata.get("origin_ref", (0.0, 0.0))
+    center = np.asarray(center, dtype=np.float64)
     q = labeled.select_fields(*q_fields).numpy().astype(np.float64)
     labels = labeled.select_fields(label_field).numpy()[:, 0].astype(int)
     q0, q1 = q[:, 0], q[:, 1]
@@ -716,9 +843,9 @@ def plot_cluster_scatter(
         fig, ax = plt.subplots(figsize=(6.5, 6.5))
     else:
         fig, ax = figax
-    q_max = 1.05 * float(np.abs(q).max()) if q.size else 1.0
-    ax.set_xlim(-q_max, q_max)
-    ax.set_ylim(q_max, -q_max)
+    q_max = 1.05 * float(np.abs(q - center[None, :]).max()) if q.size else 1.0
+    ax.set_xlim(center[1] - q_max, center[1] + q_max)
+    ax.set_ylim(center[0] + q_max, center[0] - q_max)
     ax.set_aspect("equal")
     ax.set_xlabel(q_fields[1])
     ax.set_ylabel(q_fields[0])
