@@ -113,10 +113,13 @@ def test_warren_cowley_random_is_near_zero(rmc):
     assert np.all(np.abs(sro["alpha"]) < 0.35)
 
 
-def test_refine_tilts_runs(rmc):
-    rmc.refine_tilts(max_tilt_deg=0.5, step_deg=0.25, verbose=False)
-    rmc.refine_tilts(max_tilt_deg=0.5, step_deg=0.25, max_grid=rmc.grid_size // 2, verbose=False)
-    assert all(np.rad2deg(np.linalg.norm(t)) <= 0.6 for t in rmc.geometry["tilts"])
+def test_coarse_diffuse_grid_matches_sections(rmc):
+    fine = rmc.diffuse_grid()
+    coarse = rmc.diffuse_grid(max_size=rmc.grid_size // 2)
+    assert coarse.shape[0] == fine.shape[0] // 2
+    a, _, d = rmc.diffuse_section((0, 0, 1), extent=1.0, grid=fine)
+    b, _, _ = rmc.diffuse_section((0, 0, 1), extent=1.0, grid=coarse)
+    assert np.allclose(a[d > 0.2], b[d > 0.2], rtol=1e-4)  # no displacements: identical
 
 
 def test_mask_is_zero_on_bragg_peaks(rmc):
@@ -175,17 +178,6 @@ def test_static_b_cap_holds(rmc):
     assert len(rmc._omega_vectors) == 16  # two amplitudes x eight <111> senses
 
 
-def test_omega_chain_repeats_along_one_row(rmc):
-    sites, new = rmc._omega_proposals(2, repeats=2)
-    assert sites.shape[1] == 6
-    assert np.array_equal(new[:, :3], new[:, 3:])
-    xc = rmc.site_x[sites] // rmc.refine
-    n = rmc.cells * 2
-    steps = np.mod(np.diff(xc, axis=1), n)
-    steps = np.where(steps > n // 2, steps - n, steps)
-    assert np.all(steps == steps[:, :1])  # one straight <111> row
-
-
 def test_size_effect_chi_is_odd_about_bragg_nodes(rmc):
     a = rmc.lattice_parameter
     g = np.array([1.0, 1.0, 0.0]) / a  # allowed BCC reflection
@@ -203,3 +195,29 @@ def test_size_effect_radii_orders_species(rmc):
     eta = dict(zip(rmc.species, rmc.size_eta))
     assert eta["V"] < eta["Nb"] < eta["Zr"]
     assert abs((rmc.concentrations * rmc.size_eta).sum()) < 1e-12
+
+
+def test_autoserialize_round_trip_rebuilds_model(rmc, tmp_path):
+    from quantem.core.io import load
+
+    rmc.envelope = "fitted"
+    rmc._setup_forward()
+    rmc._solve_linear(rmc._model_diffuse())
+    loss = rmc._update_residual()
+    model = rmc.model_images()
+    path = tmp_path / "rmc.zip"
+    rmc.save(path, mode="o", skip=rmc.DERIVED_ATTRIBUTES)
+    back = load(path)
+    assert back._update_residual() == pytest.approx(loss, rel=1e-5)
+    for a, b in zip(model, back.model_images()):
+        assert np.allclose(a, b, rtol=1e-4, atol=1e-6)
+    assert np.array_equal(back.species_index, rmc.species_index)
+
+
+def test_displacement_correlations_see_omega(rmc):
+    sites, new = rmc._omega_proposals(8)
+    rmc.displacement[sites.reshape(-1)] = new.reshape(-1, 3)
+    c = rmc.displacement_correlations(n_shells=2)
+    assert c["longitudinal"][0] < 0  # collapsing nearest-neighbour pairs move toward each other
+    dist = rmc.displacement_distributions()
+    assert set(dist) == {"<100>", "<110>", "<111>"}

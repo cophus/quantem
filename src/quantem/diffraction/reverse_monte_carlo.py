@@ -11,11 +11,10 @@ and omega embryos (three consecutive atoms of a <111> row, the last two
 collapsed toward each other by a/12); each changes ``F`` by a few phase
 factors, so every move is scored exactly without recomputing the supercell.
 
-Bragg peaks and the direct-beam bloom are excluded by sigmoid weights; a
-smooth background (constant, direct-beam Lorentzian, a wide Gaussian about
-the zone-axis pole, Einstein thermal diffuse, phonon halos about each
-reflection, powder rings and the Bragg cores blurred by the detector's point
-spread) and the diffuse scale are solved in closed form.
+Bragg peaks with their tails and the direct-beam bloom are masked by sigmoid
+weights; a smooth background (constant, direct-beam Lorentzian, a wide
+Gaussian about the zone-axis pole, Einstein thermal diffuse and powder rings)
+and the diffuse envelope are solved in closed form.
 
 Electrons barely separate species of neighbouring atomic number (Nb and Zr
 differ by a few percent in scattering factor), so their relative arrangement
@@ -158,6 +157,34 @@ class ReverseMonteCarlo(AutoSerialize):
         ny, nx = (a.shape[0] // b) * b, (a.shape[1] // b) * b
         out = a[:ny, :nx].reshape(ny // b, b, nx // b, b).sum(axis=(1, 3))
         return out / b**2 if reduce == "mean" else out
+
+    # rebuilt from the saved state by _post_load: pass as ``skip`` to ``save`` to keep files small
+    DERIVED_ATTRIBUTES = (
+        "_W_all", "_Wc", "_Wv", "_sym_index", "_needed", "_used", "_h_needed", "_cos", "_sin",
+        "_Fr", "_Fi", "_fs", "_keep", "_u", "_u_all", "_y", "_w", "_y_all", "_w_all", "_img",
+        "_fit", "_r", "_bg", "_scale", "_basis_all", "_pix_image", "_env_cols", "_site_lookup",
+    )  # fmt: skip
+
+    def _post_load(self) -> None:
+        """AutoSerialize hook: rebuild the derived arrays skipped at save time."""
+        if getattr(self, "site_x", None) is None or hasattr(self, "_W_all"):
+            return
+        self.device = torch.device(_default_device())
+        nc = self.cells * self.grid_divisor
+        self._site_lookup = np.full((nc,) * 3, -1, dtype=np.int64)
+        xc = self.site_x // self.refine
+        self._site_lookup[xc[:, 0], xc[:, 1], xc[:, 2]] = np.arange(len(self.site_x))
+        env_p = getattr(self, "_env_p", None)
+        self._setup_forward()
+        if self.envelope == "fitted" and env_p is not None:
+            self._env_p = list(env_p)
+            self._u_all = np.concatenate(
+                [self._env_cols[i] @ np.asarray(self._env_p[i]) for i in range(len(self.images))]
+            )
+            self._u = torch.as_tensor(
+                self._u_all[self._fit], dtype=torch.float32, device=self.device
+            )
+            self._update_residual()
 
     # ------------------------------------------------------------------ crystal
 
@@ -440,6 +467,173 @@ class ReverseMonteCarlo(AutoSerialize):
         )
         return sol.x[:2], float(np.exp(sol.x[2]))
 
+    def _orientation_quat(self, i: int, tilt: np.ndarray) -> torch.Tensor:
+        """Quaternion rotating crystal vectors into the lab frame of pattern i at a tilt.
+
+        The zone axis is turned toward ``(tilt_x, tilt_y, 1)``, which puts the Bloch excitation
+        errors on the same Laue circle as the diffuse model's Ewald sphere."""
+        from quantem.diffraction.rotations import quat_from_matrix
+
+        n = np.array([tilt[0], tilt[1], 1.0])
+        n /= np.linalg.norm(n)
+        z = np.array([0.0, 0.0, 1.0])
+        axis = np.cross(z, n)
+        s_ang, c_ang = np.linalg.norm(axis), n[2]
+        if s_ang < 1e-12:
+            rot = np.eye(3)
+        else:
+            k = axis / s_ang
+            kx = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+            rot = np.eye(3) + s_ang * kx + (1 - c_ang) * kx @ kx
+        u = rot @ _zone_frame(self.zone_axes[i])
+        return quat_from_matrix(torch.as_tensor(u, dtype=torch.float64))
+
+    def _measured_bragg(self, i: int):
+        """Measured integrated intensities of pattern i: hkl (n, 3) with the direct beam first."""
+        hkl = np.asarray(self.geometry["bragg_hkl"][i])
+        meas = np.asarray(self.geometry["bragg_intensity"][i], dtype=float)
+        nz = np.linalg.norm(hkl, axis=1) > 0
+        hkl, meas = hkl[nz], meas[nz]
+        i000 = _integrate_spots(
+            self.images[i], self.geometry["centers"][i][None], 0.03 / self.sampling
+        )[0]
+        hkl = np.vstack([[0, 0, 0], hkl])
+        meas = np.concatenate([[i000], meas])
+        ok = np.isfinite(meas)
+        return hkl[ok].astype(int), np.clip(meas[ok], 0, None)
+
+    def fit_thickness(
+        self,
+        thickness: tuple[float, float] = (20.0, 1000.0),
+        step: float = 10.0,
+        tilt_range_deg: float = 0.6,
+        tilt_step_deg: float = 0.1,
+        k_max: float = 1.6,
+        depth_samples: int = 24,
+        verbose: bool = True,
+    ) -> dict:
+        """Bloch-wave thickness and tilt of every pattern from its Bragg intensities.
+
+        For each pattern, a grid of tilts about the current one and of thicknesses is scored by
+        comparing the Bloch exit intensities of the zone reflections with the measured
+        integrated intensities (each set normalized to unit sum, compared as square roots).
+        Absorptive (Weickenmeier-Kohl) structure factors of the average crystal are used. The
+        best thickness and tilt are stored, with each beam's intensity averaged over depth,
+        ``(1/t) int_0^t |phi_g(z)|^2 dz``: the beams that generate diffuse scattering inside
+        the foil, used by ``envelope="bloch"``.
+        """
+        from quantem.diffraction import bloch
+
+        crystal = self.crystal
+        crystal.calculate_structure_factors(2 * k_max)
+        crystal.calculate_dynamical_structure_factors(self.energy, k_max=2 * k_max)
+        t_grid = np.arange(thickness[0], thickness[1] + 1e-9, step)
+        geo = self.geometry
+        geo.setdefault("thickness", [np.nan] * len(self.images))
+        geo.setdefault("bloch_g", [None] * len(self.images))
+        geo.setdefault("bloch_p", [None] * len(self.images))
+        geo.setdefault("bloch_score", [None] * len(self.images))
+        results = {}
+        for i in range(len(self.images)):
+            hkl_m, meas = self._measured_bragg(i)
+            a_meas = np.sqrt(meas / meas.sum())
+            keys = {tuple(h): k for k, h in enumerate(hkl_m)}
+            tilt0 = np.asarray(geo["tilts"][i], dtype=float)
+            offs = np.deg2rad(np.arange(-tilt_range_deg, tilt_range_deg + 1e-9, tilt_step_deg))
+            best = (np.inf, None, None, None)
+            curves = {}
+            for dx in offs:
+                for dy in offs:
+                    tilt = tilt0 + np.array([dx, dy])
+                    out = bloch.dynamical_pattern(
+                        crystal, self._orientation_quat(i, tilt), t_grid, self.energy, k_max=k_max
+                    )
+                    calc = np.zeros((len(t_grid), len(hkl_m)))
+                    calc[:, keys[(0, 0, 0)]] = out["intensity_000"].numpy()
+                    for col, h in enumerate(out["hkl"].numpy().astype(int)):
+                        k = keys.get(tuple(h))
+                        if k is not None:
+                            calc[:, k] = out["intensity"][:, col].numpy()
+                    a_calc = np.sqrt(calc / calc.sum(1, keepdims=True))
+                    score = ((a_calc - a_meas[None]) ** 2).sum(1)
+                    curves[(dx, dy)] = score
+                    j = int(np.argmin(score))
+                    if score[j] < best[0]:
+                        best = (score[j], tilt, t_grid[j], (dx, dy))
+            score, tilt, t_best, key = best
+            # depth-averaged beam intensities at the best thickness and tilt
+            z = (np.arange(depth_samples) + 0.5) / depth_samples * t_best
+            out = bloch.dynamical_pattern(
+                crystal, self._orientation_quat(i, tilt), z, self.energy, k_max=k_max
+            )
+            frame = _zone_frame(self.zone_axes[i])
+            hkl_b = np.vstack([[0, 0, 0], out["hkl"].numpy()])
+            g_b = (
+                (hkl_b / self._a_crystal) @ frame[:2].T * self._a_crystal / self.lattice_parameter
+            )
+            p_b = np.concatenate(
+                [[out["intensity_000"].mean().item()], out["intensity"].mean(0).numpy()]
+            )
+            geo["tilts"][i] = tilt
+            geo["thickness"][i] = float(t_best)
+            geo["bloch_g"][i] = g_b
+            geo["bloch_p"][i] = p_b
+            geo["bloch_score"][i] = dict(thickness=t_grid, score=curves[key], best=float(score))
+            results[self.names[i]] = dict(
+                thickness=float(t_best), tilt_deg=float(np.rad2deg(np.linalg.norm(tilt)))
+            )
+            if verbose:
+                print(
+                    f"{self.names[i]}: thickness {t_best / 10:.0f} nm, tilt "
+                    f"{np.rad2deg(np.linalg.norm(tilt)):.2f} deg, misfit {score:.3f}"
+                )
+        return results
+
+    def plot_thickness(self, **kwargs):
+        """Bloch thickness fit per pattern: misfit against thickness (top) and measured against
+        calculated Bragg intensities at the best fit, square-root scale (bottom)."""
+        import matplotlib.pyplot as plt
+
+        from quantem.diffraction import bloch
+
+        n = len(self.images)
+        fig, axs = plt.subplots(2, n, figsize=kwargs.pop("figsize", (4.2 * n, 7.5)))
+        for i in range(n):
+            sc = self.geometry["bloch_score"][i]
+            ax = axs[0, i]
+            ax.plot(sc["thickness"] / 10, sc["score"], "k-")
+            t_best = self.geometry["thickness"][i]
+            ax.axvline(t_best / 10, color="tab:red", lw=1)
+            ax.set_xlabel("thickness (nm)")
+            ax.set_ylabel("misfit")
+            ax.set_title(f"{self.names[i]}: {t_best / 10:.0f} nm")
+            hkl_m, meas = self._measured_bragg(i)
+            out = bloch.dynamical_pattern(
+                self.crystal,
+                self._orientation_quat(i, self.geometry["tilts"][i]),
+                [t_best],
+                self.energy,
+                k_max=1.6,
+            )
+            lookup = {
+                tuple(h): v
+                for h, v in zip(out["hkl"].numpy().astype(int), out["intensity"][0].numpy())
+            }
+            lookup[(0, 0, 0)] = float(out["intensity_000"][0])
+            calc = np.array([lookup.get(tuple(h), 0.0) for h in hkl_m])
+            ax = axs[1, i]
+            x, y = np.sqrt(calc / calc.sum()), np.sqrt(meas / meas.sum())
+            ax.plot(x, y, "o", ms=4, color="tab:blue")
+            lim = 1.05 * max(x.max(), y.max())
+            ax.plot([0, lim], [0, lim], "k--", lw=0.8)
+            ax.set_xlim(0, lim)
+            ax.set_ylim(0, lim)
+            ax.set_aspect("equal")
+            ax.set_xlabel("Bloch sqrt(I)")
+            ax.set_ylabel("measured sqrt(I)")
+        fig.tight_layout()
+        return fig, axs
+
     def bragg_positions(self, i: int, k_max: float = 3.0) -> np.ndarray:
         """Detector positions (row, col) of every zone reflection, direct beam included."""
         _, g2, _ = self._zone_reflections(self.zone_axes[i], k_max)
@@ -462,14 +656,13 @@ class ReverseMonteCarlo(AutoSerialize):
 
     def set_mask(
         self,
-        bragg_radius: float = 0.08,
+        bragg_radius: float = 0.12,
         softness: float = 0.01,
         q_max: float = 1.2,
         center_radius: float = 0.25,
         edge_px: int = 8,
-        tail_widths: tuple[float, ...] = (0.02, 0.06, 0.15),
     ) -> "ReverseMonteCarlo":
-        """Diffuse-scattering weight, binned data, Bragg intensities and PSF tails.
+        """Diffuse-scattering weight, binned data and Bragg intensities.
 
         The weight is ``sigmoid((d - bragg_radius) / softness)``, with ``d``
         the distance (1/A) to the nearest reflection, the direct beam
@@ -479,18 +672,17 @@ class ReverseMonteCarlo(AutoSerialize):
         ``center_radius``. Each ``bin_factor`` square is reduced to its
         weighted mean.
 
-        Each reflection's integrated intensity weights the diffuse envelope.
-        The Bragg cores blurred by ``(1 + (r / width)^2)^-1.5`` kernels, one
-        per ``tail_widths`` (1/A), are background terms for the detector's
-        point-spread tails.
-        """
-        from scipy.signal import fftconvolve
+        The mask has to cover the peaks' tails (detector point spread and
+        near-peak scattering), which are not modelled: here they fall to a few
+        percent of the local diffuse level by 0.12 1/A.
 
+        Each reflection's integrated intensity weights the diffuse envelope.
+        """
         b = self.bin_factor
         out = dict(
             bragg_radius=bragg_radius, softness=softness, q_max=q_max, center_radius=center_radius
         )
-        out.update(y=[], w=[], k=[], data=[], scale=[], bragg_k=[], bragg_intensity=[], tails=[])
+        out.update(y=[], w=[], k=[], data=[], scale=[], bragg_k=[], bragg_intensity=[])
         for i, im in enumerate(self.images):
             ny, nx = (im.shape[0] // b) * b, (im.shape[1] // b) * b
             rows, cols = np.mgrid[0:ny, 0:nx].astype(np.float64)
@@ -531,17 +723,6 @@ class ReverseMonteCarlo(AutoSerialize):
             yb = np.where(wb > 0, self._binned(w * y, "sum") / np.maximum(wb, 1e-12), 0.0)
             rb, cb = np.mgrid[0 : ny // b, 0 : nx // b].astype(np.float64) * b + (b - 1) / 2
             norm = (wb * yb).sum() / wb.sum()
-            tails = []
-            for width in tail_widths:
-                gpx = width / self.sampling
-                half = int(min(6 * gpx, 200))
-                rr = np.hypot(*np.mgrid[-half : half + 1, -half : half + 1])
-                kern = (1 + (rr / gpx) ** 2) ** -1.5
-                t = fftconvolve(core_sig, kern / kern.sum(), mode="same")
-                tails.append(
-                    np.where(wb > 0, self._binned(w * t, "sum") / np.maximum(wb, 1e-12), 0.0)
-                    / norm
-                )
             out["y"].append(yb / norm)
             out["w"].append(wb / b**2)
             out["k"].append(self._q_zone(i, rb, cb))
@@ -549,7 +730,6 @@ class ReverseMonteCarlo(AutoSerialize):
             out["scale"].append(norm)
             out["bragg_k"].append(g_q[seen])
             out["bragg_intensity"].append(inten[seen] / norm)
-            out["tails"].append(np.stack(tails))
         self.mask = out
         return self
 
@@ -566,7 +746,6 @@ class ReverseMonteCarlo(AutoSerialize):
         envelope: str = "measured",
         resolution: float = 0.75,
         shared_scale: bool = True,
-        kikuchi: bool | int = False,
         max_beams: int = 40,
         device: str | None = None,
     ) -> "ReverseMonteCarlo":
@@ -594,7 +773,7 @@ class ReverseMonteCarlo(AutoSerialize):
             Average every pattern over the 24 cubic rotations of the supercell.
         debye_waller : float
             Isotropic B (A^2) damping the diffuse intensity.
-        envelope : {"measured", "fitted", "kinematic"}
+        envelope : {"measured", "fitted", "bloch", "kinematic"}
             "measured" redistributes the diffuse intensity over the Bragg
             beams of each pattern, ``sum_g P_g fbar^2(q - g) / fbar^2(q)``
             with P_g the integrated Bragg intensities (exact for occupational
@@ -603,8 +782,10 @@ class ReverseMonteCarlo(AutoSerialize):
             and re-solves the non-negative P_g of each pattern with its
             background: diffuse scattering is generated by the beams' depth
             averaged intensities, which dynamical diffraction makes differ
-            from their exit intensities. "kinematic" keeps only the direct
-            beam.
+            from their exit intensities. "bloch" takes the depth-averaged
+            Bloch-wave beam intensities at each pattern's fitted thickness and
+            tilt (``fit_thickness``), with one diffuse scale for all patterns.
+            "kinematic" keeps only the direct beam.
         resolution : float
             Gaussian sigma, in supercell reciprocal-grid steps, with which
             each pixel reads the diffuse grid (27 nearest points). A finite
@@ -614,13 +795,6 @@ class ReverseMonteCarlo(AutoSerialize):
         shared_scale : bool
             One diffuse scale for every pattern; the envelope carries each
             pattern's absolute Bragg intensities.
-        kikuchi : bool
-            Add Kikuchi bands to the background: for the three lowest-order
-            reflection families of each zone, a band interior and its edge
-            lines, ``|(q - pole) . g_hat| = |g| / 2`` about the zone-axis pole
-            ``-K tilt``, each with a free-signed amplitude (excess or
-            deficit). They follow the fitted tilt, so ``refine_tilts`` feels them.
-            An integer sets the number of families (True: 3).
         max_beams : int
             Strongest Bragg beams of each pattern in the diffuse envelope.
         device : str, optional
@@ -667,8 +841,6 @@ class ReverseMonteCarlo(AutoSerialize):
         self.envelope = envelope
         self.resolution = float(resolution)
         self.shared_scale = bool(shared_scale)
-        self.kikuchi = bool(kikuchi)
-        self._kikuchi_families = 3 if kikuchi is True else int(kikuchi)
         self.max_beams = int(max_beams)
         self.device = torch.device(device or _default_device())
         self._setup_forward()
@@ -699,11 +871,10 @@ class ReverseMonteCarlo(AutoSerialize):
         "Al": 1.43,
     }
 
-    def _pixel_grid(self, i: int, q2: np.ndarray, n: int | None = None):
+    def _pixel_grid(self, i: int, q2: np.ndarray):
         """Grid indices and weights (n, 8) trilinear, or (n, 27) Gaussian of ``resolution``
-        steps, for in-plane q of pattern i, on a grid of ``n`` points per edge (default the
-        supercell grid; the reciprocal sampling is the same on any coarser grid)."""
-        n = self.grid_size if n is None else n
+        steps, for in-plane q of pattern i."""
+        n = self.grid_size
         h = self._q_crystal(i, q2) * self.lattice_parameter * self.cells
         if self.resolution > 0:
             stencil = np.array(list(product((-1, 0, 1), repeat=3)))
@@ -735,14 +906,9 @@ class ReverseMonteCarlo(AutoSerialize):
             vals_w.append(wts)
             u, tds = self._envelope(i, q2)
             u_all.append(u)
-            tails = self.mask["tails"][i].reshape(len(self.mask["tails"][i]), -1).T
             qm = np.linalg.norm(q2, axis=1)
-            halos = self._phonon_halos(i, q2)
             rings = self._powder_rings(qm)
-            extra = [self._kikuchi(i, q2)] if getattr(self, "kikuchi", False) else []
-            basis_all.append(
-                np.column_stack([np.ones_like(qm), qm, q2, tds, halos, rings, tails, *extra])
-            )
+            basis_all.append(np.column_stack([np.ones_like(qm), qm, q2, tds, rings]))
             pix_image.append(np.full(len(q2), i))
         cols = np.concatenate(cols_w)
         vals = np.concatenate(vals_w)
@@ -813,6 +979,15 @@ class ReverseMonteCarlo(AutoSerialize):
                 c[:, :k] = self.coefficients[:, :k]
                 self.coefficients = c
             self._update_residual()
+
+    def set_envelope(self, envelope: str) -> "ReverseMonteCarlo":
+        """Switch the diffuse envelope ("fitted", "measured", "bloch", "kinematic") and refit the
+        scale and background for the current supercell."""
+        self.envelope = envelope
+        self._setup_forward()
+        self._solve_linear(self._model_diffuse(), refit_sigmas=True)
+        self._update_residual()
+        return self
 
     def _grid_factors(self, h: np.ndarray, n: int | None = None):
         """Scattering factors (K, n) of every species at grid points h (n, 3), and a 0/1 weight
@@ -981,7 +1156,14 @@ class ReverseMonteCarlo(AutoSerialize):
         Also stores the per-beam envelope columns ``fbar^2(q - g) / fbar^2(q) x DW(q)`` and the
         beam weights, which ``envelope="fitted"`` re-solves.
         """
-        if self.envelope in ("measured", "fitted"):
+        if self.envelope == "bloch":
+            g = self.geometry["bloch_g"][i]
+            p = self.geometry["bloch_p"][i]
+            if g is None:
+                raise RuntimeError("fit_thickness before envelope='bloch'")
+            order = np.argsort(p)[::-1][: getattr(self, "max_beams", 40)]
+            g, p = g[order], p[order]
+        elif self.envelope in ("measured", "fitted"):
             g = self.mask["bragg_k"][i]
             p = self.mask["bragg_intensity"][i]
             order = np.argsort(p)[::-1][: getattr(self, "max_beams", 40)]
@@ -1007,34 +1189,10 @@ class ReverseMonteCarlo(AutoSerialize):
         self._env_p[i] = p.astype(float)
         return cols @ p, tds
 
-    def _kikuchi(self, i: int, q2: np.ndarray, tilt: np.ndarray | None = None) -> np.ndarray:
-        """Kikuchi band interiors and edge lines (n, 2 * families) about the zone-axis pole."""
-        n_families = self._kikuchi_families
-        tilt = self.geometry["tilts"][i] if tilt is None else tilt
-        pole = -np.asarray(tilt) / self.wavelength
-        hkl, g2, _ = self._zone_reflections(self.zone_axes[i], 1.2)
-        g2 = g2 * self._a_crystal / self.lattice_parameter
-        gl = np.linalg.norm(g2, axis=1)
-        nz = gl > 1e-6
-        g2, gl = g2[nz], gl[nz]
-        radii = np.unique(np.round(gl, 3))[:n_families]
-        out = np.zeros((len(q2), 2 * len(radii)))
-        width = 0.015
-        for f, rad in enumerate(radii):
-            for g, length in zip(g2[np.abs(gl - rad) < 2e-3], gl[np.abs(gl - rad) < 2e-3]):
-                d = (q2 - pole) @ (g / length)
-                out[:, 2 * f] += _sigmoid((0.5 * length - np.abs(d)) / 0.01)
-                out[:, 2 * f + 1] += np.exp(-0.5 * ((np.abs(d) - 0.5 * length) / width) ** 2)
-        if len(radii) < n_families:
-            out = np.column_stack([out, np.zeros((len(q2), 2 * (n_families - len(radii))))])
-        return out
-
     def _bg_lower(self, n: int) -> np.ndarray:
         """Lower bounds of the background amplitudes: free sign for the constant and Kikuchi."""
         lo = np.zeros(n)
         lo[0] = -np.inf
-        if getattr(self, "kikuchi", False):
-            lo[-2 * self._kikuchi_families :] = -np.inf
         return lo
 
     def _powder_rings(self, q: np.ndarray, width: float = 0.025, k_max: float = 1.5) -> np.ndarray:
@@ -1049,20 +1207,6 @@ class ReverseMonteCarlo(AutoSerialize):
         for gi, fi in zip(g, f2):
             out += fi / gi**2 * np.exp(-0.5 * ((q - gi) / width) ** 2)
         return out / out.max()
-
-    def _phonon_halos(self, i: int, q2: np.ndarray, widths=(0.04, 0.12)) -> np.ndarray:
-        """Thermal diffuse halos about every Bragg spot: ``sum_g P_g k^2 / (|q - g|^2 + k^2)``
-        per width ``k`` (1/A), acoustic phonons concentrating TDS next to each reflection."""
-        g = self.mask["bragg_k"][i]
-        p = self.mask["bragg_intensity"][i]
-        nz = np.linalg.norm(g, axis=1) > 1e-6
-        g, p = g[nz], p[nz] / max(p[nz].sum(), 1e-12)
-        out = np.zeros((len(q2), len(widths)))
-        for gi, pi in zip(g, p):
-            d2 = ((q2 - gi) ** 2).sum(1)
-            for k, width in enumerate(widths):
-                out[:, k] += pi * width**2 / (d2 + width**2)
-        return out
 
     def _phases(self, pos: np.ndarray):
         """cos and sin of 2 pi h.x / N for fine-grid positions (B, 3) on every needed point."""
@@ -1232,8 +1376,8 @@ class ReverseMonteCarlo(AutoSerialize):
 
     def fit_background(self) -> float:
         """Fit the diffuse scale and, per pattern, a constant, a direct-beam Lorentzian, a wide
-        Gaussian with a free center, Einstein thermal diffuse, phonon halos about each
-        reflection, powder rings of the average crystal and Bragg tails."""
+        Gaussian with a free center, Einstein thermal diffuse and powder rings of the
+        average crystal."""
         loss = self._solve_linear(self._model_diffuse(), refit_sigmas=True)
         self._update_residual()
         print(
@@ -1272,7 +1416,6 @@ class ReverseMonteCarlo(AutoSerialize):
         batch: int = 32,
         temperature: float = 0.05,
         omega_fraction: float = 0.5,
-        omega_repeats: Sequence[int] = (1,),
         max_static_b: float | None = 0.5,
         refit_every: int = 2,
         progress: bool = True,
@@ -1284,11 +1427,8 @@ class ReverseMonteCarlo(AutoSerialize):
         unlike atoms (composition conserved) or, with probability
         ``omega_fraction``, an omega embryo on three consecutive atoms of a
         <111> row: the first stays and the next two collapse toward each
-        other by a/12 each, (0, +v, -v), repeated along the row a number of
-        times drawn from ``omega_repeats`` (one triple makes a compact
-        embryo; longer chains make the diffuse sheets normal to <111> that
-        cut a zone as streaks). Proposing a chain where it already stands
-        clears it instead. ``max_static_b`` (A^2) caps the
+        other by a/24 or a/12 each, (0, +v, -v). Proposing an embryo where it
+        already stands clears it instead. ``max_static_b`` (A^2) caps the
         static Debye-Waller factor of all displacements, 8 pi^2 <u^2> / 3, so
         they stay consistent with how slowly the Bragg intensities fall off
         (a displacement field this strong would damp them; the diffuse scale
@@ -1324,7 +1464,7 @@ class ReverseMonteCarlo(AutoSerialize):
                 roll = self.rng.random()
                 if roll < p_omega:
                     kind = "omega"
-                    sites, new = self._omega_proposals(batch, int(self.rng.choice(omega_repeats)))
+                    sites, new = self._omega_proposals(batch)
                 else:
                     kind = "swap"
                     j = self.rng.choice(n_sites, 2 * batch, replace=False)
@@ -1420,103 +1560,24 @@ class ReverseMonteCarlo(AutoSerialize):
         self.loss_history[-1] = self._update_residual()
         return self
 
-    def _omega_proposals(self, batch: int, repeats: int = 1):
-        """Disjoint omega chains along <111> rows: sites (B, 3 * repeats) and their new
-        displacement vectors (B, 3 * repeats, 3).
-
-        Each chain repeats the (0, +v, -v) collapse ``repeats`` times along one row."""
+    def _omega_proposals(self, batch: int):
+        """Disjoint omega embryos along <111> rows: sites (B, 3) and their new displacement
+        vectors (B, 3, 3), the (0, +v, -v) collapse."""
         n_sites = len(self.site_x)
         nc = self._site_lookup.shape[0]
         j0 = self.rng.choice(n_sites, batch, replace=False)
         vec = self._omega_vectors[self.rng.integers(0, len(self._omega_vectors), batch)]
         step = np.sign(vec)  # nearest neighbour along that <111>, in site units
         xc = self.site_x[j0] // self.refine
-        length = 3 * repeats
         sites = np.stack(
-            [self._site_lookup[tuple(np.mod(xc + t * step, nc).T)] for t in range(length)], 1
+            [self._site_lookup[tuple(np.mod(xc + t * step, nc).T)] for t in range(3)], 1
         )
-        triple = np.stack([np.zeros_like(vec), vec, -vec], 1)  # (B, 3, 3)
-        pattern = np.tile(triple, (1, repeats, 1))
+        pattern = np.stack([np.zeros_like(vec), vec, -vec], 1)  # (B, 3, 3)
         current = self.displacement[sites]
         standing = np.all(current == pattern, axis=(1, 2))
         new = np.where(standing[:, None, None], 0, pattern)
         keep = _disjoint_rows(sites)
         return sites[keep], new[keep]
-
-    def refine_tilts(
-        self,
-        max_tilt_deg: float = 2.5,
-        step_deg: float = 0.25,
-        patterns: Sequence[int] | None = None,
-        max_grid: int = 400,
-        verbose: bool = True,
-    ) -> "ReverseMonteCarlo":
-        """Refine each pattern's tilt against the diffuse fit of the current supercell.
-
-        The tilt moves where the Ewald sphere cuts the 3D diffuse intensity.
-        For each pattern, a grid of tilts within ``max_tilt_deg`` of the
-        zone axis is scored by reading the full symmetrized supercell
-        intensity and re-solving that pattern's scale and background, then
-        the best is polished with Nelder-Mead. Run it after some RMC sweeps,
-        once the supercell has structure, and alternate the two.
-        """
-        grid = self.diffuse_grid(max_grid)
-        n_grid = grid.shape[0]
-        grid = grid.ravel()
-        y = self._y_all
-        w = self._w_all
-        patterns = range(len(self.images)) if patterns is None else patterns
-        for i in patterns:
-            sel = np.nonzero((self._pix_image == i) & self._fit)[0]
-            q2 = self.mask["k"][i].reshape(-1, 2)[sel - np.nonzero(self._pix_image == i)[0][0]]
-            u = self._u_all[sel]
-            X_bg = self._bg_basis(i, sel)
-            sw = np.sqrt(w[sel])
-            lo = np.concatenate([[0.0], self._bg_lower(X_bg.shape[1])])
-            tilt0 = np.array(self.geometry["tilts"][i], dtype=float)
-            kik = getattr(self, "kikuchi", False)
-
-            def loss(t):
-                self.geometry["tilts"][i] = np.asarray(t)
-                cols, wts = self._pixel_grid(i, q2, n_grid)
-                if kik:
-                    X_bg[:, -2 * self._kikuchi_families :] = self._kikuchi(i, q2, t)
-                X = np.column_stack([u * (grid[cols] * wts).sum(1), X_bg])
-                x = _lsq_bounded(X, y[sel], sw, lo)
-                return float(((X @ x - y[sel]) ** 2 * w[sel]).sum())
-
-            l0 = loss(tilt0)
-            lim = np.deg2rad(max_tilt_deg)
-            steps = np.arange(-lim, lim + 1e-12, np.deg2rad(step_deg))
-            best = (l0, tilt0)
-            for tx in steps:
-                for ty in steps:
-                    t = np.array([tx, ty])
-                    if np.hypot(tx, ty) > lim:
-                        continue
-                    lt = loss(t)
-                    if lt < best[0]:
-                        best = (lt, t)
-            sol = optimize.minimize(
-                loss,
-                best[1],
-                method="Nelder-Mead",
-                bounds=[(-lim, lim)] * 2,
-                options=dict(xatol=1e-4, fatol=1e-6),
-            )
-            t = sol.x if sol.fun < best[0] and np.linalg.norm(sol.x) <= lim else best[1]
-            self.geometry["tilts"][i] = np.asarray(t)
-            if verbose:
-                print(
-                    f"{self.names[i]}: tilt {np.rad2deg(np.linalg.norm(tilt0)):.2f} -> "
-                    f"{np.rad2deg(np.linalg.norm(t)):.2f} deg, pattern loss {l0:.2f} -> "
-                    f"{min(sol.fun, best[0]):.2f}"
-                )
-        self._setup_forward()
-        self._solve_linear(self._model_diffuse())
-        loss_all = self._update_residual()
-        self.loss_history.append(loss_all)
-        return self
 
     # ---------------------------------------------------------------- analysis
 
@@ -1551,7 +1612,7 @@ class ReverseMonteCarlo(AutoSerialize):
         return out
 
     def background_images(self) -> list[np.ndarray]:
-        """Fitted background (constant, Gaussians, thermal diffuse, Bragg tails) per pattern."""
+        """Fitted smooth background per pattern."""
         full = self.model_images()
         diffuse = self.model_images(diffuse_only=True)
         return [f - d for f, d in zip(full, diffuse)]
@@ -1756,31 +1817,40 @@ class ReverseMonteCarlo(AutoSerialize):
 
     def plot_fit(
         self,
+        columns: Sequence[str] = ("experiment", "background", "difference", "model", "residual"),
         diffuse_only: bool = False,
         sigma: float = 0.7,
         quantiles: tuple[float, float] = (0.01, 0.99),
         cmap: str = "turbo_black",
         **kwargs,
     ):
-        """Experiment (left) and model (right) for every zone on one linear scale per row.
+        """Experiment, fitted background, experiment - background, supercell diffuse model and
+        residual, one row per zone, cropped to ``q_max``.
 
-        Default: the binned pattern (blurred by ``sigma`` binned pixels) and
-        the full model. ``diffuse_only``: the experiment minus the fitted
-        background next to the supercell's diffuse term, then their
-        difference on a diverging map (white = no difference). The scale
-        spans ``quantiles`` of the experiment inside the diffuse mask (weight
-        > 0.5), which excludes the Bragg peaks and the direct-beam bloom;
-        masked pixels are black in the diffuse view. Panels are cropped to
-        ``q_max``.
+        Experiment and background share a linear scale spanning ``quantiles`` of the
+        experiment inside the diffuse mask (weight > 0.5); experiment - background and the
+        model share one spanning ``quantiles`` of the difference; the residual uses a diverging
+        map at half that range (white = no difference). Masked pixels are black in the last
+        three columns. The experiment is blurred by ``sigma`` binned pixels. ``diffuse_only``
+        keeps the last three columns.
         """
         import matplotlib
 
         from quantem.core.visualization import show_2d
 
-        model = self.model_images(diffuse_only=diffuse_only)
-        background = self.background_images() if diffuse_only else None
+        if diffuse_only:
+            columns = ("difference", "model", "residual")
+        full = self.model_images()
+        diffuse = self.model_images(diffuse_only=True)
         cmap_obj = matplotlib.colormaps[cmap].with_extremes(bad="black")
         diverging = matplotlib.colormaps["RdBu_r"].with_extremes(bad="black")
+        titles_of = {
+            "experiment": "experiment",
+            "background": "background",
+            "difference": "experiment - background",
+            "model": "model",
+            "residual": "residual",
+        }
         rows, titles, norms, cmaps = [], [], [], []
         for i in range(len(self.images)):
             q = np.linalg.norm(self.mask["k"][i], axis=-1)
@@ -1789,132 +1859,210 @@ class ReverseMonteCarlo(AutoSerialize):
             sel = (w > 0.5) & inside
             rr, cc = np.nonzero(inside)
             crop = (slice(rr.min(), rr.max() + 1), slice(cc.min(), cc.max() + 1))
-            if diffuse_only:
-                exp = self.mask["y"][i] - background[i]
-                if sigma:
-                    exp = _nan_blur(np.where(w > 0.2, exp, np.nan), sigma)
-                exp = np.where(sel, exp, np.nan)
-                mod = np.where(sel, model[i], np.nan)
-                lo, hi = np.nanquantile(exp, quantiles)
-                h = 0.5 * (hi - lo)
-                rows.append([exp[crop], mod[crop], (exp - mod)[crop]])
-                titles.append(
-                    [
-                        f"{self.names[i]} experiment - background",
-                        f"{self.names[i]} model",
-                        "experiment - background - model",
-                    ]
-                )
-                norms.append(
-                    [dict(interval_type="manual", vmin=lo, vmax=hi)] * 2
-                    + [dict(interval_type="manual", vmin=-h, vmax=h)]
-                )
-                cmaps.append([cmap_obj, cmap_obj, diverging])
-            else:
-                exp = self.mask["data"][i]
-                if sigma:
-                    exp = ndimage.gaussian_filter(exp, sigma)
-                lo, hi = np.quantile(exp[sel], quantiles)
-                rows.append(
-                    [np.where(inside, exp, np.nan)[crop], np.where(inside, model[i], np.nan)[crop]]
-                )
-                titles.append([f"{self.names[i]} experiment", f"{self.names[i]} model"])
-                norms.append([dict(interval_type="manual", vmin=lo, vmax=hi)] * 2)
-                cmaps.append([cmap_obj, cmap_obj])
+            background = full[i] - diffuse[i]
+            exp = self.mask["data"][i]
+            if sigma:
+                exp = ndimage.gaussian_filter(exp, sigma)
+            diff = self.mask["y"][i] - background
+            if sigma:
+                diff = _nan_blur(np.where(w > 0.2, diff, np.nan), sigma)
+            diff = np.where(sel, diff, np.nan)
+            panels = {
+                "experiment": np.where(inside, exp, np.nan),
+                "background": np.where(inside, background, np.nan),
+                "difference": diff,
+                "model": np.where(sel, diffuse[i], np.nan),
+                "residual": diff - np.where(sel, diffuse[i], np.nan),
+            }
+            lo, hi = np.quantile(exp[sel], quantiles)
+            dlo, dhi = np.nanquantile(diff, quantiles)
+            half = 0.5 * (dhi - dlo)
+            scales = {
+                "experiment": (lo, hi),
+                "background": (lo, hi),
+                "difference": (dlo, dhi),
+                "model": (dlo, dhi),
+                "residual": (-half, half),
+            }
+            rows.append([panels[c][crop] for c in columns])
+            titles.append([f"{self.names[i]} {titles_of[c]}" for c in columns])
+            norms.append(
+                [
+                    dict(interval_type="manual", vmin=scales[c][0], vmax=scales[c][1])
+                    for c in columns
+                ]
+            )
+            cmaps.append([diverging if c == "residual" else cmap_obj for c in columns])
         return show_2d(
             rows,
             title=titles,
             norm=norms,
             cmap=cmaps,
-            axsize=kwargs.pop("axsize", (4, 4)),
+            axsize=kwargs.pop("axsize", (3.4, 3.4)),
             **kwargs,
         )
 
-    def plot_sro(self, n_shells: int = 8, extent: float = 2.0, layer: int = 0):
-        """Short-range order and displacements.
-
-        1: Warren-Cowley alpha of every species pair against neighbour
-        distance (< 0 unlike neighbours preferred, > 0 like). 2-3: the
-        symmetrized diffuse intensity of the supercell in Laue units (1 =
-        random alloy) on the (001) and (1-10) reciprocal planes; maxima at
-        special points name the order (100: B2-type, 1/2 1/2 1/2: D0_3,
-        2/3 2/3 2/3: omega). The color scale is set away from the
-        reciprocal-lattice nodes. 4: one (001) layer of the supercell colored
-        by species, displaced atoms ringed. 5: fraction of each species
-        displaced along <111>.
-        """
+    def plot_warren_cowley(self, n_shells: int = 8):
+        """Warren-Cowley alpha against neighbour distance (< 0 unlike neighbours preferred, > 0
+        like); one curve for a binary site, one per species pair otherwise."""
         import matplotlib.pyplot as plt
 
         sro = self.warren_cowley(n_shells)
-        grid = self.diffuse_grid()
-        sec_001, _, d_001 = self.diffuse_section((0, 0, 1), extent, grid=grid)
-        sec_110, _, d_110 = self.diffuse_section((1, -1, 0), extent, grid=grid)
         K = len(self.species)
-        colors = plt.get_cmap("tab10")(np.arange(K))
-
-        fig, axs = plt.subplots(1, 5, figsize=(24, 4.6))
-        ax = axs[0]
+        fig, ax = plt.subplots(figsize=(5.5, 4))
         ax.axhline(0, color="0.6", lw=0.8)
-        for s in range(K):
-            for t in range(s, K):
-                ax.plot(
-                    sro["radius"],
-                    sro["alpha"][:, s, t],
-                    "o-" if s == t else "s--",
-                    ms=4,
-                    label=f"{self.species[s]}-{self.species[t]}",
-                )
+        if K == 2:  # a binary site has one alpha for every pair
+            ax.plot(sro["radius"], sro["alpha"][:, 0, 0], "o-", ms=4, color="k")
+            ax.set_title(f"{self.species[0]}-{self.species[1]}")
+        else:
+            for s_ in range(K):
+                for t in range(s_, K):
+                    ax.plot(
+                        sro["radius"],
+                        sro["alpha"][:, s_, t],
+                        "o-" if s_ == t else "s--",
+                        ms=4,
+                        label=f"{self.species[s_]}-{self.species[t]}",
+                    )
+            ax.legend(fontsize=8)
         ax.set_xlabel("neighbour distance (A)")
         ax.set_ylabel("Warren-Cowley alpha")
-        ax.legend(fontsize=8, ncol=2)
-        between = np.concatenate([sec_001[d_001 > 0.2], sec_110[d_110 > 0.2]])
+        fig.tight_layout()
+        return fig, ax
+
+    def plot_diffuse_sections(self, extent: float = 2.0, normals=((0, 0, 1), (1, -1, 0))):
+        """Symmetrized diffuse intensity of the supercell in Laue units (1 = random alloy) on
+        reciprocal-lattice planes through the origin. Maxima at special points name the order
+        (100: B2-type, 1/2 1/2 1/2: D0_3, 2/3 2/3 2/3: omega). The color scale is set away
+        from the reciprocal-lattice nodes."""
+        import matplotlib.pyplot as plt
+
+        grid = self.diffuse_grid()
+        secs = [self.diffuse_section(n, extent, grid=grid) for n in normals]
+        between = np.concatenate([sec[d > 0.2] for sec, _, d in secs])
         vmax = np.quantile(between, 0.995)
+        fig, axs = plt.subplots(1, len(normals), figsize=(5.2 * len(normals), 4.4))
+        axs = np.atleast_1d(axs)
         ext = [-extent, extent, -extent, extent]
-        for ax, sec, title, xl, yl in (
-            (axs[1], sec_001, "(001) section, Laue units", "h", "k"),
-            (axs[2], sec_110, "(1-10) section, Laue units", "[001]", "[110]/sqrt2"),
-        ):
+        for ax, n, (sec, (u, v), _) in zip(axs, normals, secs):
             im = ax.imshow(
                 sec.T, origin="lower", extent=ext, cmap="turbo_black", vmin=0, vmax=vmax
             )
-            ax.set_title(title)
-            ax.set_xlabel(xl)
-            ax.set_ylabel(yl)
+            ax.set_title("(" + "".join(f"{int(x)}" for x in n) + ") section, Laue units")
+            ax.set_xlabel("[" + " ".join(f"{x:.2f}" for x in u) + "] (1/a)")
+            ax.set_ylabel("[" + " ".join(f"{x:.2f}" for x in v) + "] (1/a)")
             fig.colorbar(im, ax=ax, fraction=0.046)
+        fig.tight_layout()
+        return fig, axs
 
-        ax = axs[3]
-        z = layer * self.grid_divisor * self.refine
-        in_layer = self.site_x[:, 2] == z
-        xy = self.site_x[in_layer, :2] / (self.grid_divisor * self.refine)
-        sp = self.species_index[in_layer]
-        for s in range(K):
-            m = sp == s
-            ax.scatter(xy[m, 1], xy[m, 0], s=10, color=colors[s], label=self.species[s])
-        moved = self._omega_like()[in_layer]
+    def _shells(self, n_shells: int):
+        """Neighbour offsets of the BCC site lattice (site units, a / 2) grouped by distance."""
+        r = np.arange(-4, 5)
+        v = np.stack(np.meshgrid(r, r, r, indexing="ij"), -1).reshape(-1, 3)
+        bcc = np.all(v % 2 == 0, axis=1) | np.all(v % 2 == 1, axis=1)
+        v = v[bcc & np.any(v != 0, axis=1)]
+        d2 = (v**2).sum(1)
+        return [v[d2 == d] for d in np.unique(d2)[:n_shells]]
+
+    def displacement_correlations(self, n_shells: int = 6) -> dict:
+        """Displacement short-range order per neighbour shell.
+
+        ``longitudinal``: <(u_i.r)(u_j.r)> / <(u.r)^2> with r the bond direction;
+        ``transverse``: the same for the components normal to the bond. Omega embryos give a
+        strong negative longitudinal correlation on the nearest-neighbour <111> bond (the
+        collapsing pair moves together).
+        """
+        if self.grid_divisor != 2:
+            raise NotImplementedError("Displacement correlations are implemented for BCC sites.")
         step = self.lattice_parameter / (self.grid_divisor * self.refine)
-        u = self.displacement[in_layer, :2] * step / self.lattice_parameter
-        ax.quiver(
-            xy[:, 1],
-            xy[:, 0],
-            u[:, 1],
-            u[:, 0],
-            angles="xy",
-            scale_units="xy",
-            scale=0.1,
-            width=0.003,
-            color="0.3",
-        )
-        ax.scatter(xy[moved, 1], xy[moved, 0], s=40, facecolors="none", edgecolors="k", lw=0.6)
-        ax.set_aspect("equal")
-        ax.set_title("(001) layer, displacements x10, omega ringed")
-        ax.set_xlabel("cells")
-        ax.legend(fontsize=8, loc="upper right")
+        u = self.displacement * step
+        nc = self._site_lookup.shape[0]
+        xc = self.site_x // self.refine
+        out = dict(radius=[], longitudinal=[], transverse=[])
+        for offs in self._shells(n_shells):
+            rhat = offs / np.linalg.norm(offs, axis=1, keepdims=True)
+            nb = np.stack([self._site_lookup[tuple(np.mod(xc + o, nc).T)] for o in offs], 1)
+            ui = u[:, None, :]
+            uj = u[nb]
+            li = (ui * rhat[None]).sum(-1)
+            lj = (uj * rhat[None]).sum(-1)
+            ti = ui - li[..., None] * rhat[None]
+            tj = uj - lj[..., None] * rhat[None]
+            ll = (li**2).mean()
+            tt = (ti**2).sum(-1).mean()
+            out["radius"].append(np.linalg.norm(offs[0]) * self.lattice_parameter / 2)
+            out["longitudinal"].append(float((li * lj).mean() / ll) if ll > 0 else 0.0)
+            out["transverse"].append(float((ti * tj).sum(-1).mean() / tt) if tt > 0 else 0.0)
+        out["radius"] = np.asarray(out["radius"])
+        return out
 
-        ax = axs[4]
-        summary = self.displacement_summary()
-        ax.bar(self.species, [summary["mean_displacement"][s] for s in self.species], color=colors)
-        ax.set_ylabel("mean static displacement (A)")
-        ax.set_title(f"static B = {summary['static_b']:.3f} A^2")
+    def plot_displacement_correlations(self, n_shells: int = 6):
+        """Displacement short-range order: longitudinal and transverse displacement
+        correlations by neighbour shell."""
+        import matplotlib.pyplot as plt
+
+        c = self.displacement_correlations(n_shells)
+        fig, ax = plt.subplots(figsize=(5.5, 4))
+        ax.axhline(0, color="0.6", lw=0.8)
+        ax.plot(c["radius"], c["longitudinal"], "o-", label="longitudinal (along bond)")
+        ax.plot(c["radius"], c["transverse"], "s--", label="transverse")
+        ax.set_xlabel("neighbour distance (A)")
+        ax.set_ylabel("displacement correlation")
+        ax.legend(fontsize=8)
+        fig.tight_layout()
+        return fig, ax
+
+    def displacement_distributions(self) -> dict:
+        """Probability of each projected displacement u.n (A) per species, pooled over the
+        symmetry-equivalent directions n of <100>, <110> and <111> (both senses)."""
+        step = self.lattice_parameter / (self.grid_divisor * self.refine)
+        families = {
+            "<100>": np.eye(3),
+            "<110>": np.array(
+                [[1, 1, 0], [1, -1, 0], [1, 0, 1], [1, 0, -1], [0, 1, 1], [0, 1, -1]]
+            ),
+            "<111>": np.array([[1, 1, 1], [1, 1, -1], [1, -1, 1], [-1, 1, 1]]),
+        }
+        out = {}
+        for name, dirs in families.items():
+            n = dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
+            proj = self.displacement @ n.T * step  # (n_sites, n_dirs)
+            proj = np.concatenate([proj, -proj], axis=1)
+            out[name] = {}
+            for k, sp in enumerate(self.species):
+                v = np.round(proj[self.species_index == k].ravel(), 4)
+                vals, counts = np.unique(v, return_counts=True)
+                out[name][sp] = (vals, counts / counts.sum())
+        return out
+
+    def plot_displacements(self, **kwargs):
+        """Probability distribution of the static displacement of each species projected on
+        <100>, <110> and <111> (pooled over equivalent directions and both senses). Omega
+        displacements are discrete, so the distributions are a central peak at 0 with side
+        peaks at the half and full collapse."""
+        import matplotlib.pyplot as plt
+
+        dist = self.displacement_distributions()
+        fig, axs = plt.subplots(1, 3, figsize=kwargs.pop("figsize", (14, 3.8)), sharey=True)
+        colors = plt.get_cmap("tab10")(np.arange(len(self.species)))
+        width = (
+            0.8 * self.lattice_parameter / (self.grid_divisor * self.refine) / len(self.species)
+        )
+        for ax, (name, per_species) in zip(axs, dist.items()):
+            for k, sp in enumerate(self.species):
+                vals, prob = per_species[sp]
+                offset = (k - (len(self.species) - 1) / 2) * width
+                ax.bar(vals + offset, prob, width=width, color=colors[k], label=sp)
+            ax.set_yscale("log")
+            ax.set_xlabel(f"u . n, n along {name} (A)")
+            ax.set_title(name)
+        axs[0].set_ylabel("probability")
+        axs[0].legend()
+        s = self.displacement_summary()
+        fig.suptitle(
+            f"static B = {s['static_b']:.3f} A^2; omega fraction "
+            + ", ".join(f"{k} {100 * v:.1f}%" for k, v in s["omega_fraction"].items())
+        )
         fig.tight_layout()
         return fig, axs
 

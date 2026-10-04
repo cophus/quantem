@@ -252,7 +252,8 @@ def dynamical_pattern(
     -------
     dict
         'qx', 'qy' (N,), 'hkl' (N, 3), 'intensity' (T, N) diffracted
-        intensities per thickness, 's_g' (N,).
+        intensities per thickness, 'intensity_000' (T,) the direct beam,
+        's_g' (N,).
     """
     if crystal.g_vec is None:
         raise RuntimeError("Run crystal.calculate_structure_factors() first.")
@@ -308,6 +309,7 @@ def dynamical_pattern(
         "hkl": hkl_sel,
         "s_g": s_sel,
         "intensity": intensity,
+        "intensity_000": torch.abs(psi[:, 0]) ** 2,
         "thicknesses": t,
     }
 
