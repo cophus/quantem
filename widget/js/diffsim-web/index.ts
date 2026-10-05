@@ -138,6 +138,14 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
     .${id}-top { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; justify-content: center; margin-bottom: 8px; }
     .${id}-panels { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
     .${id}-panel { display: flex; flex-direction: column; gap: 6px; min-width: 0; flex: 0 0 auto; }
+    .${id}-ctl { display: flex; flex-direction: column; gap: 6px; }
+    .${id}-panels.stacked { flex-direction: column; flex-wrap: nowrap; align-items: center; }
+    .${id}-panels.stacked .${id}-panel { display: contents; }
+    .${id}-panels.stacked #${id}-cell { order: 1; }
+    .${id}-panels.stacked #${id}-pat { order: 2; }
+    .${id}-panels.stacked #${id}-patctl { order: 3; }
+    .${id}-panels.stacked #${id}-cellctl { order: 4; }
+    .${id}-panels.stacked #${id}-ewaldc { order: 5; }
     .${id}-canvas { display: block; border-radius: 4px; touch-action: none; cursor: grab; background: #000; }
     .${id}-canvas.cell { background: var(--${id}-cellbg, #161616); border: 1px solid var(--${id}-border, #444); }
     .${id}-row { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
@@ -185,6 +193,7 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
       <div class="${id}-panel">
         <canvas class="${id}-canvas cell" id="${id}-cell"></canvas>
         <canvas class="${id}-canvas cell" id="${id}-ewaldc" style="cursor:default"></canvas>
+        <div class="${id}-ctl" id="${id}-cellctl">
         <div class="${id}-row">
           <div class="${id}-group"><div class="${id}-btn" data-rot="x-">x −</div><div class="${id}-btn" data-rot="x+">x +</div></div>
           <div class="${id}-group"><div class="${id}-btn" data-rot="y-">y −</div><div class="${id}-btn" data-rot="y+">y +</div></div>
@@ -204,9 +213,11 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
           <label class="${id}-check">cells <input type="number" id="${id}-ncell" value="${state.nCells[0]}" min="1" max="3" step="1" style="width:40px"></label>
         </div>
         <div class="${id}-hint">Drag to tilt the crystal (the near face follows the pointer). Shift-drag, or two fingers, twist about the beam. The beam comes toward you.</div>
+        </div>
       </div>
       <div class="${id}-panel">
         <canvas class="${id}-canvas" id="${id}-pat"></canvas>
+        <div class="${id}-ctl" id="${id}-patctl">
         <div class="${id}-row">
           <div class="${id}-group" id="${id}-modes">
             <div class="${id}-btn" data-mode="nanobeam">nanobeam</div>
@@ -243,6 +254,7 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
         </div>
         <div class="${id}-hint" id="${id}-status"></div>
         <div class="${id}-hint">Drag the pattern to move the tilt map. Double-click a disk to tilt to its two-beam condition, or empty space to put the Laue circle centre there.</div>
+        </div>
       </div>
     </div>
   `;
@@ -271,21 +283,44 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
   // ---------------------------------------------------------------- size
   // Layout: left column = cell (Sc square) above the Ewald panel (Sc x Se);
   // right column = pattern square whose side S matches the left column's
-  // height, so S = Sc + gap + Se with Se = Sc / 2. Stacked on narrow screens.
+  // height, so S = Sc + gap + Se with Se = Sc / 2. On narrow (portrait)
+  // screens everything stacks in one column with the cell and the pattern
+  // adjacent, then the controls, then the Ewald panel. Both layouts are
+  // capped so the canvases fit in the visible height below a fixed page
+  // header (the MyST top bar).
   let S = 400, Sc = 260, Se = 130;
   const GAP = 8;
+  const panelsEl = $<HTMLElement>(`.${id}-panels`);
+  // small viewport height (browser toolbars shown): stable while the mobile toolbars collapse on scroll
+  const probe = document.createElement("div");
+  probe.style.cssText = "position:fixed;top:0;left:0;width:0;height:100vh;height:100svh;visibility:hidden;pointer-events:none";
+  el.appendChild(probe);
+  const availHeight = () => {
+    const h = probe.offsetHeight || window.innerHeight;
+    let nav = 0;
+    for (const e of document.querySelectorAll<HTMLElement>(".myst-top-nav, header")) {
+      const p = getComputedStyle(e).position;
+      const r = e.getBoundingClientRect();
+      if ((p === "fixed" || p === "sticky") && r.top <= 0 && r.height < h / 3) nav = Math.max(nav, r.bottom);
+    }
+    return h - nav - 16;
+  };
   const computeSize = () => {
     const w = wrap.clientWidth - 30;
+    const h = availHeight();
     const sideBySide = w >= 2.5 * 180 + 2 * GAP + 12;
     if (sideBySide) {
-      Sc = Math.floor(Math.min((w - 12 - GAP) / 2.5, state.sizePref / 1.5));
+      const hCap = state.showEwald ? (h - GAP) / 1.5 : h;
+      Sc = Math.floor(Math.max(140, Math.min((w - 12 - GAP) / 2.5, state.sizePref / 1.5, hCap)));
       Se = state.showEwald ? Math.round(Sc / 2) : 0;
       S = Sc + (Se ? GAP + Se : 0);
     } else {
-      Sc = Math.max(180, Math.min(state.sizePref, w));
+      // cell and pattern stacked: keep both on screen at once
+      Sc = Math.floor(Math.max(180, Math.min(state.sizePref, w, (h - 12) / 2)));
       Se = state.showEwald ? Math.round(Sc / 2) : 0;
       S = Sc;
     }
+    panelsEl.classList.toggle("stacked", !sideBySide);
     cellCanvas.style.width = `${Sc}px`; cellCanvas.style.height = `${Sc}px`;
     ewaldCanvas.style.display = Se ? "block" : "none";
     ewaldCanvas.style.width = `${Sc}px`; ewaldCanvas.style.height = `${Se}px`;
@@ -293,6 +328,8 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
     const panels = wrap.querySelectorAll<HTMLElement>(`.${id}-panel`);
     if (panels[0]) panels[0].style.width = `${Sc}px`;
     if (panels[1]) panels[1].style.width = `${S}px`;
+    $<HTMLElement>(`#${id}-cellctl`).style.width = sideBySide ? "" : `${Math.max(Sc, Math.min(w, 420))}px`;
+    $<HTMLElement>(`#${id}-patctl`).style.width = sideBySide ? "" : `${Math.max(Sc, Math.min(w, 420))}px`;
   };
 
   // ---------------------------------------------------------------- physics cache
@@ -810,9 +847,11 @@ export function render({ model, el }: { model: Model; el: HTMLElement }) {
   computeSize();
   applyTheme();
   recompute();
-  const ro = new ResizeObserver(() => { const old = S + Sc; computeSize(); if (S + Sc !== old) drawAll(); });
+  const relayout = () => { const old = S + Sc; computeSize(); if (S + Sc !== old) drawAll(); };
+  const ro = new ResizeObserver(relayout);
   ro.observe(wrap);
-  return () => { mo.disconnect(); ro.disconnect(); };
+  ro.observe(probe); // viewport height: rotation, window resize
+  return () => { mo.disconnect(); ro.disconnect(); probe.remove(); };
 }
 
 export default { render };
