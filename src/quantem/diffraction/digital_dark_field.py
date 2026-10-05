@@ -7,7 +7,8 @@ the peaks in three ways, following MacLaren and co-workers
 
 - Virtual apertures: peaks within a radius of a set of aperture positions,
   usually a lattice built from two reciprocal lattice vectors
-  (fit_lattice, aperture_array, aperture_array_subtract, aperture_ddf_image).
+  (fit_lattice, lattice_distance, aperture_array, aperture_array_subtract,
+  aperture_ddf_image).
 - Polar selection: peaks within a ring of radius q, optionally restricted to
   a range of azimuthal angles (add_polar_fields, polar_mask,
   radial_ddf_image).
@@ -16,8 +17,8 @@ the peaks in three ways, following MacLaren and co-workers
   real-space centers of mass or the dark field images of those clusters
   groups the spots of each grain (L2), and clustering the remaining peaks in
   diffraction space alone isolates ring-like nanocrystalline or amorphous
-  components (L3) (ddf_images, cluster_coms, group_ddf_images,
-  assign_grain_labels).
+  components (L3) (ddf_images, cluster_coms, cluster_centers,
+  group_ddf_images, assign_grain_labels).
 
 All functions read the peaks from a Vector with one cell per probe position.
 The diffraction coordinates are given by `q_fields`, which defaults to
@@ -271,6 +272,34 @@ def fit_lattice(
         sw = np.sqrt(weights[ok])[:, None]
         g, *_ = np.linalg.lstsq(n[ok] * sw, means[ok] * sw, rcond=None)
     return g[0], g[1]
+
+
+def lattice_distance(
+    positions,
+    g1,
+    g2,
+    center=(0.0, 0.0),
+) -> np.ndarray:
+    """Distance from each position to the nearest point of a 2D lattice.
+
+    Parameters
+    ----------
+    positions : array-like of float
+        (N, 2) diffraction positions, for example from cluster_centers.
+    g1, g2 : array-like of float
+        (2,) lattice vectors.
+    center : array-like of float, default=(0, 0)
+        (2,) lattice origin.
+
+    Returns
+    -------
+    np.ndarray
+        (N,) distances, in the units of the positions.
+    """
+    basis = np.stack([np.asarray(g1, dtype=np.float64), np.asarray(g2, dtype=np.float64)])
+    q = np.atleast_2d(np.asarray(positions, dtype=np.float64)) - np.asarray(center)[None, :]
+    frac = q @ np.linalg.inv(basis)
+    return np.linalg.norm((frac - np.round(frac)) @ basis, axis=1)
 
 
 def aperture_array_subtract(
@@ -614,6 +643,42 @@ def cluster_coms(
         wk = wk / max(wk.sum(), 1e-12)
         coms[k] = (rc[m] * wk[:, None]).sum(axis=0)
     return coms, sizes
+
+
+def cluster_centers(
+    labeled,
+    q_fields=None,
+    label_field: str = "cluster",
+    intensity_field: str = "intensity",
+) -> np.ndarray:
+    """Intensity-weighted diffraction position of every cluster.
+
+    Parameters
+    ----------
+    labeled : Vector
+        Vector carrying a cluster label field (from cluster_vector).
+    q_fields : (str, str), optional
+        Diffraction coordinate fields.
+    label_field : str, default="cluster"
+        Field holding the cluster labels.
+    intensity_field : str, default="intensity"
+        Field used as the weight of each peak.
+
+    Returns
+    -------
+    np.ndarray
+        (K, 2) mean diffraction positions, ordered by cluster id.
+    """
+    q = _q_coordinates(labeled, q_fields)
+    labels = labeled.select_fields(label_field).numpy()[:, 0].astype(int)
+    w = labeled.select_fields(intensity_field).numpy()[:, 0].astype(np.float64).clip(min=0)
+    m = labels >= 0
+    n = labels.max() + 1
+    wsum = np.maximum(np.bincount(labels[m], weights=w[m], minlength=n), 1e-12)
+    return np.stack(
+        [np.bincount(labels[m], weights=w[m] * q[m, k], minlength=n) / wsum for k in range(2)],
+        axis=1,
+    )
 
 
 def ddf_images(

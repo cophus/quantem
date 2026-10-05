@@ -113,3 +113,17 @@ def test_fit_lattice_and_group_images():
     assert labels[0] == labels[1] == labels[2] >= 0
     assert labels[3] == labels[4] >= 0 and labels[3] != labels[0]
     assert labels[5] == -1
+
+
+def test_cluster_centers_and_lattice_distance():
+    peaks = _lattice_peaks(R=1, C=2)
+    labeled = peaks.copy()
+    n = labeled.total_rows
+    labels = np.full(n, -1)
+    labels[:9] = 0  # the 3x3 lattice in cell (0, 0)
+    labeled.add_fields("cluster", values=labels[:, None])
+    centers = ddf.cluster_centers(labeled)
+    np.testing.assert_allclose(centers, [[0.0, 0.0]], atol=1e-6)
+
+    d = ddf.lattice_distance([[10.0, 10.0], [5.0, 5.0], [11.0, 0.0]], (10.0, 0.0), (0.0, 10.0))
+    np.testing.assert_allclose(d, [0.0, np.hypot(5, 5), 1.0])
