@@ -152,6 +152,7 @@ def cluster_vector(
     field_scales=None,
     scan_scales=None,
     device: str | torch.device = "cpu",
+    block: int = 2048,
     label_field: str = "cluster",
 ):
     """DBSCAN over the rows of a Vector, in any combination of field and
@@ -174,6 +175,10 @@ def cluster_vector(
         Multiplier per field; default 1.
     scan_scales : (float, float) | None
         If given, append (row * s0, col * s1) of each row's scan cell.
+    device : str | torch.device, default="cpu"
+        Torch device for the distance computations.
+    block : int, default=2048
+        Rows per distance block; lower to reduce memory.g
     label_field : str, default="cluster"
         Name of the label field on the returned Vector.
 
