@@ -101,14 +101,10 @@ def dbscan(
     if edge_rows:
         rows = torch.cat(edge_rows).cpu().numpy()
         cols = torch.cat(edge_cols).cpu().numpy()
-        graph = sp.coo_matrix(
-            (np.ones(rows.shape[0], dtype=np.int8), (rows, cols)), shape=(N, N)
-        )
+        graph = sp.coo_matrix((np.ones(rows.shape[0], dtype=np.int8), (rows, cols)), shape=(N, N))
         _, comp = connected_components(graph, directed=False)
         core_np = core.cpu().numpy()
-        labels = torch.as_tensor(
-            np.where(core_np, comp, -1), dtype=torch.long, device=device
-        )
+        labels = torch.as_tensor(np.where(core_np, comp, -1), dtype=torch.long, device=device)
 
     # pass 3: border points join the nearest core cluster within eps
     for i0 in range(0, N, block):
@@ -118,9 +114,7 @@ def dbscan(
             continue
         j0, j1 = block_candidates(i0, i1)
         d = torch.cdist(ps[i0:i1], ps[j0:j1])
-        d = torch.where(
-            core[None, j0:j1], d, torch.full_like(d, torch.inf)
-        )
+        d = torch.where(core[None, j0:j1], d, torch.full_like(d, torch.inf))
         d_min, j_min = d.min(dim=1)
         near = bmask & (d_min <= eps)
         if bool(near.any()):
@@ -168,12 +162,17 @@ def cluster_vector(
         Ragged vector over a scan grid.
     fields : sequence of str
         Field names contributing dimensions.
-    eps, min_samples :
-        DBSCAN parameters (Euclidean metric in the scaled space).
+    eps : float
+        DBSCAN neighborhood radius, in the scaled clustering space
+        (Euclidean metric).
+    min_samples : int
+        Neighbors (including the point itself) required for a core point.
     field_scales : sequence of float | None
         Multiplier per field; default 1.
     scan_scales : (float, float) | None
         If given, append (row * s0, col * s1) of each row's scan cell.
+    device : str | torch.device, default="cpu"
+        Torch device for the DBSCAN distance computations.
     label_field : str, default="cluster"
         Name of the label field on the returned Vector.
 
@@ -212,8 +211,31 @@ def filter_rows(vector, mask):
     """Copy of a ragged Vector keeping only the flattened rows where mask.
 
     The scan-grid shape is unchanged; rows are dropped from their cells.
+
+    Parameters
+    ----------
+    vector : Vector
+        Ragged vector over a 2D scan grid.
+    mask : array-like of bool
+        (vector.total_rows,) keep flag per row, in the flattened order of
+        vector.numpy().
+
+    Returns
+    -------
+    Vector
+        New Vector with the same fields, units, name, dtype and metadata,
+        holding only the kept rows.
+
+    Raises
+    ------
+    ValueError
+        If len(mask) differs from vector.total_rows.
     """
-    mask = np.asarray(mask, dtype=bool)
+    mask = np.asarray(mask, dtype=bool).ravel()
+    if mask.size != vector.total_rows:
+        raise ValueError(
+            f"mask has {mask.size} entries but the Vector has {vector.total_rows} rows."
+        )
     counts = np.asarray(vector.row_counts(), dtype=int)
     flat = vector.numpy().astype(np.float64)
     starts = np.concatenate([[0], np.cumsum(counts)])
@@ -223,14 +245,17 @@ def filter_rows(vector, mask):
         row = []
         for c in range(shape[1]):
             k = r * shape[1] + c
-            sel = mask[starts[k]:starts[k + 1]]
-            row.append(flat[starts[k]:starts[k + 1]][sel])
+            sel = mask[starts[k] : starts[k + 1]]
+            row.append(flat[starts[k] : starts[k + 1]][sel])
         nested.append(row)
     from quantem.core.datastructures.vector import Vector
 
     out = Vector.from_data(
-        nested, fields=list(vector.fields), units=list(vector.units),
-        name=vector.name, dtype=vector.dtype,
+        nested,
+        fields=list(vector.fields),
+        units=list(vector.units),
+        name=vector.name,
+        dtype=vector.dtype,
     )
     out.metadata.update(vector.metadata)
     return out

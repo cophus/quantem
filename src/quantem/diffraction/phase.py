@@ -121,8 +121,9 @@ class PhaseMap(AutoSerialize):
 
         # hyperparameters inherited from the maps and recorded per stage
         self.metadata: dict = {"orientation_maps": [dict(om.metadata) for om in orientation_maps]}
-        self.phase_weights: torch.Tensor | None = None
-        self.costs_single: torch.Tensor | None = None
+        # fit results, (R, C, ...) over the scan; see fit()
+        self.phase_weights: torch.Tensor | None = None  # (R, C, F) per candidate
+        self.crystal_weights: torch.Tensor | None = None  # (R, C, n_crystals)
         self.cost_best: torch.Tensor | None = None
         self.phase_index: torch.Tensor | None = None
         self.reliability: torch.Tensor | None = None
@@ -131,13 +132,32 @@ class PhaseMap(AutoSerialize):
 
     @classmethod
     def from_orientation_maps(cls, orientation_maps: list[OrientationMap]) -> "PhaseMap":
-        """Create from OrientationMaps that share the same peaks."""
+        """Create from OrientationMaps that share the same peaks.
+
+        Parameters
+        ----------
+        orientation_maps : list of OrientationMap
+            Matched maps, one per candidate crystal.
+
+        Returns
+        -------
+        PhaseMap
+
+        Raises
+        ------
+        ValueError
+            If the maps have different scan shapes.
+        RuntimeError
+            If a map has not been matched.
+        """
         p0 = orientation_maps[0].peaks
         for om in orientation_maps:
             if om.peaks.shape != p0.shape:
                 raise ValueError("All OrientationMaps must share the same scan shape.")
             if om.quats is None:
-                raise RuntimeError(f"OrientationMap for {om.crystal.name}: run match() first.")
+                raise RuntimeError(
+                    f"OrientationMap for {om.crystal.name}: run match_orientations() first."
+                )
         return cls(orientation_maps, _token=cls._token)
 
     def fit(
@@ -191,13 +211,18 @@ class PhaseMap(AutoSerialize):
             non-precession data with strong dynamical scattering, lowering
             this weight makes the decision coverage-driven and removes the
             bias toward sparse templates.
-        min_sim_intensity_rel : float, default=0.02
+        min_sim_intensity_rel : float | None
             Simulated reflections weaker than this fraction of the pattern
             maximum are dropped before comparison: kinematically weak spots
             are frequently unobservable and should not penalize a phase whose
-            structure factors happen to include many of them.
+            structure factors happen to include many of them. None takes
+            MIN_SIM_INTENSITY_REL (0.02).
         k_max : float | None
-            Restrict the comparison below this scattering vector.
+            Restrict the comparison below this scattering vector
+            (1/Angstroms).
+        min_number_peaks : int | None
+            Positions with fewer measured peaks (direct beam included) are
+            not fit and stay unindexed; inherits the matching's value.
         min_diffracted_peaks : int, default=2
             Null hypothesis: a position needs at least this many measured
             peaks beyond `null_k_min` before any phase is assigned. Vacuum
@@ -208,6 +233,25 @@ class PhaseMap(AutoSerialize):
             Scattering vector (1/Angstroms) above which a measured peak
             counts as diffracted. The default excludes the direct beam,
             which sits at the origin after `correct_peak_origins`.
+        progress_bar : bool, default=True
+            Show a progress bar over the positions.
+
+        Returns
+        -------
+        PhaseMap
+            Self, with these (R, C, ...) results:
+
+            - `phase_index`: winning crystal, -1 where unindexed (not fit,
+              rejected by the null hypothesis, or no candidate weight).
+            - `phase_weights`: (R, C, F) non-negative weight of every
+              candidate in the best model, F = len(`candidates`).
+            - `crystal_weights`: (R, C, n_crystals) those weights summed per
+              crystal and normalized to sum to one, zero where unindexed.
+            - `cost_best`: cost of the best model, NaN where not fit.
+            - `reliability`: cost gap to the best model without the winning
+              crystal, NaN where not fit or no such model exists.
+            - `diffracted_intensity`, `num_diffracted`: measured intensity
+              and number of peaks beyond `null_k_min`.
         """
         from scipy.optimize import nnls
 
@@ -249,11 +293,9 @@ class PhaseMap(AutoSerialize):
 
         subsets = [s for n in range(1, max_patterns + 1) for s in combinations(range(F), n)]
 
-        costs_single = torch.full((R, C, F), torch.nan, dtype=torch.float64)
         cost_best = torch.full((R, C), torch.nan, dtype=torch.float64)
         weights_out = torch.zeros((R, C, F), dtype=torch.float64)
-        reliability = torch.zeros((R, C), dtype=torch.float64)
-        best_subset = torch.full((R, C), -1, dtype=torch.long)
+        reliability = torch.full((R, C), torch.nan, dtype=torch.float64)
         diffracted = torch.zeros((R, C), dtype=torch.float64)
         num_diffracted = torch.zeros((R, C), dtype=torch.long)
 
@@ -334,14 +376,10 @@ class PhaseMap(AutoSerialize):
             if not results:
                 continue
             results.sort(key=lambda r: r[0])
-            c_best, s_best, cols_best, w_best = results[0]
+            c_best, _, cols_best, w_best = results[0]
             cost_best[rx, ry] = c_best
-            best_subset[rx, ry] = subsets.index(s_best)
             for f, w in zip(cols_best, w_best):
                 weights_out[rx, ry, f] = w
-            for cost, s, _, _ in results:
-                if len(s) == 1:
-                    costs_single[rx, ry, s[0]] = cost
 
             # reliability: cost gap to the best model containing NO candidate
             # of the dominant crystal (candidates of one crystal can be
@@ -351,13 +389,11 @@ class PhaseMap(AutoSerialize):
             others = [c for c, s, _, _ in results if all(cands[f][0] != i_dom for f in s)]
             reliability[rx, ry] = (min(others) - c_best) if others else torch.nan
 
-        self.costs_single = costs_single
         self.cost_best = cost_best
         self.diffracted_intensity = diffracted
         self.num_diffracted = num_diffracted
         self.phase_weights = weights_out
         self.reliability = reliability
-        self.best_subset = best_subset
 
         # dominant phase: candidate weights summed per crystal
         n_maps = len(oms)
@@ -365,10 +401,15 @@ class PhaseMap(AutoSerialize):
         for f, (i_om, _) in enumerate(cands):
             w_phase[..., i_om] += weights_out[..., f]
         # argmax over all-zero weights returns 0, which would label every
-        # position that was never fit as the first phase; mark them instead
+        # position that was never fit, or whose best model has no weight
+        # (NNLS returns all zeros when no candidate overlaps the peaks), as
+        # the first phase; mark them instead
+        w_sum = w_phase.sum(dim=-1)
         self.phase_index = w_phase.argmax(dim=-1)
-        self.phase_index[torch.isnan(cost_best)] = -1
-        self.phase_fractions = w_phase / w_phase.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        unindexed = torch.isnan(cost_best) | (w_sum <= 0)
+        self.phase_index[unindexed] = -1
+        self.reliability[unindexed] = torch.nan
+        self.crystal_weights = w_phase / w_sum[..., None].clamp_min(1e-12)
         return self
 
     def apply_dynamical(self, result: dict) -> "PhaseMap":
@@ -383,6 +424,21 @@ class PhaseMap(AutoSerialize):
         `metadata['kinematical']`. Positions the refinement did not reach
         (outside its `mask`) keep their current decision, so a refinement
         of one region, or several in stages, updates only that region.
+
+        Parameters
+        ----------
+        result : dict
+            Output of :func:`~quantem.diffraction.bloch.refine_dynamical`:
+            "cost" (R, C, F) per-candidate cost, NaN where not refined,
+            "phase_index" (R, C) the winning crystal, and optionally
+            "metadata".
+
+        Returns
+        -------
+        PhaseMap
+            Self, with `phase_index`, `reliability` and `cost_best` updated
+            at the refined positions. With one crystal there is no
+            runner-up and the reliability is NaN, as in :meth:`fit`.
         """
         cost = torch.nan_to_num(result["cost"], nan=torch.inf)
         n_maps = len(self.orientation_maps)
@@ -395,7 +451,7 @@ class PhaseMap(AutoSerialize):
             torch.isfinite(order[..., 0]),
             (order[..., 1] - order[..., 0]).clamp_min(0)
             if n_maps > 1
-            else torch.zeros_like(order[..., 0]),
+            else torch.full_like(order[..., 0], torch.nan),
             torch.full_like(order[..., 0], torch.nan),
         )
         done = torch.isfinite(order[..., 0])
@@ -481,13 +537,17 @@ class PhaseMap(AutoSerialize):
         scalebar: dict | str | None = "auto",
         figax=None,
     ):
-        """Dominant-phase map, colored by phase and shaded by reliability.
+        """Dominant-phase map: color gives the crystal, brightness the evidence.
+
+        By default the brightness is the diffracted signal, so vacuum and
+        unindexed positions are black; see `shade_by`.
 
         Parameters
         ----------
         phase_colors : np.ndarray | None
-            One RGB color per phase; defaults to the shared palette used by
-            the pattern overlay plots (gold, light blue, ...).
+            One RGB color per phase, cycled when there are more phases;
+            defaults to `DEFAULT_PHASE_COLORS`, the palette shared with the
+            pattern overlay plots (gold, cyan, green, purple).
         shade_by : {"signal", "reliability", "none"}, default="signal"
             What the brightness means. "signal" fades each position by the
             measured diffracted intensity (see :meth:`signal_confidence`), so
@@ -525,23 +585,32 @@ class PhaseMap(AutoSerialize):
             and units carried from the dataset by the orientation maps; a
             dict such as {"sampling": 30, "units": "A"} overrides it, and
             None draws no bar.
+        figax : (fig, ax) | None
+            Existing axes to draw into.
+
+        Returns
+        -------
+        tuple
+            ``(fig, ax)``.
+
+        Raises
+        ------
+        ValueError
+            If `shade_by` is unknown or `shade_gamma` is not positive.
         """
         if isinstance(scalebar, str):
             scalebar = self.orientation_maps[0].scan_scalebar if scalebar == "auto" else None
         import matplotlib.pyplot as plt
 
         from quantem.core.visualization.visualization_utils import add_scalebar_to_ax
-        from quantem.diffraction.orientation_visualization import DEFAULT_PHASE_COLORS
+        from quantem.diffraction.orientation_visualization import phase_color_cycle
 
         assert self.phase_index is not None and self.reliability is not None
-        if phase_colors is None:
-            phase_colors = DEFAULT_PHASE_COLORS[: len(self.names)]
+        phase_colors = phase_color_cycle(len(self.names), phase_colors)
         if reliability_range is not None:
             shade_by, shade_range = "reliability", reliability_range
         phase = self.phase_index.numpy()
         indexed = phase >= 0
-        if majority_filter > 0:
-            phase = _majority_filter(phase, int(majority_filter))
         if shade_by == "signal":
             alpha = self.signal_confidence(shade_range)
             lo, hi = 0.0, 1.0
@@ -569,7 +638,14 @@ class PhaseMap(AutoSerialize):
         # zero maps to zero under any positive exponent, so unindexed positions
         # stay black and only the faint indexed ones are lifted
         alpha = np.power(alpha, shade_gamma)
-        rgb = phase_colors[np.where(indexed, phase, 0)] * alpha[..., None]
+        if majority_filter > 0:
+            # the filter can turn an indexed position unindexed (-1) and the
+            # reverse, so the colors and the black mask follow the filtered
+            # decision; a position it newly indexes has no brightness of its
+            # own and stays black
+            phase = _majority_filter(phase, int(majority_filter))
+            alpha = alpha * (phase >= 0)
+        rgb = phase_colors[np.where(phase >= 0, phase, 0)] * alpha[..., None]
 
         if figax is None:
             fig, ax = plt.subplots(figsize=(9, 4.5))

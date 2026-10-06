@@ -9,7 +9,8 @@ from quantem.core.visualization.visualization_utils import add_scalebar_to_ax
 from quantem.diffraction.crystal import Crystal
 from quantem.diffraction.rotations import quat_to_matrix
 
-# one color per candidate phase, used consistently across every plot
+# one color per candidate phase, used consistently across every plot; index
+# with phase_color_cycle() so more crystals than colors cycle through them
 DEFAULT_PHASE_COLORS = np.array(
     [
         [1.00, 0.80, 0.25],  # gold
@@ -18,8 +19,6 @@ DEFAULT_PHASE_COLORS = np.array(
         [0.85, 0.50, 0.80],  # purple
     ]
 )
-ORIGIN_COLOR = "#2ca02c"
-MEASURED_COLOR = "0.15"
 # exponent on the distance from the wedge centre: >1 widens the white centre
 # and softens the transition into it, <1 shrinks it (much below 0.5 leaves a
 # bright point at the centre)
@@ -50,6 +49,29 @@ CLUSTER_COLORS = [
     (0.737, 0.741, 0.133),
     (0.090, 0.745, 0.812),
 ]
+
+
+def phase_color_cycle(n: int, colors=None) -> np.ndarray:
+    """One RGB color per phase, cycling through the palette.
+
+    Parameters
+    ----------
+    n : int
+        Number of phases.
+    colors : sequence | None
+        Palette of K matplotlib colors (RGB rows or names); None takes
+        `DEFAULT_PHASE_COLORS`.
+
+    Returns
+    -------
+    np.ndarray
+        (n, 3) RGB colors in [0, 1]; phase k takes palette entry k modulo K.
+    """
+    from matplotlib.colors import to_rgb
+
+    palette = DEFAULT_PHASE_COLORS if colors is None else colors
+    palette = np.array([to_rgb(c) for c in palette], dtype=float)
+    return palette[np.arange(n) % palette.shape[0]]
 
 
 def _bary_to_rgb(
@@ -161,9 +183,13 @@ def ipf_color(
         Quaternions (..., 4).
     crystal : Crystal
         Provides symmetry and the fundamental wedge.
-    direction : {"x", "y", "z"} | torch.Tensor, default="z"
-        Lab direction whose crystal-frame coordinates are colored; "z" is the
-        beam direction (zone-axis map).
+    direction : {"z", "r", "c"} | float | array-like, default="z"
+        Lab direction whose crystal-frame coordinates are colored: "z" is
+        the beam direction (zone-axis map), "r" the scan row axis and "c"
+        the scan column axis ("x" and "y" are accepted as aliases of "r"
+        and "c"). A number is an in-plane angle in degrees from the column
+        axis toward the row axis; a 2 or 3 element vector is an explicit
+        (row, col[, z]) direction.
     saturation_power : float | None
         Width of the white centre; see :func:`_bary_to_rgb`.
     chroma : float | None
@@ -368,12 +394,22 @@ def plot_orientation_map(
     ----------
     om : OrientationMap
         Matched orientation map.
-    direction : {"x", "y", "z"}, default="z"
-        Lab direction to color ("z" = zone axis).
+    direction : {"z", "r", "c"} | float | array-like, default="z"
+        Lab direction to color: "z" the beam (zone axis), "r" the scan row
+        axis, "c" the scan column axis ("x" and "y" are aliases of "r" and
+        "c"), a number for an in-plane angle in degrees, or an explicit
+        vector; see :func:`ipf_color`.
     match : int, default=0
         Which match index to plot.
     mask : np.ndarray | None
         Multiplied into the RGB image (e.g. a phase or reliability mask).
+    figax : (fig, (ax_map, ax_legend)) | (fig, ax_map) | None
+        Existing axes; with a single axis the legend is skipped.
+    legend : bool, default=True
+        Draw the IPF color wedge in a panel beside the map.
+    axsize : tuple[float, float], default=(9.0, 4.5)
+        Figure size in inches of the map panel; the legend panel widens the
+        figure by 30%. Ignored when `figax` is given.
     fold : bool | "auto", default="auto"
         Fold the in-plane part of each orientation by the apparent
         rotational symmetry of its own zero-layer pattern
@@ -404,12 +440,15 @@ def plot_orientation_map(
         The legend is drawn with the same values.
     scalebar : dict | None
         Real-space scale bar, e.g. {"sampling": 30, "units": "A"}.
-    figax : (fig, (ax_map, ax_legend)) | (fig, ax_map) | None
-        Existing axes; with a single axis the legend is skipped.
     crop : (r0, r1, c0, c1) | None
         Show only this window of the map (rows r0:r1, columns c0:c1).
     title : str | None
         Replaces the default title (crystal name and colored direction).
+
+    Returns
+    -------
+    tuple
+        ``(fig, ax)`` with `ax` the map panel.
     """
     import matplotlib.pyplot as plt
 
@@ -522,9 +561,9 @@ def plot_pattern_matches(
     One row per probe position; one column per (crystal, match) candidate,
     so alpha and beta fits sit next to each other for direct comparison.
     Measured peaks are solid gray disks with area proportional to intensity;
-    each candidate's simulation is drawn as colored crosses (red, then blue
-    by default) also sized by intensity. With `dataset` given, the raw
-    pattern is shown behind the crosses instead of the gray disks.
+    each candidate's simulation is drawn as colored markers in its phase
+    color, also sized by intensity. With `dataset` given, the raw pattern is
+    shown behind the markers instead of the gray disks.
 
     Parameters
     ----------
@@ -536,12 +575,14 @@ def plot_pattern_matches(
         If given, the diffraction pattern is shown behind the overlay and
         the gray measured disks are omitted.
     pixel_size : float | None
-        Reciprocal pixel size (1/Angstroms per pixel); required with dataset.
+        Reciprocal pixel size (1/Angstroms per pixel); required with
+        `dataset`.
     origins : np.ndarray | None
         (scan_r, scan_c, 2) fitted origins from measure_origins(); aligns
         the background pattern with the origin-corrected peaks.
     matches : tuple[int, ...], default=(0, 1)
-        Match indices per crystal.
+        Match indices per crystal. Indices a map does not hold (the second
+        match of a map matched with `num_matches=1`) are skipped.
     norm : dict | str | None
         `norm` of `show_2d`, which draws the recorded pattern, e.g.
         {"power": 0.5, "upper_quantile": 0.98}. The default,
@@ -560,7 +601,8 @@ def plot_pattern_matches(
         panel and leave the pattern in the middle of empty space, so the
         default trims the furthest 2%. Pass 1.0 to enclose every peak.
     colors : list | None
-        One color per crystal; defaults to red, blue, green, purple.
+        One color per crystal; defaults to `DEFAULT_PHASE_COLORS`, the
+        palette of the phase map, cycled when there are more crystals.
     marker : str | None
         Matplotlib marker for the simulated peaks. The default is an open
         circle over a diffraction pattern, which leaves the measured disk
@@ -575,11 +617,32 @@ def plot_pattern_matches(
         which keeps the weak spots visible.
     measured_power : float, default=0.5
         Compression applied to the measured intensities before sizing.
+    scalebar : bool, default=True
+        Draw a 0.5 1/Angstrom scale bar in the bottom-left panel.
+    show_measured : bool, default=True
+        Draw the measured peaks as gray disks. Ignored with `dataset`,
+        where the recorded pattern is shown instead.
+    marker_scale : float, default=250.0
+        Marker area, in points^2, of the strongest simulated reflection;
+        the others scale with intensity.
     transpose_plots : bool, default=False
         Panel layout only, nothing in the data is transposed. By default
         rows are probe positions and columns are candidates; True swaps
         them, giving one row per candidate across the positions, which fits
         a few candidates and many positions on a page.
+    axsize : tuple[float, float], default=(3.1, 3.1)
+        Size of one panel in inches.
+
+    Returns
+    -------
+    tuple
+        ``(fig, axs)`` with `axs` a 2D array of panels.
+
+    Raises
+    ------
+    ValueError
+        If `dataset` is given without `pixel_size`, or none of `matches`
+        exists in any map.
     """
     import matplotlib.pyplot as plt
 
@@ -591,8 +654,12 @@ def plot_pattern_matches(
         if isinstance(orientation_maps, (list, tuple))
         else [orientation_maps]
     )
-    if colors is None:
-        colors = ["#d62728", "#1f77b4", "#2ca02c", "#9467bd"]
+    if dataset is not None and pixel_size is None:
+        raise ValueError(
+            "plot_pattern_matches needs pixel_size (1/Angstroms per pixel) to place the "
+            "dataset behind the peaks"
+        )
+    colors = [tuple(c) for c in phase_color_cycle(len(oms), colors)]
     peaks = oms[0].peaks
     fields = peaks.fields
     ix = [fields.index(f) for f in ("qx", "qy", "intensity")]
@@ -602,7 +669,10 @@ def plot_pattern_matches(
     th = np.deg2rad(-rot_deg)
     rot_back = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
 
-    panels = [(i, m) for i in range(len(oms)) for m in matches]
+    # a map matched with fewer matches than requested has no panel for them
+    panels = [(i, m) for i, om in enumerate(oms) for m in matches if 0 <= m < om.quats.shape[2]]
+    if not panels:
+        raise ValueError(f"none of matches={tuple(matches)} exists in the orientation maps")
     n_pos, n_pan = len(positions), len(panels)
     n_r, n_c = (n_pan, n_pos) if transpose_plots else (n_pos, n_pan)
     fig, axs = plt.subplots(
@@ -611,7 +681,7 @@ def plot_pattern_matches(
         figsize=(axsize[0] * n_c, axsize[1] * n_r + 0.2),
         squeeze=False,
     )
-    over_image = dataset is not None and pixel_size is not None
+    over_image = dataset is not None
     if marker is None:
         marker = "o" if over_image else "+"
     ordinal = ["1st", "2nd", "3rd"] + [f"{k + 1}th" for k in range(3, 9)]
@@ -621,7 +691,7 @@ def plot_pattern_matches(
     # collapse its axes, so the limit is taken over all of them together.
     if q_max_plot is not None:
         q_lim = float(q_max_plot)
-    elif dataset is not None and pixel_size is not None:
+    elif over_image:
         q_lim = dataset.shape[-1] / 2 * pixel_size
     else:
         if not 0.0 < q_max_quantile <= 1.0:
@@ -794,7 +864,28 @@ def plot_cluster_map(
     scalebar: dict | None = None,
     figax=None,
 ):
-    """Map of orientation clusters (variants), one color per cluster."""
+    """Map of orientation clusters (variants), one color per cluster.
+
+    Also available as :meth:`OrientationMap.plot_cluster_map`.
+
+    Parameters
+    ----------
+    om : OrientationMap
+        The clustered map; gives the crystal name for the title.
+    clusters : dict
+        Output of :meth:`OrientationMap.cluster_orientations`.
+    colors : sequence | None
+        One color per cluster, cycled; defaults to `CLUSTER_COLORS`.
+    scalebar : dict | None
+        Real-space scale bar, e.g. {"sampling": 30, "units": "A"}.
+    figax : (fig, ax) | None
+        Existing axes to draw into.
+
+    Returns
+    -------
+    tuple
+        ``(fig, ax)``. Unassigned positions are black.
+    """
     import matplotlib.pyplot as plt
 
     labels = clusters["labels"].numpy()
@@ -840,17 +931,52 @@ def plot_cluster_map(
     return fig, ax
 
 
-def _pole_points(
-    quats: torch.Tensor, crystal: Crystal, pole, mask=None
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Stereographic (x, y, weight) of all symmetry-equivalent poles."""
-    q = quats.reshape(-1, 4)
-    p = torch.as_tensor(pole, dtype=torch.float64)
-    p = p / torch.linalg.norm(p)
+def _pole_family(crystal: Crystal, pole) -> torch.Tensor:
+    """Unit Cartesian vectors (F, 3) of every symmetry equivalent of a pole.
+
+    Parameters
+    ----------
+    crystal : Crystal
+        Gives the lattice and the symmetry rotations.
+    pole : array-like
+        Crystal direction in Miller indices, [uvw] or [uvtw].
+
+    Returns
+    -------
+    torch.Tensor
+        The distinct symmetry images of the pole and their inverses.
+    """
+    p = crystal.direction_vector(pole).to(torch.float64)
     Rs = quat_to_matrix(crystal.sym_quats)
     fam = torch.einsum("sij,j->si", Rs, p)
     fam = torch.unique(torch.round(fam / 1e-6) * 1e-6, dim=0)
-    fam = torch.cat([fam, -fam])
+    return torch.cat([fam, -fam])
+
+
+def _pole_points(
+    quats: torch.Tensor, crystal: Crystal, pole, mask=None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Stereographic projection of every symmetry-equivalent pole of a map.
+
+    Parameters
+    ----------
+    quats : torch.Tensor
+        (..., 4) orientations.
+    crystal : Crystal
+        Gives the lattice and the symmetry rotations.
+    pole : array-like
+        Crystal direction in Miller indices, [uvw] or [uvtw].
+    mask : np.ndarray | None
+        Per-orientation weights; zero-weight orientations are dropped.
+
+    Returns
+    -------
+    tuple of np.ndarray
+        (x, y, weight, source) of the upper-hemisphere poles, with `source`
+        the flat index of the orientation each pole came from.
+    """
+    q = quats.reshape(-1, 4)
+    fam = _pole_family(crystal, pole)
     n_fam = fam.shape[0]
     R = quat_to_matrix(q)
     poles_lab = torch.einsum("nij,sj->nsi", R, fam)
@@ -869,13 +995,23 @@ def _pole_points(
 
 
 def _pole_scatter_xy(quats: torch.Tensor, crystal: Crystal, pole) -> np.ndarray:
-    """Stereographic (x, y) of all symmetry-equivalent poles for orientations."""
-    p = torch.as_tensor(pole, dtype=torch.float64)
-    p = p / torch.linalg.norm(p)
-    Rs = quat_to_matrix(crystal.sym_quats)
-    fam = torch.einsum("sij,j->si", Rs, p)
-    fam = torch.unique(torch.round(fam / 1e-6) * 1e-6, dim=0)
-    fam = torch.cat([fam, -fam])
+    """Stereographic (x, y) of all symmetry-equivalent poles for orientations.
+
+    Parameters
+    ----------
+    quats : torch.Tensor
+        (4,) or (N, 4) orientations.
+    crystal : Crystal
+        Gives the lattice and the symmetry rotations.
+    pole : array-like
+        Crystal direction in Miller indices, [uvw] or [uvtw].
+
+    Returns
+    -------
+    np.ndarray
+        (P, 2) projected upper-hemisphere poles.
+    """
+    fam = _pole_family(crystal, pole)
     R = quat_to_matrix(torch.atleast_2d(quats))
     v = torch.einsum("nij,sj->nsi", R, fam).reshape(-1, 3)
     v = v[v[:, 2] > -1e-8]
@@ -895,18 +1031,33 @@ def plot_cluster_pole_figure(
 ):
     """Pole figure of the cluster mean orientations, one color per cluster.
 
+    Also available as :meth:`OrientationMap.plot_cluster_pole_figure`.
+
     Parameters
     ----------
     om : OrientationMap
         Provides the crystal symmetry of the clustered phase.
     clusters : dict
-        Output of OrientationMap.cluster_orientations().
+        Output of :meth:`OrientationMap.cluster_orientations`.
     pole : array-like
-        Crystal-Cartesian pole direction of the plotted family.
+        Crystal direction of the plotted family in Miller indices, [uvw] or
+        [uvtw].
+    pole_label : str, default=""
+        Legend label prefix of the pole family, e.g. "[0001]".
     overlay : dict | None
         Second pole family drawn as open markers, e.g.
         {"quats": q_beta_mean, "crystal": ti_beta, "pole": (1, 1, 0),
-        "label": "<110> beta"} -- the standard Burgers relationship check.
+        "label": "<110> beta"}, the standard Burgers relationship check.
+        Its "pole" is in Miller indices of its own crystal.
+    colors : sequence | None
+        One color per cluster, cycled; defaults to `CLUSTER_COLORS`.
+    figax : (fig, ax) | None
+        Existing axes to draw into.
+
+    Returns
+    -------
+    tuple
+        ``(fig, ax)``.
     """
     import matplotlib.pyplot as plt
 
@@ -988,26 +1139,46 @@ def plot_pole_figure(
     om : OrientationMap
         Matched orientation map.
     pole : array-like, default=(0, 0, 1)
-        Crystal direction (Cartesian) of the pole family.
+        Crystal direction of the pole family in Miller indices, [uvw] or
+        [uvtw]; converted to Cartesian with the crystal's lattice.
+    match : int, default=0
+        Which match index to plot.
     mask : np.ndarray | None
         Per-position weights (e.g. phase mask).
     bins : int, default=181
         Histogram bins across the stereographic disk.
     color_by : {"density", "ipf"}, default="density"
-        "density": grayscale-to-color histogram. "ipf": each contribution is
-        colored by the IPF (zone axis) color of its probe position, and the
-        histogram density sets the brightness, black background.
+        "density": white through yellow and red to black with increasing
+        density. "ipf": each contribution is colored by the IPF (zone axis)
+        color of its probe position, blended from a white background as the
+        density rises, with the color wedge in a panel beside it.
     int_range : tuple, default=(0.0, 1.0)
-        Density display range as fractions of the maximum bin: values below
-        the lower limit saturate to black, above the upper limit to full
-        brightness.
+        Density display range as fractions of the 98th percentile of the
+        occupied bins: values below the lower limit show as background,
+        above the upper limit at full strength.
+    smooth_sigma : float, default=1.5
+        Gaussian blur of the histogram, in bins; 0 disables it.
     label : str | None
         Annotation for the pole family, e.g. "(0001)" or "{110}".
     grid : bool, default=True
         Draw polar-angle circles and azimuth spokes every 30 degrees.
+    overlay : dict | None
+        A second pole family drawn on top. With an "om" key, the density
+        of that map's poles is drawn as contours:
+        {"om": om_beta, "pole": (1, 1, 0), "match": 0, "mask": mask_beta,
+        "label": "<110> beta"}. Otherwise fixed orientations are drawn as
+        open markers: {"quats": q, "crystal": xtl, "pole": (1, 1, 0),
+        "label": ...}. Poles are Miller indices of the overlay's crystal.
     saturation_power, chroma : float | None
         Color wedge shape, used when `color_by` is "ipf"; see
         :func:`plot_orientation_map`.
+    figax : (fig, ax) | (fig, (ax, ax_legend)) | None
+        Existing axes; the legend panel is used only with `color_by="ipf"`.
+
+    Returns
+    -------
+    tuple
+        ``(fig, ax)`` with `ax` the pole figure panel.
     """
     import matplotlib.pyplot as plt
 

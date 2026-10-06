@@ -130,3 +130,97 @@ def test_symmetry_reduced_zone_angles():
     assert float(ang[0, 1]) < 1e-6 and float(ang[0, 2]) < 1e-6
     assert float(ang[3, 4]) < 1e-6
     assert abs(float(ang[0, 3]) - 54.7356) < 1e-3
+
+
+def test_misorientation_axis_angle():
+    from quantem.diffraction.rotations import misorientation_axis_angle
+
+    axis = torch.tensor([1.0, 2.0, 2.0], dtype=torch.float64) / 3
+    qa = qnormalize(torch.tensor([0.9, 0.1, -0.3, 0.2], dtype=torch.float64))
+    dq = quat_from_axis_angle(axis, torch.tensor(np.deg2rad(35.0), dtype=torch.float64))
+    qb = qmult(qa, dq)  # R(qb) = R(qa) R(dq): dq is in the crystal frame of qa
+    ax, ang = misorientation_axis_angle(qa, qb)
+    assert abs(float(ang) - 35.0) < 1e-8
+    assert torch.allclose(ax, axis, atol=1e-8)
+
+    # with cubic symmetry, a 90 degree turn about [001] plus 10 degrees
+    # about the same axis reduces to 10 degrees, axis unchanged up to sign
+    sym = _cubic_sym_quats()
+    z = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
+    qb = qmult(qa, quat_from_axis_angle(z, torch.tensor(np.deg2rad(100.0), dtype=torch.float64)))
+    ax, ang = misorientation_axis_angle(qa, qb, sym)
+    assert abs(float(ang) - 10.0) < 1e-6
+    assert abs(abs(float(ax @ z)) - 1.0) < 1e-6
+    assert abs(float(ang) - float(misorientation_angle_deg(qa, qb, sym))) < 1e-6
+
+    # broadcasting over a batch
+    qs = qnormalize(torch.randn(7, 4, dtype=torch.float64))
+    ax, ang = misorientation_axis_angle(qs, qs[:1], sym)
+    assert ax.shape == (7, 3) and ang.shape == (7,)
+    assert torch.allclose(ang, misorientation_angle_deg(qs, qs[:1], sym), atol=1e-4)
+
+
+def _cubic_sym_quats():
+    import itertools
+
+    from quantem.diffraction.rotations import symmetry_quaternions
+
+    # the 24 proper rotations of m-3m as signed permutation matrices
+    mats = []
+    for perm in itertools.permutations(range(3)):
+        for signs in itertools.product((1, -1), repeat=3):
+            M = np.zeros((3, 3), dtype=int)
+            for i, (j, s) in enumerate(zip(perm, signs)):
+                M[i, j] = s
+            if round(np.linalg.det(M)) == 1:
+                mats.append(M)
+    return symmetry_quaternions(np.array(mats), np.eye(3))
+
+
+def test_symmetry_aligned():
+    from quantem.diffraction.rotations import symmetry_aligned
+
+    torch.manual_seed(3)
+    sym = _cubic_sym_quats()
+    assert sym.shape == (24, 4)
+    ref = qnormalize(torch.randn(4, dtype=torch.float64))
+    # small perturbations of the reference, each moved to a random symmetry
+    # branch: alignment must bring every one back next to the reference
+    eps = quat_from_axis_angle(
+        torch.randn(10, 3, dtype=torch.float64), torch.full((10,), 0.05, dtype=torch.float64)
+    )
+    near = qmult(ref.expand(10, 4), eps)
+    far = qmult(near, sym[torch.randint(1, 24, (10,))])
+    out = symmetry_aligned(ref, far, sym)
+    assert out.shape == (10, 4)
+    assert torch.allclose(out, qnormalize(near), atol=1e-10)
+    # the same orientations as the inputs
+    assert torch.allclose(
+        misorientation_angle_deg(out, far, sym), torch.zeros(10, dtype=torch.float64), atol=1e-4
+    )
+
+
+def test_sample_zone_axis_cap():
+    from quantem.diffraction.rotations import sample_zone_axis_cap
+
+    axis = torch.tensor([1.0, -1.0, 2.0], dtype=torch.float64)
+    unit = axis / torch.linalg.norm(axis)
+    pts = sample_zone_axis_cap(axis, 10.0, 2.0)
+    assert pts.ndim == 2 and pts.shape[1] == 3
+    assert torch.allclose(
+        torch.linalg.norm(pts, dim=1), torch.ones(pts.shape[0], dtype=torch.float64), atol=1e-12
+    )
+    ang = torch.rad2deg(torch.acos((pts @ unit).clamp(-1, 1)))
+    assert float(ang.max()) <= 10.0 + 1e-9
+    # equal-area count: cap area / step^2
+    n_expect = 2 * np.pi * (1 - np.cos(np.deg2rad(10))) / np.deg2rad(2) ** 2
+    assert abs(pts.shape[0] - np.ceil(n_expect)) <= 1
+    # covers the cap: every direction in it has a sample within ~step
+    rng = np.random.default_rng(0)
+    probe = sample_zone_axis_cap(axis, 9.0, 0.5)[rng.choice(300, 50)]
+    d = torch.rad2deg(torch.acos((probe @ pts.T).clamp(-1, 1))).min(dim=1).values
+    assert float(d.max()) < 2.0
+    # zero half angle: the axis alone; the poles take the short path
+    assert torch.allclose(sample_zone_axis_cap(axis, 0.0, 1.0), unit[None])
+    down = sample_zone_axis_cap(torch.tensor([0.0, 0.0, -1.0]), 5.0, 1.0)
+    assert float(down[:, 2].max()) < -np.cos(np.deg2rad(5.0)) + 1e-9

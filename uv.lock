@@ -3687,7 +3687,7 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ase" },
+    { name = "ase", specifier = ">=3.23" },
     { name = "cmasher", specifier = ">=1.9.2" },
     { name = "colorspacious" },
     { name = "dill" },
@@ -3701,7 +3701,7 @@ requires-dist = [
     { name = "rosettasciio", specifier = ">=0.8.0" },
     { name = "scikit-image", specifier = ">=0.25.2" },
     { name = "scipy" },
-    { name = "spglib" },
+    { name = "spglib", specifier = ">=2.5" },
     { name = "tensorboard", specifier = ">=2.19.0" },
     { name = "torch", specifier = ">=2.7.0" },
     { name = "torchinfo", specifier = ">=1.8.0" },

@@ -1,12 +1,13 @@
+from typing import TYPE_CHECKING, Any
+
 import numpy as np
 from numpy.typing import NDArray
-from typing import Any, TYPE_CHECKING
 from scipy.ndimage import map_coordinates
+
+from quantem.core.datastructures.dataset4d import Dataset4d
 
 if TYPE_CHECKING:
     from .dataset4dstem import Dataset4dstem
-
-from quantem.core.datastructures.dataset4d import Dataset4d
 
 
 class Polar4dstem(Dataset4d):
@@ -60,6 +61,30 @@ class Polar4dstem(Dataset4d):
         signal_units: str = "arb. units",
         metadata: dict | None = None,
     ) -> "Polar4dstem":
+        """
+        Create a Polar4dstem from a 4D array shaped (scan_y, scan_x, phi, r).
+
+        Parameters
+        ----------
+        array : NDArray
+            Polar data, shape (scan_y, scan_x, n_phi, n_r).
+        name : str, optional
+            Dataset name, by default "Polar 4D-STEM dataset".
+        origin : NDArray | tuple | list | float | int, optional
+            Origin of each axis in calibrated units, by default zeros.
+        sampling : NDArray | tuple | list | float | int, optional
+            Sampling of each axis, by default ones.
+        units : list[str] | tuple | list, optional
+            Units of each axis, by default ["pixels", "pixels", "deg", "pixels"].
+        signal_units : str, optional
+            Units of the array values, by default "arb. units".
+        metadata : dict, optional
+            Metadata. Missing "polar_*" keys are set to None.
+
+        Returns
+        -------
+        Polar4dstem
+        """
         array = np.asarray(array)
         if array.ndim != 4:
             raise ValueError("Polar4dstem.from_array expects a 4D array.")
@@ -84,11 +109,13 @@ class Polar4dstem(Dataset4d):
 
     @property
     def n_phi(self) -> int:
-        return int(self.array.shape[2])
+        """Number of azimuthal bins (axis 2)."""
+        return int(self.shape[2])
 
     @property
     def n_r(self) -> int:
-        return int(self.array.shape[3])
+        """Number of radial bins (axis 3)."""
+        return int(self.shape[3])
 
 
 def _precompute_polar_coords(
@@ -151,8 +178,8 @@ def _precompute_polar_coords(
 
 def dataset4dstem_polar_transform(
     self: "Dataset4dstem",
-    origin_row: float | int | NDArray,
-    origin_col: float | int | NDArray,
+    origin_row: float,
+    origin_col: float,
     ellipse_params: tuple[float, float, float] | None = None,
     num_annular_bins: int = 180,
     radial_min: float = 0.0,
@@ -162,9 +189,54 @@ def dataset4dstem_polar_transform(
     name: str | None = None,
     signal_units: str | None = None,
 ) -> Polar4dstem:
-    if self.array.ndim != 4:
+    """
+    Resample every diffraction pattern onto a polar (phi, r) grid.
+
+    Bound to `Dataset4dstem.polar_transform`. Uses bilinear interpolation
+    (`scipy.ndimage.map_coordinates`, order 1); samples outside the detector
+    are set to 0.
+
+    Parameters
+    ----------
+    origin_row, origin_col : float
+        Center of the polar grid on the detector, in detector pixels. The same
+        center is used for all scan positions.
+    ellipse_params : tuple[float, float, float], optional
+        Elliptical distortion (a, b, theta_deg): the radius along the
+        direction theta_deg (degrees) is scaled by a / b. None for circular
+        sampling.
+    num_annular_bins : int, optional
+        Number of azimuthal bins, by default 180.
+    radial_min : float, optional
+        First radial bin in detector pixels, by default 0.
+    radial_max : float, optional
+        Radial upper limit (exclusive) in detector pixels. If None, the
+        distance from the origin to the nearest detector edge.
+    radial_step : float, optional
+        Radial bin width in detector pixels, by default 1.
+    two_fold_rotation_symmetry : bool, optional
+        If True, phi covers [0, 180) degrees instead of [0, 360).
+    name : str, optional
+        Name of the output, by default "<name>_polar".
+    signal_units : str, optional
+        Signal units of the output, by default those of this dataset.
+
+    Returns
+    -------
+    Polar4dstem
+        Array shaped (scan_y, scan_x, n_phi, n_r). Phi is in degrees, 0 along
+        +column and increasing toward +row. The radial axis uses the sampling
+        and units of the last detector axis. The polar parameters are stored
+        in metadata under "polar_*" keys.
+
+    Notes
+    -----
+    Tensor-backed datasets are copied to a CPU numpy array first.
+    """
+    array = self.numpy()
+    if array.ndim != 4:
         raise ValueError("polar_transform requires a 4D-STEM dataset (ndim=4).")
-    scan_y, scan_x, ny, nx = self.array.shape
+    scan_y, scan_x, ny, nx = array.shape
     origin_row_f = float(origin_row)
     origin_col_f = float(origin_col)
     coords, phi_bins, radial_bins, radial_max_eff = _precompute_polar_coords(
@@ -181,11 +253,11 @@ def dataset4dstem_polar_transform(
     )
     n_phi = phi_bins.size
     n_r = radial_bins.size
-    result_dtype = np.result_type(self.array.dtype, np.float32)
+    result_dtype = np.result_type(array.dtype, np.float32)
     out = np.empty((scan_y, scan_x, n_phi, n_r), dtype=result_dtype)
     for iy in range(scan_y):
         for ix in range(scan_x):
-            dp = self.array[iy, ix]
+            dp = array[iy, ix]
             out[iy, ix] = map_coordinates(
                 dp,
                 coords,

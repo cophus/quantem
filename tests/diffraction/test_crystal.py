@@ -486,3 +486,113 @@ def test_hexagonal_pseudo_symmetry_can_be_adopted(tmp_path):
     loose = Crystal.from_cif(path, pseudo_symmetry_intensity_tol=1.0, verbose=False)
     assert loose.pointgroup_matching == "6/mmm"
     assert loose.sym_quats_matching.shape[0] == 12
+
+
+def test_direction_vector():
+    cubic = Crystal.from_ase(bulk("Au", "fcc", a=4.08, cubic=True), verbose=False)
+    v = cubic.direction_vector([1, 1, 0])
+    assert torch.allclose(v, torch.tensor([1.0, 1.0, 0.0], dtype=torch.float64) / np.sqrt(2))
+    hcp = Crystal.from_ase(bulk("Ti", "hcp", a=2.95, c=4.686), verbose=False)
+    a1 = hcp.lat_real[0] / torch.linalg.norm(hcp.lat_real[0])
+    c = hcp.lat_real[2] / torch.linalg.norm(hcp.lat_real[2])
+    assert torch.allclose(hcp.direction_vector([2, -1, -1, 0]), a1)
+    assert torch.allclose(hcp.direction_vector([0, 0, 0, 1]), c)
+    # 3- and 4-index forms of the same direction agree
+    assert torch.allclose(hcp.direction_vector([1, 0, 0]), hcp.direction_vector([2, -1, -1, 0]))
+    with pytest.raises(ValueError):
+        hcp.direction_vector([1, 0])
+
+
+def test_miller_bravais_round_trip():
+    from quantem.diffraction.crystal import miller_bravais_to_miller, miller_to_miller_bravais
+
+    assert miller_to_miller_bravais([1, 0, 0]).tolist() == [2, -1, -1, 0]
+    assert miller_to_miller_bravais([1, 1, 0]).tolist() == [1, 1, -2, 0]
+    assert miller_to_miller_bravais([0, 0, 1]).tolist() == [0, 0, 0, 1]
+    assert miller_bravais_to_miller([2, -1, -1, 0]).tolist() == [1, 0, 0]
+    rng = np.random.default_rng(0)
+    uvw = rng.integers(-4, 5, size=(200, 3))
+    uvw = uvw[np.abs(uvw).sum(axis=1) > 0]
+    uvtw = miller_to_miller_bravais(uvw)
+    assert np.all(uvtw[:, 2] == -(uvtw[:, 0] + uvtw[:, 1]))
+    back = miller_bravais_to_miller(uvtw)
+    reduced = uvw // np.gcd.reduce(np.abs(uvw), axis=1)[:, None]
+    assert np.array_equal(back, reduced)
+
+
+def test_format_direction():
+    from quantem.diffraction.crystal import format_direction
+
+    bar = "̅"
+    assert format_direction(None) == ""
+    assert format_direction([1, -1, 0], mathtext=False) == "[11" + bar + "0]"
+    assert format_direction([1, -1, 0]) == "[1$\\bar{1}$0]"
+    assert format_direction([1, 0, 0], hexagonal=True, mathtext=False) == (
+        "[21" + bar + "1" + bar + "0]"
+    )
+
+
+def test_spglib_no_deprecation_warnings():
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        xtl = Crystal.from_ase(bulk("Ti", "hcp", a=2.95, c=4.686), verbose=False)
+    assert xtl.pointgroup == "6/mmm"
+
+
+def test_generate_pattern_validates_excitation_model(ti_beta):
+    q = quat_from_zone_axis(torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64))
+    with pytest.raises(ValueError, match="excitation_model"):
+        ti_beta.generate_pattern(q, excitation_model="slabb")
+    with pytest.raises(ValueError, match="thickness_A"):
+        ti_beta.generate_pattern(q, excitation_model="slab")
+
+
+def test_generate_pattern_foil_normal():
+    from quantem.diffraction.illumination import excitation_coefficients
+    from quantem.diffraction.rotations import qrotate
+
+    xtl = Crystal.from_ase(bulk("Ti", "hcp", a=2.95, c=4.686), verbose=False)
+    xtl.calculate_structure_factors(k_max=1.5)
+    c_axis = xtl.direction_vector([0, 0, 0, 1])
+
+    # foil normal along the beam: identical to the default geometry
+    q0 = quat_from_zone_axis(c_axis, in_plane_deg=10.0)
+    p0 = xtl.generate_pattern(q0, energy_ev=200e3)
+    p1 = xtl.generate_pattern(q0, energy_ev=200e3, foil_normal=(0, 0, 0, 1))
+    for key in ("qx", "qy", "intensity", "s_g"):
+        assert torch.allclose(p0[key], p1[key], atol=1e-12)
+
+    # a tilted flake: each spot sits where its rod meets the Ewald sphere
+    tilt = xtl.direction_vector([0, 1, -1, 6])
+    q = quat_from_zone_axis(tilt, in_plane_deg=10.0)
+    p = xtl.generate_pattern(q, energy_ev=200e3, foil_normal=(0, 0, 0, 1))
+    assert p["qx"].shape[0] > 5
+    n_lab = qrotate(q, c_axis[None])[0]
+    assert float(n_lab[2]) < 0.999  # really tilted
+    g_lab = qrotate(q, p["hkl"].to(torch.float64) @ xtl.lat_recip)
+    spot = g_lab - p["s_g"][:, None] * n_lab[None]
+    assert torch.allclose(spot[:, :2], torch.stack([p["qx"], p["qy"]], dim=1), atol=1e-12)
+    s_spot, _, _ = excitation_coefficients(spot, 200e3)
+    # first order in s_g: the residual is far below the excitation error
+    s_g = p["s_g"].numpy()
+    big = np.abs(s_g) > 1e-3
+    assert np.all(np.abs(s_spot[big]) < 0.05 * np.abs(s_g[big]))
+    # and moves off the projection of g, which is where it sits by default
+    assert float((spot[:, :2] - g_lab[:, :2]).abs().max()) > 1e-4
+
+
+def test_wk_factor_without_thermal_motion():
+    from quantem.diffraction.wk_scattering_factors import compute_WK_factor
+
+    g = np.linspace(0.0, 3.0, 61)
+    f0 = compute_WK_factor(g, 29, 200e3, thermal_sigma=None)
+    assert f0.dtype == np.complex128 and f0.shape == g.shape
+    assert np.all(np.isfinite(f0))
+    # the phonon absorption vanishes continuously as the displacement -> 0
+    f_small = compute_WK_factor(g, 29, 200e3, thermal_sigma=1e-3)
+    assert np.allclose(f_small, f0, rtol=1e-3, atol=1e-7)
+    # elastic part is monotonic in g, imaginary part positive
+    assert np.all(np.diff(f0.real) < 0)
+    assert np.all(compute_WK_factor(g, 29, 200e3, thermal_sigma=0.08).imag > 0)

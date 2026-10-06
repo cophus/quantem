@@ -1,5 +1,6 @@
 import gzip
 import io
+import json
 import os
 import shutil
 import tempfile
@@ -180,6 +181,32 @@ class AutoSerialize:
             except (ValueError, RuntimeError):
                 return val
         return val
+
+    @staticmethod
+    def _read_ase_atoms(group: zarr.Group) -> Any:
+        """Rebuild an ase.Atoms written by `_serialize_value`."""
+        from ase import Atoms
+
+        if "arrays" in group.group_keys():
+            arrays_group = AutoSerialize._get_group(group, "arrays")
+            arrays = {
+                k: AutoSerialize._read_array_np(arrays_group, k) for k in arrays_group.array_keys()
+            }
+            arrays.update(
+                {k: np.asarray(v) for k, v in dict(group.attrs.get("text_arrays", {})).items()}
+            )
+        else:  # files written before per-atom arrays were stored
+            arrays = {k: AutoSerialize._read_array_np(group, k) for k in ("numbers", "positions")}
+        atoms = Atoms(
+            numbers=arrays.pop("numbers"),
+            positions=arrays.pop("positions"),
+            cell=AutoSerialize._read_array_np(group, "cell"),
+            pbc=AutoSerialize._read_array_np(group, "pbc"),
+        )
+        for key, arr in arrays.items():
+            atoms.set_array(key, arr)
+        atoms.info.update(dict(group.attrs.get("info", {})))
+        return atoms
 
     @staticmethod
     def _is_autoserialize_instance(value: Any) -> bool:
@@ -462,18 +489,25 @@ class AutoSerialize:
             # Don't try to save the state - it's not essential for core functionality
 
         elif type(value).__module__.startswith("ase.") and type(value).__name__ == "Atoms":
-            # An ase.Atoms is fully defined by these four arrays; storing them
-            # keeps the file readable and avoids pickling an ase version in.
+            # Stored as plain arrays so the file stays readable without pickling
+            # an ase version in: cell, pbc, every per-atom array in atoms.arrays
+            # (numbers, positions, occupancy, tags, masses, ...) and the
+            # JSON-serializable entries of atoms.info. Constraints and attached
+            # calculators are not saved.
             subgroup = group.require_group(name)
             subgroup.attrs["_ase_atoms"] = True
-            self._write_ndarray(
-                subgroup, "numbers", np.asarray(value.get_atomic_numbers()), compressors
-            )
-            self._write_ndarray(
-                subgroup, "positions", np.asarray(value.get_positions()), compressors
-            )
             self._write_ndarray(subgroup, "cell", np.asarray(value.get_cell()), compressors)
             self._write_ndarray(subgroup, "pbc", np.asarray(value.get_pbc()), compressors)
+            arrays_group = subgroup.require_group("arrays")
+            text_arrays = {}
+            for key, arr in value.arrays.items():
+                arr = np.asarray(arr)
+                if arr.dtype.kind in "biufc":
+                    self._write_ndarray(arrays_group, key, arr, compressors)
+                else:
+                    text_arrays[key] = arr.tolist()
+            subgroup.attrs["text_arrays"] = _json_entries(text_arrays, f"{name}.arrays")
+            subgroup.attrs["info"] = _json_entries(dict(value.info), f"{name}.info")
 
         else:
             # Fallback: dill-serialize + gzip-compress
@@ -592,14 +626,7 @@ class AutoSerialize:
 
             # ase.Atoms group
             if subgrp.attrs.get("_ase_atoms"):
-                from ase import Atoms
-
-                atoms = Atoms(
-                    numbers=AutoSerialize._read_array_np(subgrp, "numbers"),
-                    positions=AutoSerialize._read_array_np(subgrp, "positions"),
-                    cell=AutoSerialize._read_array_np(subgrp, "cell"),
-                    pbc=AutoSerialize._read_array_np(subgrp, "pbc"),
-                )
+                atoms = AutoSerialize._read_ase_atoms(subgrp)
                 if type(atoms) in skip_types:
                     continue
                 setattr(obj, name, atoms)
@@ -1557,6 +1584,21 @@ def print_file(
     _recurse(root)
 
 
+def _json_entries(entries: dict, label: str) -> dict:
+    """Return the JSON-serializable entries of a dict, warning about the rest."""
+    kept, dropped = {}, []
+    for key, val in entries.items():
+        try:
+            json.dumps({str(key): val})
+        except (TypeError, ValueError):
+            dropped.append(str(key))
+        else:
+            kept[str(key)] = val
+    if dropped:
+        print(f"Not saving non-JSON-serializable entries of {label}: {dropped}")
+    return kept
+
+
 class Bundle(AutoSerialize):
     """A named collection of serializable objects, saved as one file.
 
@@ -1567,9 +1609,25 @@ class Bundle(AutoSerialize):
         bundle.save("data.zip")
         b = load("data.zip"); b.adf, b.peaks
 
+    Parameters
+    ----------
+    **objects
+        Objects to store, keyed by attribute name. Names must not shadow an
+        existing attribute or method of the class (e.g. ``save``).
+
+    Raises
+    ------
+    ValueError
+        If a name shadows a class attribute or method.
     """
 
     def __init__(self, **objects):
+        reserved = sorted(name for name in objects if hasattr(type(self), name))
+        if reserved:
+            raise ValueError(
+                f"Bundle names {reserved} shadow Bundle/AutoSerialize attributes; "
+                "choose different names."
+            )
         for name, obj in objects.items():
             setattr(self, name, obj)
 

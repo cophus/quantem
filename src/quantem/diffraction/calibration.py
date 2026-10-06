@@ -1,8 +1,27 @@
-"""Diffraction-space calibration against known crystal structures.
+"""Diffraction-space calibration of 4D-STEM Bragg peaks.
 
-Functions here operate on detected Bragg peaks (a quantem Vector) and refine
-the reciprocal-space pixel size by comparing the radial peak histogram with
-the ring positions of a reference crystal.
+Each step works on detected Bragg peaks (a quantem Vector):
+
+- Origins: :func:`measure_origins` fits a plane to the direct-beam position
+  over the scan, for ``BraggVectors.correct_peak_origins``.
+- Scan rotation: :func:`measure_scan_rotation` finds the detector-to-scan
+  rotation from the curl of the center-of-mass field.
+- Pixel size and elliptic distortion: :func:`calibrate` matches the radial
+  peak histogram against the rings of one or more reference crystals and
+  returns a :class:`DiffractionCalibration`.
+- :class:`DiffractionCalibration` holds the pixel size (1/Angstroms per
+  pixel), the ellipse and the rotation, converts pixel peaks to calibrated
+  (qx, qy) peaks with :meth:`DiffractionCalibration.apply`, and can be saved
+  from a standard and reused on another dataset.
+
+:func:`calibrate` is the main entry point. The other functions are
+lower-level steps that act on peaks directly: :func:`peaks_to_calibrated`
+and :func:`calibrate_ellipse` (both used by :func:`calibrate`),
+:func:`calibrate_pixel_size` (radial histogram fit of the scale),
+:func:`calibrate_pixel_size_matching` (scale fit by full orientation
+matching), :func:`scale_peaks` and :func:`apply_ellipse`.
+:func:`refine_calibration` measures the remaining calibration error from
+strain maps after orientation matching.
 """
 
 from __future__ import annotations
@@ -39,17 +58,16 @@ def _measure_raw_origins(bragg_vectors, search_radius: float, center=None) -> np
     return meas
 
 
-def plot_origin_fit(bragg_vectors, origins: np.ndarray, search_radius: float = 6.0, center=None):
-    """Diagnostic for measure_origins: measured vs fit vs residual, both axes."""
+def _plot_origin_panels(meas: np.ndarray, origins: np.ndarray):
+    """Measured origins, plane fit and residual for both detector axes."""
     import matplotlib.pyplot as plt
 
-    meas = _measure_raw_origins(bragg_vectors, search_radius, center)
     fig, axs = plt.subplots(2, 3, figsize=(13.5, 5.6))
     names = ["row", "col"]
     for k in range(2):
         m, f = meas[..., k], origins[..., k]
         resid = m - f
-        center = np.nanmean(m)
+        mean_m = np.nanmean(m)
         span = max(np.nanstd(m) * 3, 1e-3)
         for j, (img, title) in enumerate(
             [
@@ -58,7 +76,7 @@ def plot_origin_fit(bragg_vectors, origins: np.ndarray, search_radius: float = 6
                 (resid, f"residual {names[k]} (px)"),
             ]
         ):
-            c0 = 0.0 if j == 2 else center
+            c0 = 0.0 if j == 2 else mean_m
             sp = max(np.nanstd(resid) * 3, 1e-3) if j == 2 else span
             im = axs[k, j].imshow(
                 img,
@@ -73,6 +91,32 @@ def plot_origin_fit(bragg_vectors, origins: np.ndarray, search_radius: float = 6
             fig.colorbar(im, ax=axs[k, j], shrink=0.85)
     fig.tight_layout()
     return fig, axs
+
+
+def plot_origin_fit(bragg_vectors, origins: np.ndarray, search_radius: float = 6.0, center=None):
+    """Measured origins against the plane fit of :func:`measure_origins`.
+
+    Parameters
+    ----------
+    bragg_vectors : BraggVectors
+        With detected peaks.
+    origins : np.ndarray
+        (scan_row, scan_col, 2) fitted origins from :func:`measure_origins`.
+    search_radius : float, default=6.0
+        Radius in detector pixels searched around `center`, as passed to
+        :func:`measure_origins`.
+    center : tuple of float, optional
+        ``(row, col)`` detector position searched around, as passed to
+        :func:`measure_origins`. Defaults to the detector center.
+
+    Returns
+    -------
+    tuple
+        ``(fig, axs)``, axs of shape (2, 3): rows are the detector row and
+        column, columns are measured, fit and residual, all in pixels.
+    """
+    meas = _measure_raw_origins(bragg_vectors, search_radius, center)
+    return _plot_origin_panels(meas, origins)
 
 
 def measure_origins(
@@ -92,6 +136,9 @@ def measure_origins(
 
     Parameters
     ----------
+    bragg_vectors : BraggVectors
+        With detected peaks, fields (q_row, q_col, intensity) in detector
+        pixels, not yet origin-corrected.
     search_radius : float, default=6.0
         Radius in detector pixels searched around `center`.
     robust : bool, default=True
@@ -154,36 +201,7 @@ def measure_origins(
         out[..., k] = fit
 
     if plot:
-        import matplotlib.pyplot as plt
-
-        fig, axs = plt.subplots(2, 3, figsize=(13.5, 5.6))
-        names = ["row", "col"]
-        for k in range(2):
-            m, f = meas[..., k], out[..., k]
-            resid = m - f
-            center = np.nanmean(m)
-            span = max(np.nanstd(m) * 3, 1e-3)
-            for j, (img, title) in enumerate(
-                [
-                    (m, f"measured origin {names[k]} (px)"),
-                    (f, f"plane fit {names[k]} (px)"),
-                    (resid, f"residual {names[k]} (px)"),
-                ]
-            ):
-                c0 = 0.0 if j == 2 else center
-                s = max(np.nanstd(resid) * 3, 1e-3) if j == 2 else span
-                im = axs[k, j].imshow(
-                    img,
-                    cmap="RdBu_r",
-                    vmin=c0 - s,
-                    vmax=c0 + s,
-                    interpolation="nearest",
-                )
-                axs[k, j].set_title(title, fontsize=10)
-                axs[k, j].set_xticks([])
-                axs[k, j].set_yticks([])
-                fig.colorbar(im, ax=axs[k, j], shrink=0.85)
-        fig.tight_layout()
+        fig, axs = _plot_origin_panels(meas, out)
         return out, fig, axs
     return out
 
@@ -212,6 +230,8 @@ def peaks_to_calibrated(
     ellipse : array-like | None
         [e11, e12] elliptic distortion correction from calibrate_ellipse(),
         applied in the detector frame before the rotation.
+    name : str, default="bragg_peaks_calibrated"
+        Name of the returned Vector.
 
     Returns
     -------
@@ -223,9 +243,7 @@ def peaks_to_calibrated(
     row_counts = np.asarray(peaks_px.row_counts(), dtype=int)
     qrc = flat[:, :2] * pixel_size_inv_A
     if ellipse is not None:
-        e11, e12 = float(ellipse[0]), float(ellipse[1])
-        A = np.array([[1 + e11, e12], [e12, 1 - e11]])
-        qrc = qrc @ A.T
+        qrc = qrc @ _ellipse_matrix(ellipse).T
     if rotation_ccw_deg != 0.0:
         th = np.deg2rad(rotation_ccw_deg)
         rot = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
@@ -251,7 +269,20 @@ def peaks_to_calibrated(
 
 
 def scale_peaks(peaks, scale: float):
-    """Return a copy of a (qx, qy, intensity) Vector with q scaled."""
+    """Return a copy of a (qx, qy, intensity) Vector with q scaled.
+
+    Parameters
+    ----------
+    peaks : Vector
+        Peaks with fields (qx, qy, intensity).
+    scale : float
+        Factor applied to qx and qy, e.g. from :func:`calibrate_pixel_size`.
+
+    Returns
+    -------
+    Vector
+        Scaled copy of `peaks`.
+    """
     out = peaks.copy()
     flat = out.numpy().astype(np.float64)
     flat[:, :2] *= scale
@@ -268,6 +299,21 @@ def radial_histogram(
     bragg_intensity_power: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Intensity-weighted histogram of Bragg peak radii over all positions.
+
+    Parameters
+    ----------
+    peaks : Vector
+        Calibrated peaks with fields (qx, qy, intensity) in 1/Angstroms.
+    k_min, k_max : float, default=0.05, 1.5
+        Range of the bins, 1/Angstroms.
+    k_step : float, default=0.002
+        Bin width, 1/Angstroms.
+    bragg_k_power : float, default=2.0
+        Each peak is weighted by ``|q| ** bragg_k_power``, which offsets the
+        fall-off of the scattering factors with q.
+    bragg_intensity_power : float, default=1.0
+        Each peak is weighted by ``intensity ** bragg_intensity_power``; 0
+        counts every peak equally.
 
     Returns
     -------
@@ -296,7 +342,24 @@ def simulated_ring_profile(
     k_broadening: float = 0.01,
     bragg_k_power: float = 2.0,
 ) -> np.ndarray:
-    """1D ring profile of a crystal: Gaussians at |g| weighted by intensity."""
+    """1D ring profile of a crystal: Gaussians at |g| weighted by intensity.
+
+    Parameters
+    ----------
+    crystal : Crystal
+        With structure factors calculated.
+    k : np.ndarray
+        Scattering vectors to evaluate at, 1/Angstroms.
+    k_broadening : float, default=0.01
+        Gaussian standard deviation of each ring, 1/Angstroms.
+    bragg_k_power : float, default=2.0
+        Each ring is weighted by ``|g| ** bragg_k_power`` times its intensity.
+
+    Returns
+    -------
+    np.ndarray
+        Profile, same shape as `k`.
+    """
     g = crystal.g_len.numpy()
     w = crystal.struct_factors_int.numpy() * g**bragg_k_power
     prof = (w[None, :] * np.exp(-((k[:, None] - g[None, :]) ** 2) / (2 * k_broadening**2))).sum(
@@ -345,13 +408,32 @@ def calibrate_pixel_size_matching(
         Candidate scale factors; defaults to 0.90 ... 1.10 in 2% steps.
     subsample : int, default=8
         Stride of the probe-position grid used for scoring.
+    angle_step_deg : float, default=3.0
+        Zone-axis and in-plane angular step of the orientation plan, degrees.
+    corr_kernel_size : float, default=0.02
+        Matching kernel width, 1/Angstroms. Keep it near the peak position
+        noise: a wide kernel gives partial credit to near-coincident rings
+        at a wrong scale.
+    min_number_peaks : int, default=MIN_NUMBER_PEAKS
+        Positions with fewer peaks are not matched.
+    plot : bool, default=False
+        Plot the score against the scale factor.
+    return_scores : bool, default=False
+        Also return the scale factors and their scores.
+    returnfig : bool, default=False
+        With `plot`, also return the figure and axes.
 
     Returns
     -------
     scale : float
         Best scale factor (parabolic refinement over the score maximum).
-        With return_scores=True, also (scales, scores); with returnfig=True,
-        also (fig, ax).
+        Multiply the pixel size by it.
+    scales, scores : np.ndarray
+        Only with `return_scores`. The score is the mean over phases of the
+        median correlation of the matched positions, 0 for a phase where
+        nothing matched.
+    fig, ax
+        Only with `plot` and `returnfig`.
     """
     from quantem.diffraction.orientation import OrientationMap
 
@@ -382,10 +464,12 @@ def calibrate_pixel_size_matching(
             )
             om.match_orientations(progress_bar=False, min_number_peaks=min_number_peaks)
             corr = om.corr[..., 0]
-            per_phase.append(float(corr[corr > 0].median()))
+            matched = corr[corr > 0]
+            # a phase that indexes nothing at this scale scores zero
+            per_phase.append(float(matched.median()) if matched.numel() > 0 else 0.0)
         scores[i] = float(np.mean(per_phase))
 
-    i_best = int(np.argmax(scores))
+    i_best = int(np.nanargmax(scores)) if np.isfinite(scores).any() else 0
     scale = float(scales[i_best])
     if 0 < i_best < len(scales) - 1:
         c0, c1, c2 = scores[i_best - 1 : i_best + 2]
@@ -438,15 +522,27 @@ def calibrate_pixel_size(
         majority phase of the scan.
     scale_range : tuple, default=(0.8, 1.25)
         Search range of the scale factor.
+    scale_step : float, default=5e-4
+        Step of the scale factor scan.
+    k_min, k_max : float, default=0.05, 1.3
+        Range of scattering vectors compared, 1/Angstroms, after scaling.
+    k_broadening : float, default=0.01
+        Gaussian standard deviation of the simulated rings, 1/Angstroms.
+    bragg_k_power : float, default=2.0
+        Rings are weighted by ``|g| ** bragg_k_power``; see
+        :func:`simulated_ring_profile`.
     plot : bool, default=False
-        Show the measured histogram against the crystal ring positions,
-        before and after applying the scale.
+        Show the scaled histogram against the crystal ring profile.
+    returnfig : bool, default=False
+        With `plot`, also return the figure and axes.
 
     Returns
     -------
     scale : float
         Multiply existing q values (and the pixel size) by this factor,
-        e.g. with scale_peaks(). With returnfig=True, also (fig, axs).
+        e.g. with scale_peaks().
+    fig, ax
+        Only with `plot` and `returnfig`.
     """
     k, hist = radial_histogram(peaks, k_min=k_min * scale_range[0], k_max=k_max / scale_range[0])
     scales = np.arange(scale_range[0], scale_range[1], scale_step)
@@ -512,11 +608,11 @@ def measure_scan_rotation(
     squared curl recovers the angle.
 
     The curl is invariant under 180-degree rotation, so the sign of the
-    measured field cannot distinguish theta from theta + 180. Both candidates
-    are returned; pick the one consistent with a known feature (e.g. a
-    Burgers orientation relationship, or the divergence sign convention of
-    DPC). The returned angle is ready to pass to peaks_to_calibrated() as
-    rotation_ccw_deg.
+    measured field cannot distinguish theta from theta + 180. Only the
+    candidate in [0, 180) is returned; the other is that angle + 180. Pick
+    the one consistent with a known feature (e.g. a Burgers orientation
+    relationship, or the divergence sign convention of DPC). The returned
+    angle is ready to pass to peaks_to_calibrated() as rotation_ccw_deg.
 
     Parameters
     ----------
@@ -531,12 +627,16 @@ def measure_scan_rotation(
         Bragg disks. Recommended for crystalline data.
     plot : bool, default=False
         Plot the curl and divergence measures against the rotation angle.
+    returnfig : bool, default=False
+        With `plot`, also return the figure and axes.
 
     Returns
     -------
     rotation_ccw_deg : float
-        Curl-minimizing rotation in [0, 180); the physical answer is either
-        this angle or this angle + 180. With returnfig=True, also (fig, ax).
+        Curl-minimizing rotation in [0, 180), degrees, on a 0.25 degree
+        grid; the physical answer is either this angle or this angle + 180.
+    fig, ax
+        Only with `plot` and `returnfig`.
     """
     arr = dataset.array
     scan_r, scan_c, H, W = arr.shape
@@ -625,16 +725,27 @@ def calibrate_ellipse(
     ----------
     peaks : Vector
         Calibrated peaks (qx, qy, intensity), approximate scale is fine.
-    k_min, k_max : float
+    k_min, k_max : float, default=0.15, 1.4
         Radial range (1/Angstroms) included in the sharpness measure.
+    n_bins : int, default=800
+        Number of log-radius bins between `k_min` and `k_max`.
+    bragg_k_power : float, default=2.0
+        Each peak is weighted by ``|q| ** bragg_k_power``.
+    bragg_intensity_power : float, default=1.0
+        Each peak is weighted by ``intensity ** bragg_intensity_power``.
     plot : bool, default=False
         Show the radial histogram before and after the correction.
+    returnfig : bool, default=False
+        With `plot`, also return the figure and axes.
 
     Returns
     -------
     ellipse : np.ndarray
-        [e11, e12]; pass to peaks_to_calibrated(ellipse=...) or
-        apply_ellipse(). With returnfig=True, also (fig, ax).
+        [e11, e12], the correction matrix [[1 + e11, e12], [e12, 1 - e11]]
+        that undoes the distortion; pass to peaks_to_calibrated(ellipse=...)
+        or apply_ellipse().
+    fig, ax
+        Only with `plot` and `returnfig`.
     """
     from scipy.optimize import minimize
 
@@ -693,13 +804,58 @@ def calibrate_ellipse(
     return tuple(out) if len(out) > 1 else out[0]
 
 
+def _ellipse_matrix(ellipse) -> np.ndarray:
+    """The correction matrix [[1 + e11, e12], [e12, 1 - e11]] of an ellipse."""
+    e11, e12 = float(ellipse[0]), float(ellipse[1])
+    return np.array([[1 + e11, e12], [e12, 1 - e11]])
+
+
+def _compose_ellipse(ellipse_new, ellipse_prev) -> np.ndarray:
+    """One ellipse equivalent to applying `ellipse_prev`, then `ellipse_new`.
+
+    The product of the two correction matrices is reduced to the traceless
+    symmetric form [[1 + e11, e12], [e12, 1 - e11]]: its isotropic part is
+    a pixel size change, fit separately, and its antisymmetric part is a
+    rotation of second order in the ellipse components.
+
+    Parameters
+    ----------
+    ellipse_new : array-like
+        [e11, e12] fit on peaks that already have `ellipse_prev` applied.
+    ellipse_prev : array-like | None
+        [e11, e12] already applied, or None.
+
+    Returns
+    -------
+    np.ndarray
+        Combined [e11, e12].
+    """
+    if ellipse_prev is None:
+        return np.asarray(ellipse_new, dtype=float)
+    A = _ellipse_matrix(ellipse_new) @ _ellipse_matrix(ellipse_prev)
+    sym = 0.5 * (A + A.T) / (0.5 * np.trace(A))
+    return np.array([0.5 * (sym[0, 0] - sym[1, 1]), sym[0, 1]])
+
+
 def apply_ellipse(peaks, ellipse):
-    """Return a copy of (qx, qy, intensity) peaks with the ellipse applied."""
+    """Return a copy of (qx, qy, intensity) peaks with the ellipse applied.
+
+    Parameters
+    ----------
+    peaks : Vector
+        Peaks with fields (qx, qy, intensity).
+    ellipse : array-like
+        [e11, e12] from :func:`calibrate_ellipse`. Each q is mapped by the
+        correction matrix [[1 + e11, e12], [e12, 1 - e11]].
+
+    Returns
+    -------
+    Vector
+        Corrected copy of `peaks`.
+    """
     out = peaks.copy()
     flat = out.numpy().astype(np.float64)
-    e11, e12 = float(ellipse[0]), float(ellipse[1])
-    A = np.array([[1 + e11, e12], [e12, 1 - e11]])
-    flat[:, :2] = flat[:, :2] @ A.T
+    flat[:, :2] = flat[:, :2] @ _ellipse_matrix(ellipse).T
     out.set_flattened(flat)
     return out
 
@@ -805,6 +961,20 @@ class DiffractionCalibration(AutoSerialize):
 
     A calibration is tied to the detector binning it was measured at, which
     is recorded in `metadata`; `rebin` converts it to another binning.
+
+    Parameters
+    ----------
+    pixel_size : float
+        Reciprocal pixel size, 1/Angstroms per detector pixel.
+    ellipse : array-like | None
+        [e11, e12] elliptic distortion correction, see
+        :func:`calibrate_ellipse`. None applies no correction.
+    rotation_ccw_deg : float, default=0.0
+        Diffraction-to-scan rotation in degrees, see
+        :func:`measure_scan_rotation`.
+    metadata : dict | None
+        Evidence and provenance, e.g. the reference phases, the matched
+        rings and their residual, and the detector binning.
     """
 
     def __init__(
@@ -850,7 +1020,19 @@ class DiffractionCalibration(AutoSerialize):
         return out
 
     def rebin(self, factor: float) -> "DiffractionCalibration":
-        """The same calibration for data binned by `factor` more than this one."""
+        """The same calibration for data binned by `factor` more than this one.
+
+        Parameters
+        ----------
+        factor : float
+            Additional detector binning. The pixel size is multiplied by it;
+            the ellipse and rotation do not depend on binning.
+
+        Returns
+        -------
+        DiffractionCalibration
+            New calibration with ``metadata["binning"]`` updated.
+        """
         md = dict(self.metadata)
         md["binning"] = md.get("binning", 1) * factor
         return DiffractionCalibration(
@@ -946,7 +1128,7 @@ def calibrate(
     k_broadening: float = 0.01,
     bragg_k_power: float = 2.0,
     residual_tol: float = 0.01,
-    plot: bool = True,
+    plot: bool = False,
     figsize: tuple[float, float] = (13.0, 6.4),
     marker_size: float = 8.0,
     zone_axis=None,
@@ -980,11 +1162,25 @@ def calibrate(
     fit_ellipse : bool, default=True
         Fit the elliptic distortion as well as the scale.
     n_iter : int, default=3
-        Ellipse and scale refinement rounds.
+        Ellipse and scale refinement rounds. Each round fits the ellipse
+        left over after the current correction and composes the two.
     scale_search : tuple, default=(0.6, 1.7)
         Capture range of the coarse scan, as a multiple of the guess.
+    k_min, k_max : float, default=0.05, 1.3
+        Range of scattering vectors fit, 1/Angstroms. The ellipse fit uses
+        at least 0.15 as its lower limit.
+    k_broadening : float, default=0.01
+        Gaussian standard deviation of the reference rings in the fine scale
+        fit, 1/Angstroms; the coarse scan uses six times this. Measured rings
+        further than four times this from any reference ring are not counted
+        in the per-ring check.
+    bragg_k_power : float, default=2.0
+        Peaks and rings are weighted by ``|q| ** bragg_k_power``.
     residual_tol : float, default=0.01
         Per-ring residual rms above which the fit is reported as unreliable.
+    plot : bool, default=False
+        Show the ring comparison before and after the fit, for the first
+        reference crystal.
     figsize : tuple, default=(13, 6.4)
         Figure size.
     marker_size : float, default=8.0
@@ -995,10 +1191,22 @@ def calibrate(
         Fit only the rings of this zone, [uvw] or [UVTW] (see
         :func:`zone_reflections`). For a specimen near one zone axis
         everywhere, whose peaks hold no other rings.
+    returnfig : bool, default=False
+        With `plot`, also return the figure and axes.
 
     Returns
     -------
     DiffractionCalibration
+        The pixel size, ellipse and rotation. ``metadata`` holds the matched
+        rings as (measured k, reference k, ratio), their residual rms and
+        whether the fit passed `residual_tol`. With `plot` and `returnfig`,
+        ``(cal, fig, axs)`` instead, axs of shape (2, 2).
+
+    Warns
+    -----
+    UserWarning
+        If fewer than three rings match or their residual rms exceeds
+        `residual_tol`.
 
     Notes
     -----
@@ -1015,7 +1223,7 @@ def calibrate(
 
     peaks_0 = peaks_to_calibrated(peaks_px, pixel_size_guess)
     # coarse: broad rings so the score has a single maximum over a wide range
-    scale, sc_coarse, score_coarse = _fit_scale(
+    scale, _, _ = _fit_scale(
         peaks_0,
         crystals,
         scale_search[0],
@@ -1029,12 +1237,16 @@ def calibrate(
     for it in range(max(1, n_iter)):
         if fit_ellipse:
             pk = peaks_to_calibrated(peaks_px, pixel_size_guess * scale, ellipse=ellipse)
-            ellipse = calibrate_ellipse(
+            # the fit sees peaks with the current ellipse already applied, so
+            # it returns the residual distortion: compose it with the current
+            # correction instead of replacing it
+            residual = calibrate_ellipse(
                 pk, k_min=max(k_min, 0.15), k_max=k_max, bragg_k_power=bragg_k_power
             )
+            ellipse = _compose_ellipse(residual, ellipse)
         pk = peaks_to_calibrated(peaks_px, pixel_size_guess, ellipse=ellipse)
         half = 0.08 / (it + 1)
-        scale, sc_fine, score_fine = _fit_scale(
+        scale, _, _ = _fit_scale(
             pk,
             crystals,
             scale * (1 - half),
@@ -1140,15 +1352,38 @@ def calibrate(
     return (cal, fig, axs) if returnfig else cal
 
 
+# reflections closer than this in |g| (1/Angstroms) are drawn as one ring
+_SHELL_STEP = 0.005
+
+
+def _shells(crystal: Crystal, bragg_k_power: float):
+    """Group a crystal's reflections into rings.
+
+    Returns
+    -------
+    radius : np.ndarray
+        Mean |g| of each ring, 1/Angstroms, ascending.
+    intensity : np.ndarray
+        Summed intensity of each ring, weighted by ``|g| ** bragg_k_power``.
+    index : np.ndarray
+        Ring index of every reflection.
+    """
+    g = crystal.g_len.numpy()
+    ints = crystal.struct_factors_int.numpy() * g**bragg_k_power
+    _, index = np.unique(np.round(g / _SHELL_STEP).astype(np.int64), return_inverse=True)
+    index = index.ravel()
+    count = np.bincount(index)
+    radius = np.bincount(index, weights=g) / count
+    intensity = np.bincount(index, weights=ints)
+    return radius, intensity, index
+
+
 def _ring_shells(crystal: Crystal, k_min: float, k_max: float, bragg_k_power: float):
     """Ring radii of a crystal in (k_min, k_max) and their summed intensity,
     relative to the strongest ring in that range."""
-    g = crystal.g_len.numpy()
-    ints = crystal.struct_factors_int.numpy() * g**bragg_k_power
-    shells = np.round(g / 0.005) * 0.005
-    keep = (shells > k_min) & (shells < k_max)
-    uniq = np.unique(shells[keep])
-    tot = np.array([ints[keep][shells[keep] == u].sum() for u in uniq])
+    radius, intensity, _ = _shells(crystal, bragg_k_power)
+    keep = (radius > k_min) & (radius < k_max)
+    uniq, tot = radius[keep], intensity[keep]
     return uniq, tot / max(float(tot.max()), 1e-30) if tot.size else tot
 
 
@@ -1322,9 +1557,16 @@ def plot_ring_comparison(
         Calibrated peaks (qx, qy, intensity) in 1/Angstroms.
     crystals : Crystal | list[Crystal]
         Reference crystal(s) with structure factors calculated.
+    k_min, k_max : float, default=0.1, 1.5
+        Range of scattering vectors shown, 1/Angstroms.
     k_broadening : float | None
         None draws sharp lines at the ring positions; a value (1/Angstroms)
         draws the broadened ring profile instead.
+    bragg_k_power : float, default=2.0
+        Measured peaks and reference rings are weighted by
+        ``|q| ** bragg_k_power``.
+    label_hkl : bool, default=True
+        Label the strongest rings by their Miller indices.
     label_min_intensity : float, default=0.05
         Label rings whose summed intensity exceeds this fraction of the
         strongest ring.
@@ -1334,11 +1576,18 @@ def plot_ring_comparison(
     zone_axis : sequence of int, optional
         Show only the rings of this zone, [uvw] or [UVTW] (see
         :func:`zone_reflections`).
+    figax : (fig, axs) | None
+        Existing figure and one axis per crystal.
+
+    Returns
+    -------
+    tuple
+        ``(fig, axs)``, axs a 1D array with one axis per crystal.
     """
     import matplotlib.pyplot as plt
 
     xtls = _restrict(crystals, zone_axis)
-    k, hist = radial_histogram(peaks, k_min=k_min, k_max=k_max)
+    k, hist = radial_histogram(peaks, k_min=k_min, k_max=k_max, bragg_k_power=bragg_k_power)
 
     n = len(xtls)
     if figax is None:
@@ -1348,15 +1597,13 @@ def plot_ring_comparison(
         fig, axs = figax
         axs = np.atleast_1d(axs)
 
-    for ci, (ax, xtl) in enumerate(zip(axs, xtls)):
+    for ax, xtl in zip(axs, xtls):
         ax.fill_between(k, hist / hist.max(), color="r", alpha=0.75, lw=0, label="measured")
-        hexagonal = xtl.laue_group in ("6/m", "6/mmm", "-3", "-3m")
+        hexagonal = xtl.hexagonal_matching
         g_len = xtl.g_len.numpy()
         ints = xtl.struct_factors_int.numpy() * g_len**bragg_k_power
         hkl_np = xtl.hkl.numpy()
-        shells = np.round(g_len / 0.01) * 0.01
-        uniq = np.unique(shells)
-        shell_int = np.array([ints[shells == u].sum() for u in uniq])
+        uniq, shell_int, shells = _shells(xtl, bragg_k_power)
         shell_int = shell_int / shell_int.max()
 
         if k_broadening is not None:
@@ -1376,19 +1623,19 @@ def plot_ring_comparison(
         if label_hkl:
             # the strongest rings first, each at least 0.03 1/A from the
             # last, then drawn left to right
-            labeled_g: list[float] = []
+            labeled: list[int] = []
             for j in np.argsort(-shell_int):
                 u, si = uniq[j], shell_int[j]
-                if len(labeled_g) >= n_labels:
+                if len(labeled) >= n_labels:
                     break
                 if u < k_min or u > k_max or si < label_min_intensity:
                     continue
-                if any(abs(u - g0) < 0.03 for g0 in labeled_g):
+                if any(abs(u - uniq[j0]) < 0.03 for j0 in labeled):
                     continue
-                labeled_g.append(u)
-            for rows, u in enumerate(sorted(labeled_g)):
-                in_shell = shells == u
-                idx = np.nonzero(in_shell)[0]
+                labeled.append(int(j))
+            for rows, j in enumerate(sorted(labeled)):
+                u = uniq[j]
+                idx = np.nonzero(shells == j)[0]
                 idx = idx[ints[idx] > 0.99 * ints[idx].max()]
                 key = [tuple(-hkl_np[i]) for i in idx]
                 best = idx[int(np.lexsort(np.array(key).T[::-1])[0])]
@@ -1460,17 +1707,30 @@ def refine_calibration(
         'rotation_deg' : residual detector rotation,
         'ellipse' : (e11, e12) traceless ellipticity components,
         'num_positions' : positions used.
+
+    Raises
+    ------
+    ValueError
+        If `strain_maps` is empty or no position passes the filters.
     """
     As = []
     for i, sm in enumerate(strain_maps):
-        A = np.stack([sm.u_array, sm.v_array], axis=-1)  # (R, C, 2, 2)
+        A = np.stack([sm.g1_array, sm.g2_array], axis=-1)  # (R, C, 2, 2)
         ok = np.isfinite(A).all(axis=(-2, -1))
         dev = np.abs(A - np.eye(2)).max(axis=(-2, -1))
         ok &= dev < max_strain
         if masks is not None and masks[i] is not None:
             ok &= np.asarray(masks[i]) > 0
         As.append(A[ok])
+    if not As:
+        raise ValueError("strain_maps is empty: pass at least one StrainMap.")
     A_all = np.concatenate(As, axis=0)
+    if A_all.shape[0] == 0:
+        raise ValueError(
+            "no positions left for the calibration residual: every strain fit "
+            f"failed, was masked out, or deviates from the identity by more than "
+            f"max_strain={max_strain:g}."
+        )
     M = np.median(A_all, axis=0)
 
     scale = float(np.sqrt(np.abs(np.linalg.det(M))))
@@ -1515,9 +1775,24 @@ def plot_bragg_rings(
         (solid, then dashed line styles).
     n_rings : int, default=8
         Number of rings per crystal, strongest first.
+    q_max : float | None
+        Half-width of the histogram, 1/Angstroms. Defaults to just beyond
+        the largest peak radius.
+    bins : int, default=400
+        Number of histogram bins along each axis.
+    power : float, default=0.25
+        The histogram is shown raised to this power, which brings out weak
+        rings next to the direct beam.
     zone_axis : sequence of int, optional
         Draw only the rings of this zone, [uvw] or [UVTW] (see
         :func:`zone_reflections`).
+    figax : (fig, ax) | None
+        Existing figure and axis.
+
+    Returns
+    -------
+    tuple
+        ``(fig, ax)``.
     """
     import matplotlib.pyplot as plt
 
@@ -1546,11 +1821,7 @@ def plot_bragg_rings(
     colors = ["r", "b", "g"]
     th = np.linspace(0, 2 * np.pi, 361)
     for ci, xtl in enumerate(xtls):
-        g_len = xtl.g_len.numpy()
-        ints = xtl.struct_factors_int.numpy() * g_len**2
-        shells = np.round(g_len / 0.01) * 0.01
-        uniq = np.unique(shells)
-        shell_int = np.array([ints[shells == u].sum() for u in uniq])
+        uniq, shell_int, _ = _shells(xtl, 2.0)
         keep = uniq < q_max
         uniq, shell_int = uniq[keep], shell_int[keep]
         order = np.argsort(shell_int)[::-1][:n_rings]

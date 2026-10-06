@@ -14,9 +14,7 @@ from quantem.diffraction.rotations import qnormalize
 def test_refine_calibration_recovers_distortion():
     torch.manual_seed(1)
     rng = np.random.default_rng(1)
-    xtl = Crystal.from_ase(
-        bulk("Ti", "hcp", a=2.9505, c=4.6855), name="Ti alpha", verbose=False
-    )
+    xtl = Crystal.from_ase(bulk("Ti", "hcp", a=2.9505, c=4.6855), name="Ti alpha", verbose=False)
     xtl.calculate_structure_factors(k_max=1.5)
 
     # global calibration error: 1.5% scale, 0.8% ellipticity, 0.3 deg rotation

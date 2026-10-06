@@ -82,7 +82,23 @@ def excitation_coefficients(
     the same affine model. Without illumination, c_g is the static
     excitation error and a_g = b_g = 0.
 
-    Returns (c, a, b) as float arrays (N,).
+    Parameters
+    ----------
+    g_lab : torch.Tensor | np.ndarray
+        Lab-frame reciprocal vectors (N, 3), 1/Angstroms, with the beam
+        along -z.
+    energy_ev : float
+        Beam energy, eV.
+    precession_deg : float, default=0.0
+        Precession semi-angle, degrees.
+    semiconv_mrad : float, default=0.0
+        Convergence semi-angle, mrad.
+
+    Returns
+    -------
+    c, a, b : np.ndarray
+        Central excitation error, ring amplitude and disk amplitude (N,),
+        1/Angstroms.
     """
     g = np.asarray(
         g_lab.detach().cpu().numpy() if isinstance(g_lab, torch.Tensor) else g_lab, dtype=float
@@ -118,14 +134,19 @@ def relrod_factor(g_lab, n_lab, energy_ev: float, precession_deg: float = 0.0):
     Parameters
     ----------
     g_lab : torch.Tensor | np.ndarray
-        Lab-frame reciprocal vectors (..., 3).
+        Lab-frame reciprocal vectors (..., 3), 1/Angstroms.
     n_lab : torch.Tensor | np.ndarray
         Lab-frame unit plate normal, broadcastable to `g_lab`.
+    energy_ev : float
+        Beam energy, eV.
+    precession_deg : float, default=0.0
+        Precession semi-angle, degrees; sets K as above.
 
     Returns
     -------
     torch.Tensor | np.ndarray
-        f (...,), the same type as `g_lab`.
+        f (...,), dimensionless, the same type as `g_lab`. 1e6 where the rod
+        is within 0.05 K of tangent to the sphere.
     """
     k0 = 1.0 / electron_wavelength_angstrom(energy_ev)
     r = k0 * np.sin(np.deg2rad(precession_deg))
@@ -152,12 +173,35 @@ def averaged_gaussian_intensity_envelope(
     semiconv_mrad: float = 0.0,
     foil_normal_lab=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Envelope, central excitation error and support half-width of every
-    reflection under the illumination: returns (envelope, c, a, b).
+    """Illumination-averaged Gaussian envelope of every reflection.
 
-    With `foil_normal_lab` (a lab-frame unit plate normal) the excitation is
-    measured along the relrod instead of along the beam: c, a and b are the
-    distances along the rod (see :func:`relrod_factor`)."""
+    With `foil_normal_lab` the excitation is measured along the relrod
+    instead of along the beam: c, a and b are the distances along the rod
+    (see :func:`relrod_factor`).
+
+    Parameters
+    ----------
+    g_lab : torch.Tensor | np.ndarray
+        Lab-frame reciprocal vectors (N, 3), 1/Angstroms.
+    energy_ev : float
+        Beam energy, eV.
+    sigma : float
+        Width of the excitation envelope, 1/Angstroms.
+    precession_deg : float, default=0.0
+        Precession semi-angle, degrees.
+    semiconv_mrad : float, default=0.0
+        Convergence semi-angle, mrad.
+    foil_normal_lab : array-like, optional
+        Lab-frame unit plate normal (3,).
+
+    Returns
+    -------
+    envelope : np.ndarray
+        Averaged envelope (N,) in [0, 1].
+    c, a, b : np.ndarray
+        Central excitation error and ring and disk amplitudes (N,),
+        1/Angstroms; a + b is the half-width of the swept range about c.
+    """
     c, a, b = excitation_coefficients(g_lab, energy_ev, precession_deg, semiconv_mrad)
     if foil_normal_lab is not None:
         g_np = g_lab.detach().cpu().numpy() if isinstance(g_lab, torch.Tensor) else g_lab
@@ -190,9 +234,30 @@ def averaged_gaussian_intensity_envelope(
 
 
 def ring_disk_quadrature(r: float, R: float, n_phi: int = 128, n_r: int = 8, n_psi: int = 32):
-    """Positive angular quadrature of the ring x disk illumination, the
-    reference against which the analytic envelope is checked: returns
-    in-plane tilts (M, 2) and normalized weights (M,)."""
+    """Positive quadrature of the ring x disk illumination.
+
+    The reference against which the analytic envelopes are checked.
+
+    Parameters
+    ----------
+    r : float
+        Ring radius, in the units the tilts are wanted in.
+    R : float
+        Disk radius, same units.
+    n_phi : int, default=128
+        Equally spaced points on the ring.
+    n_r : int, default=8
+        Gauss-Legendre radial nodes of the disk (in r^2).
+    n_psi : int, default=32
+        Equally spaced azimuths of the disk.
+
+    Returns
+    -------
+    tilts : np.ndarray
+        In-plane tilts (M, 2), ring point plus disk point.
+    weights : np.ndarray
+        Positive weights (M,) summing to 1.
+    """
     phi = 2 * np.pi * np.arange(n_phi) / n_phi if r > 0 else np.zeros(1)
     ring = r * np.column_stack((np.cos(phi), np.sin(phi)))
     if R > 0:
@@ -218,8 +283,25 @@ def gaussian_envelope_ring_series(c, a, sigma: float, n_terms: int = 6) -> np.nd
 
     which converges in a few terms for v < 1 (the precession sweep of the
     excitation error smaller than the envelope width, the electron
-    diffraction regime); larger v falls back to the transform. Accepts
-    numpy arrays or torch tensors of any shape (a broadcast to c)."""
+    diffraction regime); larger v falls back to the transform.
+
+    Parameters
+    ----------
+    c : np.ndarray | torch.Tensor
+        Central excitation errors, any shape, 1/Angstroms.
+    a : np.ndarray | torch.Tensor | float
+        Ring amplitudes, broadcast to `c`, 1/Angstroms.
+    sigma : float
+        Width of the excitation envelope, 1/Angstroms.
+    n_terms : int, default=6
+        Terms of the sum over n.
+
+    Returns
+    -------
+    np.ndarray | torch.Tensor
+        Envelope in [0, 1], shape of `c`; a float64 tensor when `c` is a
+        tensor.
+    """
     from scipy.special import iv
 
     is_torch = isinstance(c, torch.Tensor)
@@ -244,8 +326,28 @@ def gaussian_envelope_ring_series(c, a, sigma: float, n_terms: int = 6) -> np.nd
 def excitation_amplitudes(
     g_lab: torch.Tensor, energy_ev: float, precession_deg: float, semiconv_mrad: float
 ):
-    """Ring and disk amplitudes (a, b) as torch tensors for lab-frame g of
-    any leading shape (..., 3); zero tensors when no illumination."""
+    """Ring and disk amplitudes of lab-frame reflections, in torch.
+
+    The a and b of :func:`excitation_coefficients`, without c, for any
+    leading shape and differentiable in `g_lab`.
+
+    Parameters
+    ----------
+    g_lab : torch.Tensor
+        Lab-frame reciprocal vectors (..., 3), 1/Angstroms.
+    energy_ev : float
+        Beam energy, eV.
+    precession_deg : float
+        Precession semi-angle, degrees.
+    semiconv_mrad : float
+        Convergence semi-angle, mrad.
+
+    Returns
+    -------
+    a, b : torch.Tensor
+        Ring and disk amplitudes (...,), 1/Angstroms; zero without
+        precession or convergence.
+    """
     lam = electron_wavelength_angstrom(energy_ev)
     k0 = 1.0 / lam
     r = k0 * np.sin(np.deg2rad(precession_deg))
@@ -270,7 +372,22 @@ def slab_envelope(c, a, b, thickness_A: float) -> np.ndarray:
     which reduces to sinc(c z)^2 without illumination; the Born intensity
     of reflection g is (pi |U_g| z / k0)^2 S. Vectorized Gauss-Legendre
     quadrature over v, exact to ~1e-10 for the phase ranges of electron
-    diffraction (c z below ~20)."""
+    diffraction (c z below ~20).
+
+    Parameters
+    ----------
+    c, a, b : array-like
+        Central excitation error, ring amplitude and disk amplitude
+        (1/Angstroms), from :func:`excitation_coefficients`; a and b are
+        broadcast to the shape of c.
+    thickness_A : float
+        Specimen thickness z, Angstroms.
+
+    Returns
+    -------
+    np.ndarray
+        S in [0, 1], same shape as c.
+    """
     c = np.asarray(c, dtype=float)
     a = np.broadcast_to(np.asarray(a, dtype=float), c.shape)
     b = np.broadcast_to(np.asarray(b, dtype=float), c.shape)
@@ -280,12 +397,29 @@ def slab_envelope(c, a, b, thickness_A: float) -> np.ndarray:
 
 
 def gaussian_envelope_ring_torch(c: torch.Tensor, a: torch.Tensor, sigma: float) -> torch.Tensor:
-    """Ring-averaged Gaussian envelope (b = 0) in torch, for the refinement
-    loops: the Bessel series of gaussian_envelope_ring_series truncated
+    """Ring-averaged Gaussian envelope (b = 0) in torch, for the refinements.
+
+    The Bessel series of :func:`gaussian_envelope_ring_series` truncated
     after the I_4 term, with I_n(u) from the I_0 / I_1 recurrences (and
     their small-argument series where the recurrence would cancel). Below
     v = a^2 / 4 sigma^2 = 0.3 the truncation error is under 1e-5; larger
-    sweeps are averaged over the ring directly by quadrature."""
+    sweeps are averaged over the ring directly by quadrature. Stays on the
+    device of `c` and is differentiable.
+
+    Parameters
+    ----------
+    c : torch.Tensor
+        Central excitation errors, any shape, 1/Angstroms.
+    a : torch.Tensor
+        Ring amplitudes, broadcastable to `c`, 1/Angstroms.
+    sigma : float
+        Width of the excitation envelope, 1/Angstroms.
+
+    Returns
+    -------
+    torch.Tensor
+        float64 envelope in [0, 1], the broadcast shape of `c` and `a`.
+    """
     c = c.to(torch.float64)
     a = torch.as_tensor(a, dtype=torch.float64)
     u = c * a / sigma**2

@@ -74,8 +74,18 @@ class Dataset4dstem(Dataset4d):
         signal_units : str, optional
             Units for the array values, by default "arb. units"
         metadata : dict
-            "r_to_q_rotation_cw_deg":  rotation r to q clockwise in degrees
-            "ellipticity": 3 parameters (a, b, theta (degrees))
+            Missing keys below are set to None.
+
+            "q_to_r_rotation_ccw_deg" : float
+                Rotation in degrees that maps detector (q) vectors onto the
+                scan (r) frame. A detector vector (dr, dc) is first swapped to
+                (dc, dr) if "q_transpose" is True, then rotated as
+                dr' = cos(t) dr - sin(t) dc, dc' = sin(t) dr + cos(t) dc.
+            "q_transpose" : bool
+                If True, swap the detector row and column axes before the
+                rotation.
+            "ellipticity" : tuple
+                3 parameters (a, b, theta in degrees).
         _token : object | None, optional
             Token to prevent direct instantiation, by default None
         """

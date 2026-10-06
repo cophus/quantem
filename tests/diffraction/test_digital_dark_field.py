@@ -86,7 +86,7 @@ def test_assign_grain_labels():
     np.testing.assert_array_equal(grains, [3, 3, -1, -1, -2, 4, 4, 4, -2])
 
 
-def test_fit_lattice_and_group_images():
+def test_refine_lattice_vectors_and_group_images():
     rng = np.random.default_rng(0)
     g1, g2 = np.array([20.0, 3.0]), np.array([4.0, 21.0])
     nested = []
@@ -98,8 +98,14 @@ def test_fit_lattice_and_group_images():
             row.append(np.concatenate([q, np.ones((len(n), 1))], axis=1))
         nested.append(row)
     peaks = Vector.from_data(nested, fields=["q_row", "q_col", "intensity"])
-    f1, f2 = ddf.fit_lattice(
-        peaks, (19.0, 2.0), (5.0, 20.0), radius=4.0, n1_range=(-2, 2), n2_range=(-2, 2)
+    f1, f2 = ddf.refine_lattice_vectors(
+        peaks,
+        (19.0, 2.0),
+        (5.0, 20.0),
+        center=(0.0, 0.0),
+        radius=4.0,
+        n1_range=(-2, 2),
+        n2_range=(-2, 2),
     )
     np.testing.assert_allclose(f1, g1, atol=0.1)
     np.testing.assert_allclose(f2, g2, atol=0.1)
@@ -127,3 +133,108 @@ def test_cluster_centers_and_lattice_distance():
 
     d = ddf.lattice_distance([[10.0, 10.0], [5.0, 5.0], [11.0, 0.0]], (10.0, 0.0), (0.0, 10.0))
     np.testing.assert_allclose(d, [0.0, np.hypot(5, 5), 1.0])
+
+
+def _pixel_lattice_peaks(origin=(32.0, 32.0)):
+    """3 x 3 scan of a pixel lattice g1=(20, 3), g2=(4, 21) around origin."""
+    g = np.array([[20.0, 3.0], [4.0, 21.0]])
+    n = np.array([[i, j] for i in (-1, 0, 1) for j in (-1, 0, 1)], float)
+    q = np.asarray(origin) + n @ g
+    pts = np.concatenate([q, np.ones((len(n), 1))], axis=1)
+    peaks = Vector.from_data([[pts] * 3 for _ in range(3)], fields=["q_row", "q_col", "intensity"])
+    return peaks, g
+
+
+def test_refine_lattice_vectors_uses_stored_origin_for_pixel_peaks():
+    peaks, g = _pixel_lattice_peaks()
+    with pytest.raises(ValueError, match="origin_ref"):
+        ddf.refine_lattice_vectors(peaks, g[0] + 1, g[1] - 1, radius=4.0)
+    peaks.metadata["origin_ref"] = (32.0, 32.0)
+    f1, f2 = ddf.refine_lattice_vectors(
+        peaks, g[0] + 1, g[1] - 1, radius=4.0, n1_range=(-1, 1), n2_range=(-1, 1)
+    )
+    np.testing.assert_allclose(f1, g[0], atol=1e-4)
+    np.testing.assert_allclose(f2, g[1], atol=1e-4)
+
+    # the polar functions resolve the same origin
+    ring = ddf.polar_mask(peaks, np.hypot(20.0, 3.0), tol=0.5)
+    assert ring.sum() == 9 * 2
+    np.testing.assert_array_equal(
+        ring, ddf.polar_mask(peaks, np.hypot(20, 3), 0.5, center=(32, 32))
+    )
+
+
+def test_aperture_array_needs_g2_for_array_mode():
+    with pytest.raises(ValueError, match="g2"):
+        ddf.aperture_array((10.0, 0.0))
+    with pytest.raises(ValueError):
+        ddf.aperture_array((10.0, 0.0), mode="2-beam")
+    half = ddf.aperture_array((10.0, 0.0), (0.0, 10.0), mode="single", shift=(0.5, 0.5))
+    np.testing.assert_allclose(half, [[5.0, 5.0]])
+
+
+def test_ddf_images_and_cluster_coms():
+    # 2 x 3 scan; cluster 0 lives in column 0, cluster 1 in row 1
+    nested = []
+    for r in range(2):
+        row = []
+        for c in range(3):
+            pts = [[0.0, 0.0, 1.0, -1]]
+            if c == 0:
+                pts.append([5.0, 0.0, 2.0, 0])
+            if r == 1:
+                pts.append([0.0, 5.0, 1.0 + c, 1])
+            row.append(np.asarray(pts, dtype=float))
+        nested.append(row)
+    labeled = Vector.from_data(nested, fields=["qx", "qy", "intensity", "cluster"])
+
+    images = ddf.ddf_images(labeled, [0, 1])
+    assert images.shape == (2, 2, 3)
+    np.testing.assert_allclose(images[0], [[2, 0, 0], [2, 0, 0]])
+    np.testing.assert_allclose(images[1], [[0, 0, 0], [1, 2, 3]])
+
+    coms, sizes = ddf.cluster_coms(labeled)
+    np.testing.assert_array_equal(sizes, [2, 3])
+    np.testing.assert_allclose(coms[0], [0.5, 0.0])
+    np.testing.assert_allclose(coms[1], [1.0, (0 * 1 + 1 * 2 + 2 * 3) / 6])
+    coms_u, _ = ddf.cluster_coms(labeled, weighted=False)
+    np.testing.assert_allclose(coms_u[1], [1.0, 1.0])
+
+    centers = ddf.cluster_centers(labeled)
+    np.testing.assert_allclose(centers, [[5.0, 0.0], [0.0, 5.0]])
+
+
+def test_cluster_functions_accept_empty_vector():
+    empty = Vector.from_data(
+        [[np.empty((0, 4)), np.empty((0, 4))]], fields=["qx", "qy", "intensity", "cluster"]
+    )
+    coms, sizes = ddf.cluster_coms(empty)
+    assert coms.shape == (0, 2) and sizes.shape == (0,)
+    assert ddf.cluster_centers(empty).shape == (0, 2)
+    assert ddf.ddf_images(empty, [0]).shape == (1, 1, 2)
+    fig, ax = ddf.plot_cluster_scatter(empty)
+    import matplotlib.pyplot as plt
+
+    plt.close(fig)
+
+
+def test_plot_cluster_scatter_center():
+    import matplotlib.pyplot as plt
+
+    peaks, _ = _pixel_lattice_peaks()
+    labeled = peaks.copy()
+    labeled.add_fields("cluster", values=np.zeros((labeled.total_rows, 1)))
+    labeled.metadata["origin_ref"] = (32.0, 32.0)
+    fig, ax = ddf.plot_cluster_scatter(labeled)
+    assert np.isclose(np.mean(ax.get_xlim()), 32.0)
+    plt.close(fig)
+
+    calibrated = Vector.from_data(
+        [[np.array([[0.5, 0.1, 1.0, 0], [-0.5, -0.1, 1.0, 0]])]],
+        fields=["qx", "qy", "intensity", "cluster"],
+    )
+    calibrated.metadata["origin_ref"] = (128.0, 128.0)  # detector pixels: ignored
+    fig, ax = ddf.plot_cluster_scatter(calibrated)
+    assert np.isclose(np.mean(ax.get_xlim()), 0.0)
+    assert np.isclose(np.mean(ax.get_ylim()), 0.0)
+    plt.close(fig)

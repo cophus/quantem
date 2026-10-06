@@ -8,3 +8,5 @@ from quantem.diffraction.strain import StrainMap as StrainMap
 from quantem.diffraction import bloch as bloch
 from quantem.diffraction import calibration as calibration
 from quantem.diffraction import rotations as rotations
+from quantem.diffraction import digital_dark_field as digital_dark_field
+from quantem.diffraction import illumination as illumination

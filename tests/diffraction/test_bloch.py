@@ -1,5 +1,7 @@
 """Tests for quantem.diffraction.bloch."""
 
+from functools import lru_cache
+
 import numpy as np
 import pytest
 import torch
@@ -67,8 +69,8 @@ def test_thickness_recovery(ti_beta):
     om.match_orientations(progress_bar=False)
     # thickness oscillations are sensitive to ~1 degree tilt errors, beyond
     # what kinematical matching provides for dynamical patterns; test the
-    # thickness scan itself with the true orientations (dynamical tilt
-    # refinement is the future joint pass)
+    # thickness scan itself with the true orientations (the joint tilt and
+    # thickness search is refine_dynamical, tested below)
     om.quats[0, :, 0] = q_true
 
     pm = PhaseMap.from_orientation_maps([om])
@@ -84,11 +86,14 @@ def test_thickness_recovery(ti_beta):
 
 
 # ----------------------------------------------------------------------
-# CBED / LACBED / Kossel / master pattern
+# CBED / LACBED / Kossel / Kossel reference pattern
 # ----------------------------------------------------------------------
 
 
+@lru_cache(maxsize=None)
 def _si(absorptive: bool) -> Crystal:
+    """Silicon, built once per session; the tests only read it (the Bloch
+    code caches lattice data on it, which every test shares safely)."""
     si = Crystal.from_ase(bulk("Si", "diamond", a=5.431, cubic=True), name="Si", verbose=False)
     si.calculate_structure_factors(k_max=3.0)
     if absorptive:
@@ -168,10 +173,64 @@ def test_cbed_library_common_grid():
     assert lib["patterns"][0].max() > 0
 
 
+def test_cbed_geometry_and_normalization():
+    """Without absorption the evolution is unitary, so a detector holding
+    every disk carries the full intensity (the pattern is the tilt
+    average). In a thin crystal the direct beam disk is uniform and centered
+    on the center pixel; diffracted disks sit at their g (rows qx, columns
+    qy). Checked on and off a zone axis."""
+    si = _si(absorptive=False)
+    for q in (_zone_110(), _tilted_110()):
+        res = bloch.calculate_cbed(
+            si,
+            q,
+            [10.0, 500.0],
+            energy_ev=200e3,
+            semiconv_mrad=2.0,
+            n_rings=3,
+            sg_max=0.06,
+            k_max=0.8,
+        )
+        thin, thick = res["pattern"]
+        H = thin.shape[0]
+        c = (H - 1) // 2
+        assert np.allclose(res["pattern"].sum(axis=(1, 2)), 1.0, rtol=1e-9)
+        assert np.allclose(res["g_xy"][0], 0.0)
+        r_px = res["disk_radius"] / res["sampling"]
+        yy, xx = np.mgrid[0:H, 0:H]
+        w = thin * (np.hypot(yy - c, xx - c) <= r_px + 1.5)
+        assert w.sum() > 0.95
+        assert abs((w * yy).sum() / w.sum() - c) < 0.05
+        assert abs((w * xx).sum() / w.sum() - c) < 0.05
+        # every disk sits at its g: the pattern is nonzero only inside the
+        # disks centered at (row, col) = (qx, qy) / sampling + center
+        centers = res["g_xy"] / res["sampling"] + c
+        d = np.hypot(yy[..., None] - centers[:, 0], xx[..., None] - centers[:, 1]).min(-1)
+        assert np.all(thick[d > r_px + 1.5] == 0)
+
+
+def test_cbed_detector_crop_drops_outside_samples():
+    """A smaller detector is a crop of the larger one: samples beyond its
+    edge are dropped, not piled onto the border pixels."""
+    si = _si(absorptive=True)
+    q = _tilted_110()
+    kw = dict(energy_ev=200e3, semiconv_mrad=2.0, n_rings=3, sg_max=0.06, k_max=0.8)
+    full = bloch.calculate_cbed(si, q, 500.0, **kw)
+    s = full["sampling"]
+    small = bloch.calculate_cbed(si, q, 500.0, pixel_size=s, q_max_plot=0.3, **kw)
+    h_full = (full["pattern"].shape[0] - 1) // 2
+    h_small = (small["pattern"].shape[0] - 1) // 2
+    crop = full["pattern"][
+        h_full - h_small : h_full + h_small + 1, h_full - h_small : h_full + h_small + 1
+    ]
+    assert small["pattern"].sum() < 0.99 * full["pattern"].sum()  # disks were cut
+    assert np.allclose(small["pattern"], crop, rtol=1e-12, atol=1e-15)
+
+
 def test_kossel_bright_field_matches_lacbed():
     si = _si(absorptive=True)
     q = _zone_110()
-    kw = dict(energy_ev=200e3, semiconv_mrad=15.0, sg_max=0.06, k_max=1.2)
+    kw = dict(energy_ev=200e3, semiconv_mrad=15.0, sg_max=0.06, k_max=0.8)
     kos = bloch.calculate_kossel(si, q, 900.0, n_pixels=32, progress_bar=False, **kw)
     lac = bloch.calculate_lacbed(si, q, 900.0, hkl=(0, 0, 0), n_pixels=32, **kw)
     a, b = kos["bright_field"], lac["disk"]
@@ -186,72 +245,38 @@ def test_kossel_bright_field_matches_lacbed():
     assert np.all(pat[~np.isfinite(a)] == 0)
 
 
-def test_reference_pattern_lookup():
-    from scipy.ndimage import gaussian_filter
-
+def test_kossel_pattern_orientation_matches_bright_field():
+    """The full Kossel pattern is stored on the bright field's axes, (row,
+    col) = (theta_y, theta_x): off a zone axis, where no symmetry hides a
+    transposition, the deficiency lines of the direct beam make the two
+    correlate, and the transposed pattern does not."""
     si = _si(absorptive=True)
-    q = _zone_110()
-    # the master stores the pattern at its own angular resolution
-    # (angle_step_mrad); compare against the direct calculation blurred to
-    # the same resolution
-    master = bloch.calculate_kossel_reference(
+    kos = bloch.calculate_kossel(
         si,
-        [800.0],
-        energy_ev=200e3,
-        angle_step_mrad=2.0,
-        sg_max=0.06,
-        k_max=1.0,
-        progress_bar=False,
-    )
-    fast = bloch.kossel_from_reference(master, q, semiconv_mrad=25.0, n_pixels=48)
-    direct = bloch.calculate_kossel(
-        si,
-        q,
+        _tilted_110(),
         800.0,
         energy_ev=200e3,
-        semiconv_mrad=25.0,
-        n_pixels=48,
+        semiconv_mrad=15.0,
+        n_pixels=32,
         sg_max=0.06,
-        k_max=1.0,
+        k_max=0.7,
         progress_bar=False,
     )
-    a, b = fast["bright_field"], direct["bright_field"]
-    m = np.isfinite(a) & np.isfinite(b)
-    assert m.sum() > 1000
-    # blur both to the master's angular resolution before comparing
-    px_mrad = 2 * 25.0 / 48
-    sigma = 2.0 / px_mrad / 2.355
-    af = gaussian_filter(np.nan_to_num(a), sigma)
-    bf = gaussian_filter(np.nan_to_num(b), sigma)
-    cc = np.corrcoef(af[m], bf[m])[0, 1]
-    assert cc > 0.9
+    a, p = kos["bright_field"], kos["pattern"]
+    m = np.isfinite(a)
+    cc = np.corrcoef(a[m], p[m])[0, 1]
+    cc_t = np.corrcoef(a[m], p.T[m])[0, 1]
+    assert cc > 0.4
+    assert cc - cc_t > 0.3
+    assert np.isclose(kos["mrad_per_pixel"], 2 * 15.0 / 31)
 
-    # off-zone orientation: catches in-plane sign errors that zone-axis
-    # symmetry hides (the reference stores the ANTI-propagation direction)
-    from quantem.diffraction.rotations import qmult, quat_from_axis_angle
 
-    tilt = quat_from_axis_angle(
-        torch.tensor([1.0, 0.3, 0.0], dtype=torch.float64) / np.hypot(1, 0.3),
-        torch.tensor(np.deg2rad(5.0), dtype=torch.float64),
-    )
-    q2 = qmult(tilt, q)
-    fast2 = bloch.kossel_from_reference(master, q2, semiconv_mrad=25.0, n_pixels=48)
-    direct2 = bloch.calculate_kossel(
-        si,
-        q2,
-        800.0,
-        energy_ev=200e3,
-        semiconv_mrad=25.0,
-        n_pixels=48,
-        sg_max=0.06,
-        k_max=1.0,
-        progress_bar=False,
-    )
-    a2, b2 = fast2["bright_field"], direct2["bright_field"]
-    m2 = np.isfinite(a2) & np.isfinite(b2)
-    af2 = gaussian_filter(np.nan_to_num(a2), sigma)
-    bf2 = gaussian_filter(np.nan_to_num(b2), sigma)
-    assert np.corrcoef(af2[m2], bf2[m2])[0, 1] > 0.9
+# The reference-pattern tests share one coarse reference: 3 mrad sampling and
+# beams to 0.7 1/A cost ~3 s, against ~30 s for 2 mrad and 1.0 1/A, and keep
+# the comparisons meaningful (the lookup and the line model are compared at
+# the reference's resolution).
+REF_KW = dict(energy_ev=200e3, sg_max=0.06, k_max=0.7)
+REF_STEP_MRAD = 3.0
 
 
 def _tilted_110():
@@ -264,20 +289,121 @@ def _tilted_110():
     return qmult(tilt, _zone_110())
 
 
-def test_kossel_lines_render_matches_direct():
-    si = _si(absorptive=True)
+@pytest.fixture(scope="module")
+def si_reference():
+    return bloch.calculate_kossel_reference(
+        _si(absorptive=True),
+        [800.0],
+        angle_step_mrad=REF_STEP_MRAD,
+        progress_bar=False,
+        **REF_KW,
+    )
+
+
+@pytest.fixture(scope="module")
+def si_lines():
+    return bloch.kossel_lines(_si(absorptive=True), 800.0, energy_ev=200e3, k_max=REF_KW["k_max"])
+
+
+def _direct_bright_field(q, semiconv_mrad=25.0, n_pixels=48):
+    return bloch.calculate_kossel(
+        _si(absorptive=True),
+        q,
+        800.0,
+        semiconv_mrad=semiconv_mrad,
+        n_pixels=n_pixels,
+        progress_bar=False,
+        **REF_KW,
+    )["bright_field"]
+
+
+def _blurred_cc(a, b, n_pixels=48, semiconv_mrad=25.0):
+    """Correlation of two bright fields inside the aperture after blurring
+    both to the reference's resolution. Bilinear splatting onto the Lambert
+    grid and bilinear lookup are two triangle kernels of one grid step,
+    together a blur of standard deviation step / sqrt(3)."""
+    from scipy.ndimage import gaussian_filter
+
+    px_mrad = 2 * semiconv_mrad / (n_pixels - 1)
+    sigma = REF_STEP_MRAD / np.sqrt(3) / px_mrad
+    m = np.isfinite(a) & np.isfinite(b)
+    assert m.sum() > 1000
+    af = gaussian_filter(np.nan_to_num(a), sigma)
+    bf = gaussian_filter(np.nan_to_num(b), sigma)
+    return np.corrcoef(af[m], bf[m])[0, 1]
+
+
+def test_reference_pattern_lookup(si_reference):
+    q = _zone_110()
+    assert si_reference["k_max"] == REF_KW["k_max"]
+    fast = bloch.kossel_from_reference(si_reference, q, semiconv_mrad=25.0, n_pixels=48)
+    assert np.isclose(fast["mrad_per_pixel"], 2 * 25.0 / 47)
+    assert _blurred_cc(fast["bright_field"], _direct_bright_field(q)) > 0.9
+
+    # off-zone orientation: catches in-plane sign errors that zone-axis
+    # symmetry hides (the reference stores the ANTI-propagation direction)
+    q2 = _tilted_110()
+    fast2 = bloch.kossel_from_reference(si_reference, q2, semiconv_mrad=25.0, n_pixels=48)
+    assert _blurred_cc(fast2["bright_field"], _direct_bright_field(q2)) > 0.9
+
+
+def test_kossel_polar_from_reference_matches_cartesian(si_reference):
+    """The polar lookup samples the same function: on a Cartesian grid with
+    pixels at the polar radii, the azimuth 0 and 90 degree rows coincide
+    with the center row and column."""
     q = _tilted_110()
-    kw = dict(energy_ev=200e3, semiconv_mrad=25.0, sg_max=0.06, k_max=1.0)
-    direct = bloch.calculate_kossel(si, q, 800.0, n_pixels=48, progress_bar=False, **kw)[
-        "bright_field"
-    ]
-    lines = bloch.kossel_lines(si, 800.0, energy_ev=200e3, k_max=1.0)
+    n_r = 8
+    pol = bloch.kossel_polar_from_reference(
+        si_reference, q, semiconv_mrad=20.0, n_radial=n_r, n_azimuthal=16
+    )
+    assert pol["polar"].shape == (16, n_r)
+    assert np.allclose(pol["radii_mrad"], 20.0 * np.arange(1, n_r + 1) / n_r)
+    cart = bloch.kossel_from_reference(si_reference, q, semiconv_mrad=20.0, n_pixels=2 * n_r + 1)
+    bf = cart["bright_field"]
+    # (row, col) = (theta_y, theta_x): azimuth 0 runs along +col, 90 along +row
+    assert np.allclose(pol["polar"][0], bf[n_r, n_r + 1 :])
+    assert np.allclose(pol["polar"][4], bf[n_r + 1 :, n_r])
+
+
+def test_plot_kossel_reference(si_reference, si_lines, monkeypatch):
+    import matplotlib.pyplot as plt
+
+    fig, ax = bloch.plot_kossel_reference(si_reference, _si(True), lines=si_lines, upsample=1)
+    assert len(ax.images) == 1 and len(ax.texts) > 0
+    plt.close(fig)
+
+    # a reference computed without a beam cutoff stores k_max=None; the
+    # default line set then falls back to 1.2 1/A instead of failing
+    seen = {}
+
+    def fake_lines(crystal, thicknesses_A, energy_ev, k_max):
+        seen["k_max"] = k_max
+        return si_lines
+
+    monkeypatch.setattr(bloch, "kossel_lines", fake_lines)
+    fig, ax = bloch.plot_kossel_reference({**si_reference, "k_max": None}, _si(True), upsample=1)
+    assert seen["k_max"] == 1.2
+    plt.close(fig)
+
+
+def test_kossel_lines_rejects_missing_cutoff_and_empty_set():
+    si = _si(absorptive=True)
+    with pytest.raises(ValueError, match="k_max"):
+        bloch.kossel_lines(si, 800.0, energy_ev=200e3, k_max=None)
+    with pytest.raises(ValueError, match="min_depth"):
+        bloch.kossel_lines(si, 800.0, energy_ev=200e3, k_max=0.4, min_depth=2.0)
+
+
+def test_kossel_lines_render_matches_direct(si_lines):
+    q = _tilted_110()
+    lines = si_lines
+    direct = _direct_bright_field(q, semiconv_mrad=40.0)
     # every line is a band edge: the +g and -g cones of a row sit at
     # +-theta_B, never on the zone plane
     first = lines["line_order"] == 1
     assert torch.all(lines["line_u"][first] > 0)
     assert torch.all(lines["line_u"][lines["line_order"] == -1] < 0)
-    r = bloch.render_kossel_lines(lines, q, semiconv_mrad=25.0, n_pixels=48)
+    r = bloch.render_kossel_lines(lines, q, semiconv_mrad=40.0, n_pixels=48)
     a = r["bright_field"]
     m = np.isfinite(a) & np.isfinite(direct)
     assert m.sum() > 1000
@@ -286,20 +412,19 @@ def test_kossel_lines_render_matches_direct():
     # polar rendering samples the same function: its first ring must
     # agree with the Cartesian pattern evaluated at those angles
     pol = bloch.render_kossel_lines(
-        lines, q, semiconv_mrad=25.0, polar=True, n_radial=10, n_azimuthal=12
+        lines, q, semiconv_mrad=40.0, polar=True, n_radial=10, n_azimuthal=12
     )["polar"]
     assert pol.shape == (12, 10)
     assert np.all(np.isfinite(pol))
     assert pol.min() > 0 and pol.max() < 1.5 * float(lines["background"][0])
 
 
-def test_kossel_line_segments_on_cones():
+def test_kossel_line_segments_on_cones(si_lines):
     from quantem.diffraction.rotations import quat_to_matrix
 
-    si = _si(absorptive=True)
+    lines = si_lines
     q = _tilted_110()
-    lines = bloch.kossel_lines(si, 800.0, energy_ev=200e3, k_max=1.0)
-    alpha = 25.0
+    alpha = 40.0
     seg = bloch.kossel_line_segments(lines, q, semiconv_mrad=alpha)
     n = seg["depth"].shape[0]
     assert n >= 3
@@ -325,48 +450,58 @@ def test_kossel_line_segments_on_cones():
         assert seg["width_mrad"][k] > 0 and 0 < seg["depth"][k] <= 1
 
 
-def test_reference_residual_hybrid():
-    from scipy.ndimage import gaussian_filter
+def test_overlay_kossel_segments_registration(si_lines):
+    """Segment end points lie on the aperture edge, which is the pixel
+    circle of radius (n - 1) / 2 about the center pixel (Cartesian) and the
+    last column (polar)."""
+    import matplotlib.pyplot as plt
 
-    si = _si(absorptive=True)
-    q = _zone_110()
-    master = bloch.calculate_kossel_reference(
-        si,
-        [800.0],
-        energy_ev=200e3,
-        angle_step_mrad=2.0,
-        sg_max=0.06,
-        k_max=1.0,
-        progress_bar=False,
+    q = _tilted_110()
+    alpha, n = 40.0, 33
+    seg = bloch.kossel_line_segments(si_lines, q, semiconv_mrad=alpha)
+    n_draw = int((seg["depth"] >= 0.01).sum())
+    assert n_draw >= 3
+    fig, ax = plt.subplots()
+    bloch.overlay_kossel_segments(ax, seg, alpha, n_pixels=n, min_depth=0.01)
+    assert len(ax.lines) == n_draw
+    c = (n - 1) / 2
+    for ln in ax.lines:
+        x, y = ln.get_xdata(), ln.get_ydata()
+        assert np.allclose(np.hypot(np.asarray(x) - c, np.asarray(y) - c), c)
+    plt.close(fig)
+
+    n_r, n_az = 16, 90
+    fig, ax = plt.subplots()
+    bloch.overlay_kossel_segments(
+        ax, seg, alpha, polar=True, n_radial=n_r, n_azimuthal=n_az, min_depth=0.01
     )
-    assert master["k_max"] == 1.0
-    lines = bloch.kossel_lines(si, 800.0, energy_ev=200e3, k_max=1.0)
-    bloch.kossel_reference_residual(master, lines, si)
-    assert master["residual"].shape == master["lambert"].shape
-    assert np.all(np.isfinite(master["residual"]))
-    direct = bloch.calculate_kossel(
-        si,
-        q,
-        800.0,
-        energy_ev=200e3,
-        semiconv_mrad=25.0,
-        n_pixels=48,
-        sg_max=0.06,
-        k_max=1.0,
-        progress_bar=False,
-    )["bright_field"]
-    plain = bloch.render_kossel_lines(lines, q, semiconv_mrad=25.0, n_pixels=48)
-    hybrid = bloch.render_kossel_lines(lines, q, semiconv_mrad=25.0, n_pixels=48, reference=master)
-    m = np.isfinite(direct)
-    sigma = 2.0 / (2 * 25.0 / 48) / 2.355
-    bf = gaussian_filter(np.nan_to_num(direct), sigma)
+    assert len(ax.lines) == n_draw
+    for ln in ax.lines:
+        cols = np.asarray(ln.get_xdata())
+        # radius semiconv sits in the last column, n_radial - 1
+        assert np.isclose(cols.max(), n_r - 1)
+        assert np.all(cols <= n_r - 1 + 1e-9)
+    plt.close(fig)
 
-    def cc(x):
-        return np.corrcoef(gaussian_filter(np.nan_to_num(x), sigma)[m], bf[m])[0, 1]
 
+def test_reference_residual_hybrid(si_reference, si_lines):
+    q = _zone_110()
+    si = _si(absorptive=True)
+    reference = dict(si_reference)  # the residual is added in place
+    bloch.kossel_reference_residual(reference, si_lines, si)
+    assert reference["residual"].shape == reference["lambert"].shape
+    assert np.all(np.isfinite(reference["residual"]))
+    assert "residual" not in si_reference
+    direct = _direct_bright_field(q)
+    plain = bloch.render_kossel_lines(si_lines, q, semiconv_mrad=25.0, n_pixels=48)
+    hybrid = bloch.render_kossel_lines(
+        si_lines, q, semiconv_mrad=25.0, n_pixels=48, reference=reference
+    )
+    cc_plain = _blurred_cc(plain["bright_field"], direct)
+    cc_hybrid = _blurred_cc(hybrid["bright_field"], direct)
     # on the zone axis the many-beam residual must improve the line model
-    assert cc(hybrid["bright_field"]) > cc(plain["bright_field"])
-    assert cc(hybrid["bright_field"]) > 0.9
+    assert cc_hybrid > cc_plain + 0.05
+    assert cc_hybrid > 0.9
 
 
 def test_refine_dynamical_recovery():
@@ -808,7 +943,9 @@ def test_refine_dynamical_with_precession_and_convergence():
     om = OrientationMap.from_vectors(
         peaks, xtl, energy_ev=energy_ev, precession_deg=0.4, semiconv_mrad=1.5
     )
-    om.build_plan(angle_step_zone_axis_deg=3.0, verbose=False)
+    # the matched orientations are replaced below, so a coarse plan will do
+    # (the precession-integrated library is the costly part)
+    om.build_plan(angle_step_zone_axis_deg=10.0, angle_step_in_plane_deg=10.0, verbose=False)
     om.match_orientations(progress_bar=False)
     phis = rng.uniform(0, 2 * np.pi, N)
     om.quats[0, :, 0] = torch.stack(
@@ -927,7 +1064,12 @@ def _smooth_map_setup(n, tilt_start_deg, corrupt=None):
 
 
 def test_refine_dynamical_warm_start_matches_cold():
-    from quantem.diffraction.rotations import misorientation_angle_deg
+    from quantem.diffraction.rotations import (
+        misorientation_angle_deg,
+        qconj,
+        qmult,
+        quat_from_axis_angle,
+    )
 
     n = 5
     kw = dict(
@@ -942,6 +1084,7 @@ def test_refine_dynamical_warm_start_matches_cold():
     out = {}
     for warm in (False, True):
         xtl, om, pm, q_true, t_true, A_true = _smooth_map_setup(n, 0.1)
+        q_match = om.quats[0, :, 0].clone()
         res = bloch.refine_dynamical(pm, warm_start=warm, **kw)
         out[warm] = (res, om.quats[0, :, 0].clone(), q_true, t_true, xtl)
     res_c, q_c, q_true, t_true, xtl = out[False]
@@ -955,6 +1098,36 @@ def test_refine_dynamical_warm_start_matches_cold():
     err = misorientation_angle_deg(q_true, q_w, xtl.sym_quats).numpy()
     assert err.max() < 0.03
     assert np.abs(res_w["thickness"][0].numpy() - t_true.numpy()).max() <= 25
+
+    # the reported tilt is measured from the position's own matched
+    # orientation on either route: every start was 0.1 degrees off the truth
+    for res in (res_c, res_w):
+        tilt = res["tilt_deg"][0].numpy()  # (n, 2)
+        assert np.all(np.abs(np.hypot(tilt[:, 0], tilt[:, 1]) - 0.1) < 0.03)
+        base = res["quats_base"][0, :, 0]
+        # the base is the matched orientation turned about the beam only
+        # (the in-plane rotation of the deformation fit)
+        dq = qmult(base, qconj(q_match))
+        assert torch.all(dq[:, 1:3].abs() < 1e-9)
+        assert misorientation_angle_deg(base, q_match).max() < 0.05
+        # and tilt x base gives the solution
+        for i in range(n):
+            wx, wy = np.deg2rad(tilt[i])
+            ang = np.hypot(wx, wy)
+            tq = quat_from_axis_angle(
+                torch.tensor([wx / ang, wy / ang, 0.0], dtype=torch.float64),
+                torch.tensor(ang, dtype=torch.float64),
+            )
+            q_rebuilt = qmult(tq, base[i])
+            assert torch.allclose(
+                q_rebuilt * torch.sign(q_rebuilt @ res["quats"][0, i, 0]),
+                res["quats"][0, i, 0],
+                atol=1e-9,
+            )
+        # the zero-tilt cost is at the matched orientation, above the final
+        assert torch.all(res["cost_zero_tilt"][0, :, 0] > res["cost"][0, :, 0])
+    assert np.allclose(res_c["tilt_deg"].numpy(), res_w["tilt_deg"].numpy(), atol=0.01)
+    assert np.allclose(res_c["cost_zero_tilt"].numpy(), res_w["cost_zero_tilt"].numpy(), rtol=0.05)
 
 
 def test_refine_dynamical_neighbor_rescue():
@@ -993,7 +1166,8 @@ def test_refine_dynamical_threads_match_one_worker():
     from quantem.diffraction.rotations import misorientation_angle_deg
 
     # 32 positions: two blocks of 16 on two threads, one warm-start chain
-    # broken at the block boundary
+    # broken at the block boundary. Both runs start from the same matched
+    # orientations (update_orientations=False leaves them in place)
     n = 32
     kw = dict(
         thicknesses_A=np.arange(300, 700, 25.0),
@@ -1002,14 +1176,13 @@ def test_refine_dynamical_threads_match_one_worker():
         sg_max=0.06,
         k_max=1.0,
         neighbor_rescue=False,
+        update_orientations=False,
         progress_bar=False,
     )
-    out = {}
-    for nw in (1, 2):
-        xtl, om, pm, q_true, _, _ = _smooth_map_setup(n, 0.1)
-        res = bloch.refine_dynamical(pm, num_workers=nw, **kw)
-        out[nw] = (res, om.quats[0, :, 0].clone())
-    (res_1, q_1), (res_2, q_2) = out[1], out[2]
+    xtl, om, pm, q_true, _, _ = _smooth_map_setup(n, 0.1)
+    res_1 = bloch.refine_dynamical(pm, num_workers=1, **kw)
+    res_2 = bloch.refine_dynamical(pm, num_workers=2, **kw)
+    q_1, q_2 = res_1["quats"][0, :, 0], res_2["quats"][0, :, 0]
     assert int(res_1["warm_started"].sum()) == n - 1
     assert int(res_2["warm_started"].sum()) == n - 2
     # the first block is the same computation on either route
@@ -1019,3 +1192,65 @@ def test_refine_dynamical_threads_match_one_worker():
     e1 = misorientation_angle_deg(q_true, q_1, xtl.sym_quats).numpy()
     e2 = misorientation_angle_deg(q_true, q_2, xtl.sym_quats).numpy()
     assert e2.mean() <= e1.mean() + 0.01
+
+
+def _fake_dynamical_result():
+    """A 2 x 2 refine_dynamical result with one candidate; position (1, 1)
+    was not refined."""
+    from types import SimpleNamespace
+
+    from quantem.diffraction.rotations import quat_from_axis_angle
+
+    R, C, F = 2, 2, 1
+    q = quat_from_axis_angle(
+        torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64), torch.tensor(0.3, dtype=torch.float64)
+    )
+    deform = torch.eye(2, dtype=torch.float64).repeat(R, C, F, 1, 1)
+    deform[0, 0, 0] = torch.tensor([[1.01, 0.0], [0.0, 0.99]], dtype=torch.float64)
+    cost = torch.tensor([[0.10, 0.20], [0.15, torch.nan]], dtype=torch.float64)[..., None]
+    done = torch.isfinite(cost[..., 0])
+    result = {
+        "candidate": torch.where(done, 0, -1),
+        "phase_index": torch.where(done, 0, -1),
+        "quats": q.repeat(R, C, F, 1),
+        "deformation": deform,
+        "cost": cost,
+        "cost_zero_tilt": cost + 0.01,
+        "thickness": torch.where(done, 400.0, torch.nan).to(torch.float64),
+        "thickness_contrast": torch.full((R, C), 0.1, dtype=torch.float64),
+        "tilt_deg": torch.full((R, C, 2), 0.05, dtype=torch.float64),
+    }
+    return result, SimpleNamespace(candidates=[(0, 0)])
+
+
+def test_dynamical_maps_mask_unrefined():
+    result, pm = _fake_dynamical_result()
+    maps = bloch.dynamical_maps(result, pm)
+    assert maps["mask"].tolist() == [[True, True], [True, False]]
+    assert int(maps["phase_index"][1, 1]) == -1 and int(maps["phase_index"][0, 0]) == 0
+    assert torch.isnan(maps["quats"][1, 1]).all() and torch.isfinite(maps["quats"][0, 0]).all()
+    assert torch.isnan(maps["deformation"][1, 1]).all()
+    assert torch.isnan(maps["thickness"][1, 1]) and float(maps["thickness"][0, 0]) == 400.0
+    assert np.isclose(float(maps["gain"][0, 0]), 0.01)
+    assert np.isclose(float(maps["tilt_deg"][0, 0]), 0.05 * np.sqrt(2))
+    # the strain of the strained position, in the crystal frame (a pure
+    # rotation about the beam keeps the normal strains on the diagonal)
+    eps = maps["strain"]
+    assert float(eps["aa"][0, 0]) < 0 < float(eps["bb"][0, 0])
+    assert torch.isnan(eps["cc"][1, 1])
+    # restricted to a crystal that won nowhere: empty mask
+    assert not bloch.dynamical_maps(result, pm, crystal_index=1)["mask"].any()
+
+
+def test_plot_dynamical_and_strain_maps():
+    import matplotlib.pyplot as plt
+
+    result, pm = _fake_dynamical_result()
+    maps = bloch.dynamical_maps(result, pm)
+    fig, axs = bloch.plot_dynamical_maps(maps)
+    assert np.asarray(axs).size >= 4
+    plt.close(fig)
+    strain = {k: v.numpy() for k, v in maps["strain"].items()}
+    fig, axs = bloch.plot_strain_crystal_frame(strain, mask=maps["mask"].numpy())
+    assert np.asarray(axs).size >= 6
+    plt.close(fig)

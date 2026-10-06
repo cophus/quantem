@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy as _copy
+import warnings
 from pathlib import Path
 from typing import Any, Literal, Sequence, Union
 
@@ -46,7 +47,7 @@ class BraggVectors(AutoSerialize):
        image (:meth:`make_template_from_probe`).
     2. :meth:`detect_disks` – template-match every scan position; detected peaks
        are stored in :attr:`peaks` (a :class:`Vector` of ``[q_row, q_col,
-       intensity]``, numpy-backed) and accumulated into the Bragg vector map
+       intensity]`` in detector pixels) and accumulated into the Bragg vector map
        :attr:`bvm`.
     3. :meth:`choose_basis_vectors` – pick the lattice basis ``(origin, g1, g2)``
        from the BVM, automatically or by hand; also stores the numbered candidate
@@ -55,15 +56,16 @@ class BraggVectors(AutoSerialize):
        peaks into a reference lattice (``reference_ab``/``reference_qpos``).
     5. :meth:`fit_lattice` – the heavy step: at every scan position, match the
        detections to the reference within ``max_peak_shift``, intensity-weighted
-       least-squares fit the lattice vectors into ``u_array``/``v_array`` of shape
+       least-squares fit the lattice vectors into ``g1_array``/``g2_array`` of shape
        ``(scan_row, scan_col, 2)``, and compute the per-position ``mask_weight``.
     6. :meth:`calculate_strain_map` – hand the lattice vectors (and
        ``mask_weight``) to a :class:`~quantem.diffraction.strain.StrainMap`.
 
-    Detection runs in torch (CPU now, CUDA later); the ragged peak table is held
-    in a numpy-backed :class:`Vector`. The detector→scan rotation is read from
-    the parent dataset metadata (``q_to_r_rotation_ccw_deg`` + ``q_transpose``),
-    the single source of truth shared with the DPC/CoM workflow.
+    Detection runs in torch on :attr:`device` (CPU or GPU); the ragged peak table
+    is held in a torch-backed :class:`Vector`. The detector-to-scan rotation is
+    read from the parent dataset metadata (``q_to_r_rotation_ccw_deg`` and
+    ``q_transpose``), the same keys used by the DPC/CoM workflow, and applied in
+    :meth:`calculate_strain_map`.
 
     Use :meth:`from_dataset` to construct an instance.
 
@@ -108,14 +110,16 @@ class BraggVectors(AutoSerialize):
         self.reference_qpos: np.ndarray | None = None
         self.reference_intensity: np.ndarray | None = None
 
-        self.u_array: np.ndarray | None = None
-        self.v_array: np.ndarray | None = None
+        self.g1_array: np.ndarray | None = None
+        self.g2_array: np.ndarray | None = None
         # per-position diagnostics from fit_lattice()
         self.mask_weight: np.ndarray | None = None
         self.fit_error: np.ndarray | None = None
 
         self._template: torch.Tensor | None = None
         self._template_ft: torch.Tensor | None = None
+        # full dataset resident on self.device, set by detect_disks(save_to_gpu=True)
+        self._gpu_cache: torch.Tensor | None = None
         self.metadata: dict[str, Any] = {}
 
     @classmethod
@@ -159,9 +163,10 @@ class BraggVectors(AutoSerialize):
         Overrides :meth:`~quantem.core.io.serialize.AutoSerialize.save` to drop
         :attr:`dataset` — the raw 4D-STEM cube, which dominates the file size — from
         serialization by default. The detected :attr:`peaks`, lattice fit
-        (:attr:`u_array`/:attr:`v_array`), Bragg vector map and all diagnostics are
+        (:attr:`g1_array`/:attr:`g2_array`), Bragg vector map and all diagnostics are
         kept, so the file holds the *results* of the workflow (orders of magnitude
-        smaller than the data) rather than the data itself.
+        smaller than the data) rather than the data itself. The device copy of the
+        dataset made by ``detect_disks(save_to_gpu=True)`` is never saved.
 
         ``"dataset"`` is recorded in the file's skip metadata, so a reloaded workflow
         simply has no ``dataset`` attribute. Re-attach one (``bv.dataset = ds``) before
@@ -194,6 +199,8 @@ class BraggVectors(AutoSerialize):
             skip = list(skip)
         if not include_dataset and "dataset" not in skip:
             skip.append("dataset")
+        if "_gpu_cache" not in skip:
+            skip.append("_gpu_cache")
         # Explicit (two-arg) super() rather than the bare super(): the zero-arg form
         # needs a compiler-created __class__ closure cell that is absent when this
         # method's source is re-exec'd from a string (Jupyter autoreload), which
@@ -285,16 +292,29 @@ class BraggVectors(AutoSerialize):
         BraggVectors
             ``self``, for method chaining.
         """
-        data = torch.as_tensor(
-            np.asarray(self.dataset.array), dtype=torch.float, device=self.device
-        )
-        if roi is None:
-            probe = data.mean(dim=(0, 1))
+        gpu_cache = getattr(self, "_gpu_cache", None)
+        if gpu_cache is not None:
+            # Dataset is already resident on self.device (e.g. from a prior
+            # detect_disks(save_to_gpu=True)) -- reuse it instead of transferring again.
+            if roi is None:
+                probe = gpu_cache.mean(dim=(0, 1))
+            else:
+                m = torch.as_tensor(np.asarray(roi) > 0, device=self.device)
+                if not bool(m.any()):
+                    raise ValueError("roi selects no scan positions.")
+                probe = gpu_cache[m].mean(dim=0)
         else:
-            m = torch.as_tensor(np.asarray(roi) > 0, device=self.device)
-            if not bool(m.any()):
-                raise ValueError("roi selects no scan positions.")
-            probe = data[m].mean(dim=0)
+            # Select the (small) ROI on the CPU first so we never have to put the
+            # full dataset on the device just to average a handful of positions.
+            array = np.asarray(self.dataset.array)
+            if roi is None:
+                probe_np = array.mean(axis=(0, 1))
+            else:
+                m = np.asarray(roi) > 0
+                if not m.any():
+                    raise ValueError("roi selects no scan positions.")
+                probe_np = array[m].mean(axis=0)
+            probe = torch.as_tensor(probe_np, dtype=torch.float, device=self.device)
         if center is None:
             center = probe_centroid(probe)
         self._set_template(probe, center=center, subtract_mean=subtract_mean)
@@ -415,6 +435,7 @@ class BraggVectors(AutoSerialize):
         sigma_cc: float | None = None,
         batch_size: int | None = None,
         progressbar: bool = True,
+        save_to_gpu: bool = True,
     ) -> Vector:
         """Detect Bragg disks at every scan position (or a subset for testing).
 
@@ -471,6 +492,12 @@ class BraggVectors(AutoSerialize):
             detector dimensions.
         progressbar : bool, default=True
             If ``True``, show a tqdm progress bar over the full-scan detection.
+        save_to_gpu : bool, default=True
+            If ``True`` and :attr:`device` is not the CPU, copy the whole dataset
+            to the device once and read the batches from that copy, which is
+            faster and lowers CPU load. If the copy does not fit in device memory,
+            batches are read from the dataset instead. The copy is kept for later
+            calls (including :meth:`make_template_from_data`) and is not saved.
 
         Returns
         -------
@@ -492,6 +519,19 @@ class BraggVectors(AutoSerialize):
             corr_power=corr_power,
             sigma_cc=sigma_cc,
         )
+
+        if save_to_gpu and str(self.device) != "cpu":
+            if getattr(self, "_gpu_cache", None) is None:
+                try:
+                    print(f"Loading dataset to {self.device}...", end=" ", flush=True)
+                    self._gpu_cache = torch.as_tensor(
+                        np.asarray(self.dataset.array),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                except (RuntimeError, torch.cuda.OutOfMemoryError):
+                    print("out of memory, reading per batch instead.")
+                    self._gpu_cache = None
 
         if positions is not None:
             if len(positions) == 0:
@@ -861,8 +901,8 @@ class BraggVectors(AutoSerialize):
         ``origin + a*g1 + b*g2`` for each reference ``(a, b)`` — keeping a peak only
         when it lands within ``max_peak_shift`` of its nearest ideal site (not the
         measured candidate position), then ``q = x0 + a*g1 + b*g2`` is fit by
-        intensity-weighted least squares over the matched peaks. The fitted ``g1``/``g2`` go into :attr:`u_array`/
-        :attr:`v_array` (shape ``(scan_row, scan_col, 2)``, row/col components);
+        intensity-weighted least squares over the matched peaks. The fitted ``g1``/``g2`` go into :attr:`g1_array`/
+        :attr:`g2_array` (shape ``(scan_row, scan_col, 2)``, row/col components);
         positions with fewer than ``min_num_peaks`` matched peaks are left ``nan``.
 
         Two diagnostics are stored per position. :attr:`fit_error` is the RMS fit
@@ -932,8 +972,8 @@ class BraggVectors(AutoSerialize):
         rms_rand = float(np.sqrt(cell_area / (2.0 * np.pi))) if cell_area > 0 else 1.0
 
         scan_r, scan_c = int(self.dataset.shape[0]), int(self.dataset.shape[1])
-        u_array = np.full((scan_r, scan_c, 2), np.nan, dtype=float)
-        v_array = np.full((scan_r, scan_c, 2), np.nan, dtype=float)
+        g1_array = np.full((scan_r, scan_c, 2), np.nan, dtype=float)
+        g2_array = np.full((scan_r, scan_c, 2), np.nan, dtype=float)
         mask_weight = np.zeros((scan_r, scan_c), dtype=float)
         fit_error = np.full((scan_r, scan_c), np.nan, dtype=float)
 
@@ -974,8 +1014,8 @@ class BraggVectors(AutoSerialize):
             )
             if beta is None:
                 continue
-            u_array[r, c] = beta[1]
-            v_array[r, c] = beta[2]
+            g1_array[r, c] = beta[1]
+            g2_array[r, c] = beta[2]
             fit_error[r, c] = rms
 
             # mask weight = lattice "order parameter": snap EVERY detected peak to the
@@ -998,8 +1038,8 @@ class BraggVectors(AutoSerialize):
                 rms_all = float(np.sqrt(np.sum(w * disp[nonzero] ** 2) / wsum))
                 mask_weight[r, c] = float(np.clip(1.0 - rms_all / rms_rand, 0.0, 1.0))
 
-        self.u_array = u_array
-        self.v_array = v_array
+        self.g1_array = g1_array
+        self.g2_array = g2_array
         self.mask_weight = mask_weight
         self.fit_error = fit_error
         self.metadata["fit"] = {
@@ -1017,52 +1057,116 @@ class BraggVectors(AutoSerialize):
 
     def calculate_strain_map(
         self,
-        u_ref: np.ndarray | None = None,
-        v_ref: np.ndarray | None = None,
+        g1_ref: np.ndarray | None = None,
+        g2_ref: np.ndarray | None = None,
         mask: np.ndarray | None = None,
+        q_to_r_rotation_ccw_deg: float | None = None,
+        q_transpose: bool | None = None,
+        calculation_metric: str = "median",
     ) -> StrainMap:
         """Build a :class:`StrainMap` from the fitted per-position lattice vectors.
 
         Parameters
         ----------
-        u_ref : np.ndarray, optional
-            ``(2,)`` reference for the first lattice vector. Defaults to the median
-            over the scan inside :class:`StrainMap`.
-        v_ref : np.ndarray, optional
-            ``(2,)`` reference for the second lattice vector. Defaults to the median
-            over the scan inside :class:`StrainMap`.
+        g1_ref : np.ndarray, optional
+            ``(2,)`` reference for the first lattice vector, in detector
+            ``(row, col)`` pixels (the frame of :attr:`g1_array`). Defaults to the
+            ``calculation_metric`` over the scan inside :class:`StrainMap`.
+        g2_ref : np.ndarray, optional
+            ``(2,)`` reference for the second lattice vector, as ``g1_ref``.
         mask : np.ndarray, optional
             ``(scan_row, scan_col)`` per-position weighting used when computing the
             reference lattice. Defaults to :attr:`mask_weight` from
-            :meth:`fit_lattice` (the lattice order parameter — how well all detected
+            :meth:`fit_lattice` (the lattice order parameter: how well all detected
             intensity snaps to the fitted lattice), so clean single-crystal positions
             dominate the reference and positions with off-lattice intensity are
             down-weighted.
+        q_to_r_rotation_ccw_deg : float, optional
+            Counter-clockwise rotation in degrees from the detector frame to the
+            scan frame, applied to the lattice vectors before the strain is
+            computed, so ``e_rr``/``e_cc`` refer to the scan rows and columns.
+            ``None`` (default) reads ``q_to_r_rotation_ccw_deg`` from the dataset
+            metadata, else uses 0.
+        q_transpose : bool, optional
+            If ``True``, swap the detector row/col axes before the rotation.
+            ``None`` (default) reads ``q_transpose`` from the dataset metadata,
+            else uses ``False``.
+        calculation_metric : {"median", "mean"}, default="median"
+            Statistic for the automatic reference lattice (weighted by ``mask``).
 
         Returns
         -------
         StrainMap
-            A strain map initialized from the fitted lattice vectors.
+            A strain map initialized from the fitted lattice vectors. The rotation
+            and transpose used are also stored in :attr:`metadata`.
         """
-        if self.u_array is None or self.v_array is None:
+        if self.g1_array is None or self.g2_array is None:
             raise ValueError("Run fit_lattice() before calculate_strain_map().")
 
         if mask is None:
             mask = self.mask_weight
 
-        ds_sampling = float(self.dataset.sampling[0])
-        ds_units = str(self.dataset.units[0])
+        ds_units = None
+        ds_sampling = None
+        if hasattr(self.dataset, "units"):
+            if isinstance(self.dataset.units, (tuple, list)):
+                ds_units = str(self.dataset.units[0])
+            else:
+                ds_units = str(self.dataset.units)
+        if hasattr(self.dataset, "sampling"):
+            if isinstance(self.dataset.sampling, (tuple, list, np.ndarray)):
+                ds_sampling = float(self.dataset.sampling[0])
+            else:
+                ds_sampling = float(self.dataset.sampling)
+
+        metadata = getattr(self.dataset, "metadata", None) or {}
+        parent_rot = metadata.get("q_to_r_rotation_ccw_deg", None)
+        parent_tr = metadata.get("q_transpose", None)
+
+        used_parent = False
+        if q_to_r_rotation_ccw_deg is None and parent_rot is not None:
+            q_to_r_rotation_ccw_deg = parent_rot
+            used_parent = True
+        if q_transpose is None and parent_tr is not None:
+            q_transpose = parent_tr
+            used_parent = True
+
+        if used_parent:
+            warnings.warn(
+                "BraggVectors.calculate_strain_map: using Dataset4dstem metadata "
+                f"(q_to_r_rotation_ccw_deg={q_to_r_rotation_ccw_deg or 0.0}, "
+                f"q_transpose={q_transpose or False}).",
+                UserWarning,
+            )
+
+        if q_to_r_rotation_ccw_deg is None or q_transpose is None:
+            q_to_r_rotation_ccw_deg = (
+                0.0 if q_to_r_rotation_ccw_deg is None else q_to_r_rotation_ccw_deg
+            )
+            q_transpose = False if q_transpose is None else q_transpose
+            warnings.warn(
+                "BraggVectors.calculate_strain_map: no detector rotation given or in "
+                f"the dataset metadata; using q_to_r_rotation_ccw_deg="
+                f"{q_to_r_rotation_ccw_deg} and q_transpose={q_transpose}.",
+                UserWarning,
+            )
+
+        self.metadata["q_to_r_rotation_ccw_deg"] = float(q_to_r_rotation_ccw_deg)
+        self.metadata["q_transpose"] = bool(q_transpose)
 
         return StrainMap(
-            u_array=self.u_array,
-            v_array=self.v_array,
+            g1_array=self.g1_array,
+            g2_array=self.g2_array,
             ds_shape=tuple(self.dataset.shape),
             real_space=self.real_space,
-            u_ref=u_ref,
-            v_ref=v_ref,
+            g1_ref=g1_ref,
+            g2_ref=g2_ref,
             mask=mask,
             ds_sampling=ds_sampling,
             ds_units=ds_units,
+            q_to_r_rotation_ccw_deg=float(q_to_r_rotation_ccw_deg),
+            q_transpose=bool(q_transpose),
+            calculation_metric=calculation_metric,
         )
 
     # ---- visualization ----
@@ -1080,7 +1184,8 @@ class BraggVectors(AutoSerialize):
         Parameters
         ----------
         position : tuple of int, default=(0, 0)
-            ``(row, col)`` scan position whose correlation map is shown.
+            ``(row, col)`` scan position (scan pixels) whose correlation map is
+            shown.
         crop_factor : float, optional
             If given, zoom to a square window of half-width ``crop_factor * radius``
             about the central-beam center, where ``radius`` is the central-beam
@@ -1474,7 +1579,14 @@ class BraggVectors(AutoSerialize):
         )
         return out[0] if isinstance(out, tuple) else out
 
-    def calibrate(self, crystal, pixel_size_guess: float, **kwargs):
+    def calibrate(
+        self,
+        crystal,
+        pixel_size_guess: float,
+        rotation_ccw_deg: float = 0.0,
+        plot: bool = False,
+        **kwargs,
+    ):
         """Measure the reciprocal pixel size and the elliptic distortion.
 
         Matches the radial distribution of the detected peaks against the
@@ -1497,8 +1609,9 @@ class BraggVectors(AutoSerialize):
             Starting reciprocal pixel size, 1/Angstroms per detector pixel.
             Recovered from a factor of two out in either direction.
         rotation_ccw_deg : float, default=0.0
-            Diffraction-to-scan rotation, recorded for later use.
-        plot : bool, default=True
+            Counter-clockwise diffraction-to-scan rotation in degrees, recorded
+            on the calibration for later use.
+        plot : bool, default=False
             Show the ring comparison before and after, for the first
             reference crystal. :meth:`CrystalMap.plot_calibration` checks
             every candidate phase afterwards.
@@ -1524,7 +1637,14 @@ class BraggVectors(AutoSerialize):
 
         if self.peaks is None:
             raise ValueError("Run detect_disks() before calibrate().")
-        cal = _cal.calibrate(self.peaks, crystal, pixel_size_guess, **kwargs)
+        cal = _cal.calibrate(
+            self.peaks,
+            crystal,
+            pixel_size_guess,
+            rotation_ccw_deg=rotation_ccw_deg,
+            plot=plot,
+            **kwargs,
+        )
         self.calibration = cal
         return cal
 
@@ -1588,13 +1708,22 @@ class BraggVectors(AutoSerialize):
     def _resolve_background_sigma(self, background_sigma: float | str | None) -> float | None:
         """Resolve the ``background_sigma`` argument to a value in pixels.
 
-        ``"auto"`` (the default everywhere) maps to twice the central-beam
-        radius: wide enough that the disk-scale correlation peaks pass
+        ``None`` (the default everywhere) disables the background subtraction.
+        ``"auto"`` maps to twice the central-beam radius: wide enough that the disk-scale correlation peaks pass
         untouched, narrow enough to remove the zero-sum template's negative
         moat around a bright unscattered beam -- which otherwise pushes weak
         disk peaks below zero, where the correlation clamp erases them before
-        peak finding. Pass ``None`` to disable the background subtraction or a
-        float to set the scale explicitly.
+        peak finding. A float sets the width explicitly.
+
+        Parameters
+        ----------
+        background_sigma : float, "auto" or None
+            The value passed by the caller.
+
+        Returns
+        -------
+        float or None
+            Width in pixels, or ``None`` for no background subtraction.
         """
         if background_sigma is None:
             return None
@@ -1685,6 +1814,8 @@ class BraggVectors(AutoSerialize):
         if batch_size is None:
             batch_size = int(min(1024, max(1, 16_000_000 // (H * W))))
 
+        use_cache = getattr(self, "_gpu_cache", None) is not None
+
         it = range(0, len(coords), batch_size)
         if progressbar:
             try:
@@ -1699,17 +1830,15 @@ class BraggVectors(AutoSerialize):
         results: list[NDArray] = []
         for start in it:
             chunk = coords[start : start + batch_size]
-            dps = torch.stack(
-                [
-                    torch.as_tensor(
-                        np.asarray(self.dataset.array[r, c]),
-                        dtype=torch.float,
-                        device=self.device,
-                    )
-                    for r, c in chunk
-                ],
-                dim=0,
-            )
+            rows = [r for r, c in chunk]
+            cols = [c for r, c in chunk]
+            if use_cache:
+                dps = self._gpu_cache[rows, cols]
+            else:
+                # one fancy-indexed read per batch rather than one per pattern
+                dps_np = np.asarray(self.dataset.array[np.asarray(rows), np.asarray(cols)])
+                dps = torch.as_tensor(dps_np, dtype=torch.float32, device=self.device)
+
             out = detect_disks_batch(dps, self._template_ft, **detect_kwargs)
             results.extend(
                 arr if arr.shape[0] else np.empty((0, len(PEAK_FIELDS)), dtype=float)
@@ -1813,7 +1942,7 @@ def _fit_lattice_vectors(
     a: NDArray,
     b: NDArray,
     intensity: NDArray,
-) -> tuple[NDArray | None, NDArray | None]:
+) -> tuple[NDArray | None, float]:
     """Intensity-weighted lattice fit ``q = x0 + a*g1 + b*g2`` for one pattern.
 
     Parameters

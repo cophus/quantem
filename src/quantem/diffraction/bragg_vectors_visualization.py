@@ -47,7 +47,7 @@ def plot_template(
     ax[1].imshow(template, cmap="gray")
     ax[1].set_title("template (centered)")
     ax[2].imshow(corr_map, cmap="viridis")
-    ax[2].set_title(f"correlation @ {tuple(position)}")
+    ax[2].set_title(f"correlation @ {tuple(position)} (real space pixels)")
     for a in ax:
         a.set_xticks([])
         a.set_yticks([])
@@ -531,32 +531,57 @@ def plot_bvm(
     counts: np.ndarray,
     *,
     figsize: tuple[float, float] = (10, 4),
+    norm: str | dict = "log_auto",
+    cmap: str = "inferno",
+    counts_kwargs: dict | None = None,
+    **plotting_kwargs,
 ):
-    """The Bragg vector map (log-scaled) beside the per-position peak count.
+    """The Bragg vector map beside the per-position peak count.
 
     Parameters
     ----------
     bvm : np.ndarray
-        Bragg vector map; displayed log-scaled (``log1p``).
+        ``(H, W)`` Bragg vector map in detector pixels.
     counts : np.ndarray
         Per-position peak count, shape ``(scan_row, scan_col)``.
     figsize : tuple of float, default=(10, 4)
         Figure size in inches.
+    norm : str or dict, default="log_auto"
+        Intensity normalization of the Bragg vector map, passed to
+        :func:`~quantem.core.visualization.show_2d`.
+    cmap : str, default="inferno"
+        Colormap of the Bragg vector map.
+    counts_kwargs : dict, optional
+        Keyword arguments for :func:`~quantem.core.visualization.show_2d` on the
+        peak-count panel (defaults: ``cmap="viridis"``, ``cbar=True``).
+    **plotting_kwargs
+        Further keyword arguments for :func:`~quantem.core.visualization.show_2d`
+        on the Bragg vector map panel.
 
     Returns
     -------
     tuple
         ``(fig, ax)`` with ``ax`` a length-2 array of axes.
     """
+    from quantem.core.visualization import show_2d
+
     fig, ax = plt.subplots(1, 2, figsize=figsize)
-    ax[0].imshow(np.log1p(bvm), cmap="inferno")
-    ax[0].set_title("Bragg vector map (log)")
-    im = ax[1].imshow(counts, cmap="viridis")
-    ax[1].set_title("peaks per position")
-    for a in ax:
-        a.set_xticks([])
-        a.set_yticks([])
-    fig.colorbar(im, ax=ax[1], fraction=0.046, pad=0.04)
+
+    show_2d(
+        np.asarray(bvm),
+        figax=(fig, ax[0]),
+        cmap=cmap,
+        norm=norm,
+        title="Bragg vector map",
+        **plotting_kwargs,
+    )
+    counts_plot_kwargs = {
+        "cmap": "viridis",
+        "cbar": True,
+        "title": "peaks per position",
+        **(counts_kwargs or {}),
+    }
+    show_2d(np.asarray(counts), figax=(fig, ax[1]), **counts_plot_kwargs)
     fig.tight_layout()
     return fig, ax
 

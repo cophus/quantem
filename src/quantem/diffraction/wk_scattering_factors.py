@@ -1,89 +1,82 @@
-import numpy as np
-from scipy.special import expi
-
-# from functools import lru_cache
-
-from quantem.core.utils.utils import electron_wavelength_angstrom
-
-"""
-Weickenmeier-Kohl absorptive electron scattering factors.
+"""Weickenmeier-Kohl absorptive electron scattering factors.
 
 Elastic form factors use the 8-parameter fit of Weickenmeier & Kohl,
 Acta Cryst. A47, 590 (1991); the absorptive (core-loss and phonon/TDS)
-parts are computed analytically from the same fit. This implementation
-was adapted by SE Zeltmann for py4DSTEM from EMsoftLib/others.f90 by
-Marc De Graef, who adapted it from Weickenmeier's original F77 code;
-vendored here from py4DSTEM with only the import adjusted.
+parts are computed analytically from the same fit. The implementation
+follows Weickenmeier's original F77 code as adapted by Marc De Graef in
+EMsoftLib/others.f90, translated to Python by SE Zeltmann for py4DSTEM and
+vectorized over g by Colin Ophus. It was vendored from py4DSTEM with one
+correction: the middle branch of WEKO now starts at argu >= 0.1, as in
+others.f90 (py4DSTEM used argu >= 1.0, which dropped every term with argu
+in [0.1, 1) and made the form factors non-monotonic at small g). Comments
+in quotation marks are carried over from the original code.
 """
+
+import numpy as np
+from scipy.special import expi
+
+from quantem.core.utils.utils import electron_wavelength_angstrom
 
 
 def compute_WK_factor(
     g: np.ndarray,
     Z: int,
     accelerating_voltage: float,
-    thermal_sigma: float = None,
+    thermal_sigma: float | None = None,
     include_core: bool = True,
     include_phonon: bool = True,
-    verbose=False,
-) -> np.complex128:
+) -> np.ndarray:
+    """Absorptive, relativistically corrected Weickenmeier-Kohl scattering factors.
+
+    The elastic part uses the 8-parameter fit of the elastic form factors;
+    the absorptive part is computed analytically from the same fitting
+    function, following EMsoftLib/others.f90. Vectorized over `g` only.
+
+    Parameters
+    ----------
+    g : array-like
+        Scattering vector magnitudes 1/d_hkl (crystallographic convention,
+        no 2 pi), 1/Angstroms.
+    Z : int
+        Atomic number, 1 (H) to 98 (Cf).
+    accelerating_voltage : float
+        Beam energy, eV.
+    thermal_sigma : float | None
+        RMS atomic displacement for the Debye-Waller factor and the TDS
+        absorption, Angstroms (often written <u> in papers). None or 0
+        means no thermal motion: no Debye-Waller damping and no phonon
+        absorption.
+    include_core : bool, default=True
+        Include the core-loss contribution to the absorptive form factor.
+    include_phonon : bool, default=True
+        Include the phonon/TDS contribution to the absorptive form factor.
+
+    Returns
+    -------
+    np.ndarray
+        Complex128 form factors, same shape as `g`, Angstroms. The real part
+        is elastic, the imaginary part absorptive.
     """
-    Compute the Weickenmeier-Kohl atomic scattering factors, using the parameterization
-    of the elastic part and computation of the inelastic part found in EMsoftLib/others.f90.
-    Return value should be in Å.
+    g = np.atleast_1d(np.asarray(g, dtype=float))
 
-    This implementation always returns the absorptive, relativistically corrected factors.
-
-    Currently this is mostly a direct translation of the Fortran code, along with
-    the accompanying comments from the original in quotation marks. Colin Ophus
-    vectorized it around v0.13.17. Currently it is only vectorized over `g` (i.e.
-    `Z` and all other args must be a single value.)
-
-    This method uses an 8-parameter fit to the elastic form factors, and then computes the
-    absorptive form factors using an analytic solution based on that fitting function.
-
-    Args: (note that these values cannot be arrays: the code is not vectorized)
-        g (float/ndarray):              Scattering vector magnitude in the crystallographic/py4DSTEM
-                                        convention, 1/d_hkl in units of 1/Å
-        Z (int):                        Atomic number. Data are available for H thru Cf (1 thru 98)
-        accelerating_voltage (float):   Accelerating voltage in eV.
-        thermal_sigma (float):          RMS atomic displacement for TDS, in Å
-                                        (This is often written as 〈u〉in papers)
-        include_core (bool):            If True, include the core loss contribution to the absorptive
-                                        form factors.
-        include_phonon (bool):          If True, include the phonon/TDS contribution to the
-                                        absorptive form factors.
-    Returns:
-        Fscatt (np.complex128):         The computed atomic form factor
-    """
-
-    # the WK Fortran code works in weird units:
-    # lowercase "g", our input, is the standard crystallographic quantity, in Å^-1
-    # uppercase "G" is the "G" in others.f90:FSCATT, g * 2π
-    # uppercase "S" is the "S" in others.f90:FSCATT, G / 4π = g / 2
+    # the WK Fortran code works in its own units:
+    # lowercase "g", our input, is the standard crystallographic quantity, in A^-1
+    # uppercase "G" is the "G" in others.f90:FSCATT, g * 2 pi
+    # uppercase "S" is the "S" in others.f90:FSCATT, G / 4 pi = g / 2
     G = g * 2.0 * np.pi
     S = g / 2.0
-
-    if verbose:
-        print(f"S:{S}")
 
     accelerating_voltage_kV = accelerating_voltage / 1.0e3
 
     if thermal_sigma is not None:
-        UL = thermal_sigma
+        UL = float(thermal_sigma)
         DWF = np.exp(-0.5 * UL**2 * G**2)
     else:
         UL = 0.0
         DWF = 1.0
 
-    if verbose:
-        print(f"DWF:{DWF}")
-
     A = WK_A_param[int(Z) - 1]
     B = WK_B_param[int(Z) - 1]
-
-    if verbose:
-        print(f"A:{A}")
-        print(f"B:{B}")
 
     # WEKO(A,B,S)
     # NOTE: the py4DSTEM version this was vendored from used `argu >= 1.0`
@@ -101,9 +94,6 @@ def compute_WK_factor(
         WK[sub] += A[i] / S[sub] ** 2
 
     Freal = 4.0 * np.pi * DWF * WK
-
-    if verbose:
-        print(f"Freal:{Freal}")
 
     #################################################
     # calculate "core" contribution, following FCORE:
@@ -157,8 +147,7 @@ def compute_WK_factor(
             1.0
             / (OMEGA[sub] * np.sqrt(O2[sub] + 4.0 * (1.0 + K2)))
             * np.log(
-                (OMEGA[sub] + np.sqrt(O2[sub] + 4.0 * (1.0 + K2)))
-                / (2.0 * np.sqrt(1.0 + K2))
+                (OMEGA[sub] + np.sqrt(O2[sub] + 4.0 * (1.0 + K2))) / (2.0 * np.sqrt(1.0 + K2))
             )
         )
         sub = np.logical_not(sub)
@@ -168,18 +157,15 @@ def compute_WK_factor(
 
         A0 = 0.5289
         Fcore = 4.0 / (A0 * A0) * 2.0 * np.pi / (k0 * k0) * HI
-
-        if verbose:
-            print(f"Fcore:{Fcore}")
     else:
         Fcore = 0.0
 
     ##########################################################
     # calculate phonon contribution, following FPHON(G,UL,A,B)
+    # without thermal motion RI2 equals RI1 and the phonon term vanishes;
+    # evaluating it at U = 0 instead gives inf - inf in the asymptotic branch
     Fphon = 0.0
-    if include_phonon:
-        U2 = UL**2
-
+    if include_phonon and UL > 0.0:
         A1 = A * (4.0 * np.pi) ** 2
         B1 = B / (4.0 * np.pi) ** 2
 
@@ -191,25 +177,17 @@ def compute_WK_factor(
                     * A1[ii]
                     * (DWF * RI1(B1[ii], B1[jj], G) - RI2(B1[ii], B1[jj], G, UL))
                 )
-        if verbose:
-            print(f"Fphon:{Fphon}")
 
     Fimag = (Fcore * DWF) + Fphon
 
     # perform relativistic correction
     gamma = (accelerating_voltage_kV + 511.0) / (511.0)
 
-    if verbose:
-        print(f"gamma:{gamma}")
+    Fscatt = np.asarray((Freal * gamma) + (1.0j * (Fimag * gamma**2 / k0)), dtype=np.complex128)
 
-    Fscatt = np.complex128((Freal * gamma) + (1.0j * (Fimag * gamma**2 / k0)))
-
-    if verbose:
-        print(f"Fscatt:{Fscatt}")
-
-    return (
-        Fscatt * 0.4787801 * 0.664840340614319 / (4.0 * np.pi)
-    )  # convert to Å, and remove extra physicist factors, as performed in diffraction.f90:427,576,630
+    # convert to Angstroms and remove the extra physicist factors, as in
+    # diffraction.f90:427,576,630
+    return Fscatt * 0.4787801 * 0.664840340614319 / (4.0 * np.pi)
 
 
 ##############################################
@@ -239,13 +217,9 @@ def RI1(BI, BJ, G):
         - 2.0 * expi(-BI * BJ * G[sub] ** 2 / (BI + BJ))
     )
 
-    ri1[sub] += RIH1(
-        BI * G[sub] ** 2, BI * G[sub] ** 2 * BI / (BI + BJ), BI * G[sub] ** 2
-    )
+    ri1[sub] += RIH1(BI * G[sub] ** 2, BI * G[sub] ** 2 * BI / (BI + BJ), BI * G[sub] ** 2)
 
-    ri1[sub] += RIH1(
-        BJ * G[sub] ** 2, BJ * G[sub] ** 2 * BJ / (BI + BJ), BJ * G[sub] ** 2
-    )
+    ri1[sub] += RIH1(BJ * G[sub] ** 2, BJ * G[sub] ** 2 * BJ / (BI + BJ), BJ * G[sub] ** 2)
     ri1[sub] *= np.pi / G[sub] ** 2
 
     return ri1
@@ -289,12 +263,8 @@ def RI2(BI, BJ, G, U):
     ri2[sub] += np.pi * G2[sub] * TEMP
 
     sub = EPS > 0.1
-    ri2[sub] = expi(-0.5 * U2 * G2[sub] * BIUH / BIU) + expi(
-        -0.5 * U2 * G2[sub] * BJUH / BJU
-    )
-    ri2[sub] -= expi(-BIUH * BJUH * G2[sub] / (BIUH + BJUH)) + expi(
-        -0.25 * U2 * G2[sub]
-    )
+    ri2[sub] = expi(-0.5 * U2 * G2[sub] * BIUH / BIU) + expi(-0.5 * U2 * G2[sub] * BJUH / BJU)
+    ri2[sub] -= expi(-BIUH * BJUH * G2[sub] / (BIUH + BJUH)) + expi(-0.25 * U2 * G2[sub])
     ri2[sub] *= 2.0
     X1 = 0.5 * U2 * G2[sub]
     X2 = 0.25 * U2 * G2[sub]
@@ -329,14 +299,13 @@ def RIH1(X1, X2, X3):
     rih1[sub] = np.exp(-X1[sub]) * (expi(X2[sub]) - expi(X3[sub]))
 
     sub = np.logical_and(X2 > 20.0, X3 <= 20.0)
-    rih1[sub] = np.exp(X2[sub] - X1[sub]) * RIH2(X2[sub]) / X2[sub] - np.exp(
-        -X1[sub]
-    ) * expi(X3[sub])
+    rih1[sub] = np.exp(X2[sub] - X1[sub]) * RIH2(X2[sub]) / X2[sub] - np.exp(-X1[sub]) * expi(
+        X3[sub]
+    )
 
     sub = np.logical_and(X2 <= 20.0, X3 > 20.0)
     rih1[sub] = (
-        np.exp(-X1[sub]) * expi(X2[sub])
-        - np.exp(X3[sub] - X1[sub]) * RIH2(X3[sub]) / X3[sub]
+        np.exp(-X1[sub]) * expi(X2[sub]) - np.exp(X3[sub] - X1[sub]) * RIH2(X3[sub]) / X3[sub]
     )
 
     sub = np.logical_and(X2 > 20.0, X3 > 20.0)
@@ -360,15 +329,6 @@ def RIH2(X):
     ) * ((1.0 / X) - 0.5e-3 * idx)
 
     return sig
-
-
-# NOTE - This function is present in EMSoftLib but apparently not used.
-def RIH3(X):
-    # "WERTET DEN AUSDRUCK EXP(-X) * EI(X) AUS"
-    if X <= 20.0:
-        return np.exp(-X) * expi(X)
-    else:
-        return RIH2(X) / X
 
 
 ##################

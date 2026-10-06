@@ -138,7 +138,7 @@ def _ase(spacegroup, symbols, basis, cellpar):
             2.0,
         ),
         # ilmenite's projections are nearly mirror symmetric, so the flipped
-        # orientation is a close rival and needs the finer zone grid
+        # orientation is a close rival and needs a finer zone grid than Bi
         (
             "ilmenite -3",
             lambda: _ase(
@@ -147,7 +147,7 @@ def _ase(spacegroup, symbols, basis, cellpar):
                 [(0, 0, 0.355), (0, 0, 0.146), (0.317, 0.023, 0.245)],
                 [5.09, 5.09, 14.09, 90, 90, 120],
             ),
-            1.0,
+            1.5,
         ),
     ],
 )
@@ -725,3 +725,164 @@ def test_plot_matches_background_norm():
         matplotlib.pyplot.close(fig)
     # gray_r: a lower upper quantile saturates more of the pattern to black
     assert (shown[1] <= shown[1].min() + 1e-6).mean() > (shown[0] <= shown[0].min() + 1e-6).mean()
+
+
+def _quat_deg(axis, angle_deg):
+    from quantem.diffraction.rotations import quat_from_axis_angle
+
+    a = torch.tensor(axis, dtype=torch.float64)
+    return quat_from_axis_angle(a / a.norm(), torch.tensor(np.deg2rad(angle_deg)))
+
+
+def _two_grain_peaks(xtl, q1, q2, n=3):
+    """n positions, each the sum of two grains' patterns."""
+    peaks = Vector.from_shape(
+        (1, n), fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t"
+    )
+    for i in range(n):
+        rows = []
+        for q in (q1, q2):
+            p = xtl.generate_pattern(q, energy_ev=200e3, sigma_excitation=0.02)
+            rows.append(np.stack([p["qx"].numpy(), p["qy"].numpy(), p["intensity"].numpy()], 1))
+        peaks[0, i] = np.concatenate(rows)
+    return peaks
+
+
+def test_second_match_indexes_second_grain():
+    """With deflation, the second match fits the peaks the first leaves."""
+    from quantem.diffraction.rotations import quat_from_zone_axis
+
+    xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True), verbose=False)
+    xtl.calculate_structure_factors(k_max=1.5)
+    q1 = quat_from_zone_axis(xtl.direction_vector((0, 0, 1)), 10.0)
+    q2 = quat_from_zone_axis(xtl.direction_vector((1, 1, 1)), 35.0)
+    peaks = _two_grain_peaks(xtl, q1, q2)
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om.build_plan(angle_step_zone_axis_deg=2.0, angle_step_in_plane_deg=2.0, verbose=False)
+    om.match_orientations(num_matches=2, suppress_matched=1.0, progress_bar=False)
+    assert om.quats.shape[2] == 2 and om.corr_residual.shape == om.corr.shape
+    sym = xtl.sym_quats
+    for i in range(peaks.shape[1]):
+        e = [
+            [float(misorientation_angle_deg(q, om.quats[0, i, m], sym)) for q in (q1, q2)]
+            for m in range(2)
+        ]
+        # the two matches are the two grains, one each
+        assert min(e[0][0] + e[1][1], e[0][1] + e[1][0]) < 6.0, e
+
+
+def test_match_residual():
+    """The residual of one crystal is re-matched by the other."""
+    torch.manual_seed(1)
+    ti_a = Crystal.from_ase(bulk("Ti", "hcp", a=2.9505, c=4.6855), name="a", verbose=False)
+    ti_b = Crystal.from_ase(bulk("Ti", "bcc", a=3.26, cubic=True), name="b", verbose=False)
+    for x in (ti_a, ti_b):
+        x.calculate_structure_factors(k_max=1.5)
+    q_a = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    q_b = _quat_deg((1.0, 0.0, 0.0), 20.0)
+    N = 3
+    peaks = Vector.from_shape(
+        (1, N), fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t"
+    )
+    for i in range(N):
+        rows = []
+        for x, q, s in ((ti_a, q_a, 1.0), (ti_b, q_b, 0.5)):
+            p = x.generate_pattern(q, energy_ev=200e3, sigma_excitation=0.02)
+            rows.append(
+                np.stack([p["qx"].numpy(), p["qy"].numpy(), s * p["intensity"].numpy()], 1)
+            )
+        peaks[0, i] = np.concatenate(rows)
+    oms = {}
+    for x in (ti_a, ti_b):
+        om = OrientationMap.from_vectors(peaks, x, energy_ev=200e3)
+        om.build_plan(angle_step_zone_axis_deg=3.0, verbose=False, progress_bar=False)
+        om.match_orientations(progress_bar=False)
+        oms[x.name] = om
+    om_b = oms["b"]
+    om_b.match_residual(oms["a"], progress_bar=False)
+    assert om_b.quats.shape[2] == 2
+    for name in ("corr", "corr_residual", "mirror"):
+        assert getattr(om_b, name).shape == (1, N, 2), name
+    # with alpha's peaks removed, beta is found by one of its two matches
+    err = misorientation_angle_deg(q_b, om_b.quats[0], ti_b.sym_quats).amin(dim=-1)
+    assert float(err.max()) < 2.0, err
+    assert float(om_b.corr[0, :, 1].min()) > 0
+    assert "match_residual" in om_b.metadata
+
+    # nothing left once every peak is deleted: no error, an empty second match
+    om_a = oms["a"]
+    om_a.match_residual(om_a, delete_radius=10.0, progress_bar=False)
+    assert om_a.quats.shape[2] == 2
+    assert float(om_a.corr[..., 1].abs().max()) == 0.0
+    assert om_a.corr_residual.shape == om_a.corr.shape
+
+
+def test_plot_pattern_matches_defaults_with_one_match():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from types import SimpleNamespace
+
+    from quantem.diffraction.orientation_visualization import plot_pattern_matches
+
+    torch.manual_seed(0)
+    xtl = Crystal.from_ase(bulk("Ti", "bcc", a=3.31, cubic=True), verbose=False)
+    xtl.calculate_structure_factors(k_max=1.5)
+    peaks = _make_peaks(xtl, qnormalize(torch.randn(2, 4, dtype=torch.float64)))
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om.build_plan(angle_step_zone_axis_deg=3.0, verbose=False, progress_bar=False)
+    om.match_orientations(progress_bar=False)
+    # default matches=(0, 1) with a single match: one panel, no IndexError
+    fig, axs = plot_pattern_matches(om, [(0, 0), (0, 1)])
+    assert axs.shape == (2, 1)
+    with pytest.raises(ValueError, match="none of matches"):
+        plot_pattern_matches(om, [(0, 0)], matches=(3,))
+    img = np.ones((1, 2, 16, 16))
+    with pytest.raises(ValueError, match="pixel_size"):
+        plot_pattern_matches(om, [(0, 0)], dataset=SimpleNamespace(array=img, shape=img.shape))
+    matplotlib.pyplot.close("all")
+
+
+def test_misorientation_map_and_cluster_plots():
+    import matplotlib
+
+    matplotlib.use("Agg")
+    from quantem.diffraction.orientation_visualization import _pole_family
+
+    xtl = Crystal.from_ase(bulk("Ti", "hcp", a=2.95, c=4.686), verbose=False)
+    xtl.calculate_structure_factors(k_max=1.5)
+    q0 = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float64)
+    q1 = _quat_deg((1.0, 0.0, 0.0), 25.0)
+    R, C = 4, 6
+    q = torch.where((torch.arange(C) < 3)[None, :, None], q0, q1).expand(R, C, 4).clone()
+    peaks = _make_peaks(xtl, q0[None])
+    om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
+    om.quats = q[..., None, :]
+    om.corr = torch.ones((R, C, 1), dtype=torch.float64)
+
+    mis = om.misorientation_map()
+    assert mis.shape == (R, C)
+    assert float(mis[:, :3].max()) < 1e-6 and np.allclose(mis[:, 3:].numpy(), 25.0, atol=1e-6)
+    assert np.allclose(om.misorientation_map(reference=q1)[:, 3:].numpy(), 0.0, atol=1e-6)
+
+    clusters = om.cluster_orientations(min_cluster_size=2)
+    assert clusters["sizes"].tolist() == [12, 12]
+    fig, ax = om.plot_cluster_map(clusters)
+    assert len(ax.get_legend().get_texts()) == 2
+    fig, ax = om.plot_cluster_pole_figure(clusters, pole=(0, 0, 0, 1), pole_label="[0001]")
+    assert len(ax.collections) == 2
+    # a mask selects positions above one half
+    half = np.zeros((R, C))
+    half[:, :3] = 0.9
+    half[:, 3:] = 0.4
+    assert om.cluster_orientations(mask=half, min_cluster_size=2)["sizes"].tolist() == [12]
+    matplotlib.pyplot.close("all")
+
+    # poles are Miller indices: hexagonal [110] is 60 degrees from [100],
+    # not the 45 degrees of the Cartesian (1, 1, 0)
+    fam = _pole_family(xtl, (1, 1, 0))
+    d = xtl.direction_vector((1, 1, 0))
+    assert float((fam @ d).max()) > 1 - 1e-5
+    assert torch.allclose(_pole_family(xtl, (0, 0, 1)), _pole_family(xtl, (0, 0, 0, 1)))
+    a = xtl.direction_vector((1, 0, 0))
+    assert np.isclose(float(a @ d), 0.5)

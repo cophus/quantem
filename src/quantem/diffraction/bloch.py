@@ -1,16 +1,34 @@
-"""Dynamical (Bloch wave) diffraction for orientation and phase refinement.
+"""Dynamical (Bloch wave) electron diffraction.
 
-Second-pass refinement: kinematical matching fixes orientations from peak
-positions (which dynamical scattering does not move), then this module
-recomputes peak intensities with multiple scattering to refine specimen
-thickness and phase assignment for the top candidates.
+Simulation and refinement with the Bloch wave formulation of De Graef
+(2003), ch. 5. The module has five families of functions:
 
-Follows the Bloch wave formulation of De Graef (2003), ch. 5. The structure
-matrix uses U_g = gamma_rel * F_g / pi with F_g the kinematical structure
-factors (scattering amplitude per volume, 1/Angstrom^2), off-diagonals
-U_(g-h) and diagonal 2 k0 s_g. Without absorption the matrix is Hermitian,
-so one eigendecomposition per orientation gives the diffracted intensities
-at every thickness essentially for free:
+- Spot patterns: dynamical_pattern() gives the Bloch intensities of one
+  orientation at every thickness; refine_thickness() refits thickness and
+  phase of a fitted PhaseMap with them.
+- Convergent beam patterns: calculate_cbed() and calculate_cbed_library()
+  (disk patterns), calculate_lacbed() (one reflection's rocking surface)
+  and calculate_kossel() (wide-angle Kossel patterns).
+- Kossel reference patterns: calculate_kossel_reference() computes the
+  bright field over all beam directions once; kossel_from_reference() and
+  kossel_polar_from_reference() look patterns up from it. The line model
+  (kossel_lines(), render_kossel_lines(), kossel_line_segments()) describes
+  the same patterns as one profile per systematic row, with
+  kossel_reference_residual() adding the many-beam correction near zone
+  axes.
+- Bragg-vector refinement: refine_dynamical() refines orientation,
+  thickness, in-plane deformation and phase per position against the
+  measured peak intensities; dynamical_maps(), plot_dynamical_maps(),
+  strain_crystal_frame() and plot_strain_crystal_frame() present the result.
+- Image refinement: fit_disk_shape() and refine_dynamical_image() refine
+  against the diffraction pattern pixels.
+
+The structure matrix uses U_g = gamma_rel * F_g / pi with F_g the
+kinematical structure factors (scattering amplitude per volume,
+1/Angstrom^2), or the absorptive Weickenmeier-Kohl factors when the crystal
+carries them (Crystal.calculate_dynamical_structure_factors), off-diagonals
+U_(g-h) and diagonal 2 k0 s_g. One eigendecomposition per incident
+direction gives the intensities at every thickness:
 
     psi(t) = C exp(2 pi i gamma t) C^-1 psi_0,   A C = 2 k0 gamma C
 """
@@ -40,7 +58,7 @@ from quantem.diffraction.rotations import qrotate, sample_zone_axes
 
 
 def relativistic_gamma(energy_ev: float) -> float:
-    """Relativistic mass factor 1 + eV / (m0 c^2)."""
+    """Relativistic mass factor 1 + eV / (m0 c^2) at beam energy energy_ev (eV)."""
     return 1.0 + float(energy_ev) / 510998.95
 
 
@@ -83,25 +101,33 @@ def _coupling_matrix(
     def keys(h):
         return ((h + m) * key_mult).sum(dim=-1)
 
-    lut = {int(k): i for i, k in enumerate(keys(hkl_all))}
-    diff_keys = keys(diff)
+    # vectorized lookup: binary search of the queried keys in the sorted
+    # stored keys
+    keys_all = keys(hkl_all)
+    order = torch.argsort(keys_all)
+    keys_sorted = keys_all[order]
+
+    def lookup(k):
+        pos = torch.searchsorted(keys_sorted, k).clamp(max=keys_sorted.shape[0] - 1)
+        return torch.where(keys_sorted[pos] == k, order[pos], -1)
+
     U = torch.zeros((nb, nb), dtype=torch.complex128)
-    idx = torch.tensor(
-        [lut.get(int(k), -1) for k in diff_keys.reshape(-1)], dtype=torch.long
-    ).reshape(nb, nb)
+    idx = lookup(keys(diff).reshape(-1)).reshape(nb, nb)
     has = idx >= 0
     U[has] = U_all[idx[has]]
     U.fill_diagonal_(0)
 
     u0_imag = 0.0
     if absorptive:
-        i0 = lut.get(int(keys(torch.zeros(3, dtype=torch.long))), -1)
+        i0 = int(lookup(keys(torch.zeros((1, 3), dtype=torch.long)))[0])
         if i0 >= 0:
             u0_imag = float(U_all[i0].imag)
     return U, u0_imag, absorptive
 
 
-_coverage_warned: set = set()
+# guards the per-crystal record of issued coverage warnings, which the
+# threads of refine_dynamical() check concurrently
+_coverage_lock = threading.Lock()
 
 
 def _beam_universe(crystal: Crystal) -> tuple[torch.Tensor, torch.Tensor]:
@@ -137,12 +163,19 @@ def _primitive_lattice_mask(crystal: Crystal, g: torch.Tensor) -> torch.Tensor:
     if lat_p is None:
         import spglib
 
+        from quantem.diffraction.crystal import _spglib_raises
+
         cell = (
             crystal.lat_real.numpy(),
             crystal.positions_frac.numpy(),
             crystal.numbers.numpy(),
         )
-        prim = spglib.standardize_cell(cell, to_primitive=True, no_idealize=True)
+        try:
+            with _spglib_raises():
+                prim = spglib.standardize_cell(cell, to_primitive=True, no_idealize=True)
+        except Exception:
+            # no primitive cell found: keep every point of the stored box
+            prim = None
         lat_p = np.asarray(crystal.lat_real.numpy() if prim is None else prim[0], dtype=float)
         crystal._primitive_lattice = lat_p
     m = g.to(torch.float64) @ torch.as_tensor(lat_p, dtype=torch.float64).T
@@ -150,13 +183,25 @@ def _primitive_lattice_mask(crystal: Crystal, g: torch.Tensor) -> torch.Tensor:
 
 
 def _check_dynamical_factors(crystal: Crystal, energy_ev: float, g_max_beams: float) -> None:
-    """Warn once per crystal when the absorptive factors are missing, were
-    computed at another energy, or stop short of 1.5 times the largest beam
-    (the couplings g - h reach twice it, but the factors beyond 1.5 times
-    are negligible)."""
-    key = id(crystal)
-    if key in _coverage_warned:
+    """Warn when the absorptive factors are missing, were computed at
+    another energy, or stop short of 1.5 times the largest beam (the
+    couplings g - h reach twice it, but the factors beyond 1.5 times are
+    negligible).
+
+    A warning is issued once per crystal and factor set: the record is
+    kept on the crystal, keyed by the energy and extent of its dynamical
+    factors and the energy of the calculation, so recomputing the factors
+    or running at another energy is checked again.
+    """
+    key = (
+        getattr(crystal, "dyn_energy_ev", None),
+        getattr(crystal, "dyn_k_max", None),
+        round(float(energy_ev)),
+    )
+    warned = getattr(crystal, "_bloch_coverage_warned", None)
+    if warned is not None and key in warned:
         return
+    msgs = []
     if getattr(crystal, "U_dyn", None) is None:
         k_kin = getattr(crystal, "k_max", None)
         msg = (
@@ -168,30 +213,37 @@ def _check_dynamical_factors(crystal: Crystal, energy_ev: float, g_max_beams: fl
                 f", which stop at {k_kin:.2f} 1/A, short of the "
                 f"{1.5 * g_max_beams:.2f} 1/A the couplings of this beam list need"
             )
-        _coverage_warned.add(key)
-        warnings.warn(f"{crystal.name}: {msg}", stacklevel=3)
+        msgs.append(msg)
+    else:
+        e_dyn = getattr(crystal, "dyn_energy_ev", None)
+        k_dyn = getattr(crystal, "dyn_k_max", None)
+        if e_dyn is not None and abs(e_dyn - energy_ev) > 1.0:
+            msgs.append(
+                f"dynamical structure factors were computed at {e_dyn:.0f} eV, the "
+                f"calculation runs at {energy_ev:.0f} eV"
+            )
+        # couplings g - h reach twice the beam radius, but the factors fall
+        # off fast: 1.5 times it keeps every coupling that matters (to 5%,
+        # since the fitted in-plane strain stretches the beams a little past
+        # k_max)
+        if k_dyn is not None and 1.5 * g_max_beams > 1.05 * k_dyn:
+            msgs.append(
+                f"dynamical structure factors extend to {k_dyn:.2f} 1/A but the beam "
+                f"list reaches {g_max_beams:.2f} 1/A, so couplings beyond "
+                f"{k_dyn:.2f} 1/A are missing (treated as zero); recompute with "
+                f"k_max >= {1.5 * g_max_beams:.2f}"
+            )
+    if not msgs:
         return
-    e_dyn = getattr(crystal, "dyn_energy_ev", None)
-    k_dyn = getattr(crystal, "dyn_k_max", None)
-    msgs = []
-    if e_dyn is not None and abs(e_dyn - energy_ev) > 1.0:
-        msgs.append(
-            f"dynamical structure factors were computed at {e_dyn:.0f} eV, the "
-            f"calculation runs at {energy_ev:.0f} eV"
-        )
-    # couplings g - h reach twice the beam radius, but the factors fall off
-    # fast: 1.5 times it keeps every coupling that matters (to 5%, since the
-    # fitted in-plane strain stretches the beams a little past k_max)
-    if k_dyn is not None and 1.5 * g_max_beams > 1.05 * k_dyn:
-        msgs.append(
-            f"dynamical structure factors extend to {k_dyn:.2f} 1/A but the beam "
-            f"list reaches {g_max_beams:.2f} 1/A, so couplings beyond "
-            f"{k_dyn:.2f} 1/A are missing (treated as zero); recompute with "
-            f"k_max >= {1.5 * g_max_beams:.2f}"
-        )
-    if msgs:
-        _coverage_warned.add(key)
-        warnings.warn(f"{crystal.name}: " + "; ".join(msgs), stacklevel=3)
+    with _coverage_lock:
+        warned = getattr(crystal, "_bloch_coverage_warned", None)
+        if warned is None:
+            warned = set()
+            crystal._bloch_coverage_warned = warned
+        if key in warned:
+            return
+        warned.add(key)
+    warnings.warn(f"{crystal.name}: " + "; ".join(msgs), stacklevel=3)
 
 
 def select_dynamical_beams(
@@ -203,12 +255,37 @@ def select_dynamical_beams(
     k_max: float | None = None,
     deform: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Beam list (nb, 3) hkl, 000 first, for a Bloch calculation at an
-    orientation and every incident direction within alpha_max_rad of the
-    optic axis: reflections with |s_g| < sg_max + alpha_max |g| (a tilt t
-    shifts s_g by at most |t| |g| / k0 to leading order). One list computed
-    with the largest tilt of a refinement search keeps every stage of that
-    search in the same truncated system."""
+    """Beam list for a Bloch calculation over a range of incident directions.
+
+    Selects the reflections with |s_g| < sg_max + alpha_max_rad |g| at the
+    given orientation, which covers every incident direction within
+    alpha_max_rad of the optic axis (a tilt t shifts s_g by at most
+    |t| |g| / k0 to leading order). One list computed with the largest tilt
+    of a refinement search keeps every stage of that search in the same
+    truncated system.
+
+    Parameters
+    ----------
+    crystal : Crystal
+        With structure factors calculated.
+    orientation : torch.Tensor
+        Unit quaternion (4,), crystal to lab.
+    energy_ev : float
+        Beam energy in eV.
+    alpha_max_rad : float, default=0.0
+        Largest incident tilt from the optic axis, in radians.
+    sg_max : float, default=SG_MAX
+        Excitation error cutoff in 1/Angstroms at zero tilt.
+    k_max : float | None
+        Largest |g| in 1/Angstroms; None keeps every candidate reflection.
+    deform : torch.Tensor | None
+        (3, 3) deformation applied to the lab-frame reciprocal vectors.
+
+    Returns
+    -------
+    torch.Tensor
+        (nb, 3) Miller indices, with the 000 beam first.
+    """
     lam = electron_wavelength_angstrom(energy_ev)
     hkl_u, g_u = _beam_universe(crystal)
     g_lab = qrotate(orientation, g_u)
@@ -233,27 +310,35 @@ def dynamical_pattern(
 ) -> dict[str, torch.Tensor]:
     """Bloch-wave diffraction intensities for one orientation, all thicknesses.
 
+    The beams are the reflections with |s_g| < sg_max (and |g| <= k_max);
+    one eigendecomposition gives the intensities at every thickness.
+
     Parameters
     ----------
     crystal : Crystal
-        With structure factors calculated. For accurate couplings,
-        calculate_structure_factors should cover 2x the k_max used here so
-        every difference vector g - h has a structure factor.
+        With structure factors calculated. Preferably also with
+        calculate_dynamical_structure_factors (absorptive factors, at this
+        energy, covering at least 1.5 times k_max so the couplings g - h
+        that matter have a factor); a warning is issued otherwise.
     orientation : torch.Tensor
         Unit quaternion (4,) rotating crystal vectors into the lab frame.
     thicknesses_A : array-like or float
         Specimen thicknesses in Angstroms.
-    sg_max : float, default=0.1
+    energy_ev : float, default=300e3
+        Beam energy in eV.
+    sg_max : float, default=SG_MAX
         Excitation error cutoff (1/Angstroms) for including a beam.
     k_max : float | None
-        In-plane scattering vector cutoff for included beams.
+        Largest |g| (1/Angstroms) of an included beam; None keeps every
+        reflection within sg_max.
 
     Returns
     -------
     dict
-        'qx', 'qy' (N,), 'hkl' (N, 3), 'intensity' (T, N) diffracted
+        'qx', 'qy' (N,) lab-frame positions (1/Angstroms), 'hkl' (N, 3),
+        's_g' (N,) excitation errors, 'intensity' (T, N) diffracted
         intensities per thickness, 'intensity_000' (T,) the direct beam,
-        's_g' (N,).
+        'thicknesses' (T,) in Angstroms.
     """
     if crystal.g_vec is None:
         raise RuntimeError("Run crystal.calculate_structure_factors() first.")
@@ -324,37 +409,53 @@ def refine_thickness(
     min_number_peaks: int | None = None,
     progress_bar: bool = True,
 ):
-    """Second-pass thickness and phase refinement with dynamical intensities.
+    """Thickness and phase refinement with dynamical intensities.
+
+    For every probe position, the winning candidates of a fitted PhaseMap are
+    re-simulated with Bloch waves over a thickness grid at their matched
+    orientations. The peak pairing is fixed (positions are kinematic); the
+    intensity cost is evaluated for all thicknesses from a single
+    eigendecomposition per candidate, and the best (thickness, candidate)
+    combination updates the phase decision. refine_dynamical() also refines
+    the orientation and the in-plane deformation.
 
     Parameters left as None inherit the phase fit's values (see
     PhaseMap.fit); the resolved values are recorded in
     phase_map.metadata['thickness'].
-
-    For every probe position, the winning candidates of a fitted PhaseMap are
-    re-simulated with Bloch waves over a thickness grid. The peak pairing is
-    fixed (positions are kinematic); the intensity cost is evaluated for all
-    thicknesses from a single eigendecomposition per candidate, and the best
-    (thickness, candidate) combination updates the phase decision.
 
     Parameters
     ----------
     phase_map : PhaseMap
         A fitted PhaseMap (fit() has been run).
     thicknesses_A : np.ndarray | None
-        Thickness grid in Angstroms; default 50 ... 1000 in 25 A steps.
+        Thickness grid in Angstroms; default 50 to 1000 in 25 A steps.
+    pair_distance : float | None
+        Largest distance (1/Angstroms) at which a simulated and a measured
+        peak are paired.
+    power_intensity : float | None
+        Intensities are compared as I ** power_intensity.
+    sg_max : float, default=SG_MAX
+        Excitation error cutoff (1/Angstroms) of the Bloch beam list.
+    k_max : float | None
+        Largest |g| (1/Angstroms) of a beam; None keeps every reflection
+        within sg_max.
     min_number_peaks : int | None
         Positions with fewer measured peaks, direct beam included, are
         skipped; None inherits the phase fit's minimum. At least 3.
+    progress_bar : bool, default=True
+        Show a progress bar over positions.
 
     Returns
     -------
     dict
-        'thickness' (R, C) best-fit thickness map, 'cost' (R, C, F) dynamical
-        costs per candidate at its best thickness, 'phase_index' (R, C)
-        updated phase assignment.
+        'thickness' (R, C) best-fit thickness of the winning candidate,
+        'cost' (R, C, F) dynamical cost per candidate at its best
+        thickness, 'phase_index' (R, C) updated phase assignment (-1 where
+        no candidate was refined), 'thickness_per_candidate' (R, C, F).
+        NaN where a candidate was not refined.
     """
     if thicknesses_A is None:
-        thicknesses_A = np.arange(50.0, 1000.0, 25.0)
+        thicknesses_A = np.arange(50.0, 1000.0 + 1e-6, 25.0)
     t_grid = torch.as_tensor(thicknesses_A, dtype=torch.float64)
 
     oms = phase_map.orientation_maps
@@ -453,7 +554,8 @@ def refine_thickness(
     for f, (i_om, _) in enumerate(cands):
         c = torch.nan_to_num(cost_out[..., f], nan=torch.inf)
         cost_phase[..., i_om] = torch.minimum(cost_phase[..., i_om], c)
-    phase_index = cost_phase.argmin(dim=-1)
+    done = torch.isfinite(cost_out).any(dim=-1)
+    phase_index = torch.where(done, cost_phase.argmin(dim=-1), -1)
 
     f_best = torch.nan_to_num(cost_out, nan=torch.inf).argmin(dim=-1)
     thickness = torch.gather(thick_out, 2, f_best[..., None]).squeeze(-1)
@@ -574,8 +676,9 @@ def _bloch_solve(
     With fast_absorption=True the Hermitian part is diagonalized (eigh, much
     faster and better batched than the general complex eig) and the weak
     absorption enters first order: gamma_imag = diag(C^dagger U'' C)/(2 k0).
-    Standard for master-pattern computations; the absorptive parts of U are
-    a few percent of the elastic parts, so the first-order error is small.
+    Standard for reference (master) pattern computations; the absorptive
+    parts of U are a few percent of the elastic parts, so the first-order
+    error is small.
     """
     nb = U.shape[0]
     if absorptive and fast_absorption:
@@ -612,8 +715,20 @@ def _bloch_solve(
 def tilt_grid(semiconv_mrad: float, energy_ev: float, n_rings: int = 8):
     """Concentric-ring sampling of the illumination aperture.
 
-    Returns (M, 2) in-plane incident wavevectors (1/Angstroms) covering the
-    disk of semiangle `semiconv_mrad`, with approximately uniform density.
+    Parameters
+    ----------
+    semiconv_mrad : float
+        Convergence semiangle in mrad.
+    energy_ev : float
+        Beam energy in eV.
+    n_rings : int, default=8
+        Rings outside the center point; ring r has ceil(2 pi r) points.
+
+    Returns
+    -------
+    torch.Tensor
+        (M, 2) in-plane incident wavevectors (1/Angstroms) covering the
+        disk with approximately uniform density, the center first.
     """
     lam = electron_wavelength_angstrom(energy_ev)
     alpha_k = semiconv_mrad * 1e-3 / lam
@@ -633,7 +748,7 @@ def calculate_cbed(
     energy_ev: float = 300e3,
     semiconv_mrad: float = 3.0,
     n_rings: int = 8,
-    sg_max: float = 0.1,
+    sg_max: float = SG_MAX,
     k_max: float | None = None,
     pixel_size: float | None = None,
     q_max_plot: float | None = None,
@@ -650,32 +765,43 @@ def calculate_cbed(
     Parameters
     ----------
     crystal : Crystal
-        With structure factors calculated (cover 2x k_max so every
-        difference vector g - h has a coupling).
+        With structure factors calculated, and preferably
+        calculate_dynamical_structure_factors at this energy (absorption).
     orientation : torch.Tensor
-        Unit quaternion (4,).
+        Unit quaternion (4,), crystal to lab.
     thicknesses_A : float | array-like
         One or more specimen thicknesses in Angstroms.
+    energy_ev : float, default=300e3
+        Beam energy in eV.
     semiconv_mrad : float, default=3.0
-        Convergence semiangle. Disks overlap when it exceeds half the
-        smallest g spacing times the wavelength.
+        Convergence semiangle in mrad. Disks overlap when it exceeds half
+        the smallest g spacing times the wavelength.
     n_rings : int, default=8
         Radial sampling rings across the aperture (~200 tilts at 8).
-    sg_max : float, default=0.1
-        Excitation error cutoff for beam selection (widened automatically
-        by the aperture tilt range).
+    sg_max : float, default=SG_MAX
+        Excitation error cutoff (1/Angstroms) for beam selection, widened
+        automatically by the aperture tilt range.
     k_max : float | None
-        In-plane cutoff for included beams.
+        Largest |g| (1/Angstroms) of an included beam.
     pixel_size : float | None
         Detector sampling (1/Angstroms per pixel); default disk radius / 12.
     q_max_plot : float | None
-        Half-width of the detector; default covers all beams plus a disk.
+        Half-width of the detector (1/Angstroms); default covers all beams
+        plus a disk. Disk samples beyond it are dropped.
+    tilt_batch : int, default=64
+        Incident tilts per batched eigendecomposition (memory versus
+        speed).
 
     Returns
     -------
-    dict with 'pattern' ((T, H, W), squeezed to (H, W) for one thickness),
-    'sampling' (1/Angstroms per pixel), 'disk_radius' (1/Angstroms),
-    'thicknesses', 'hkl', 'g_xy'.
+    dict
+        'pattern' ((T, H, H), squeezed to (H, H) for one thickness; rows
+        are qx, columns qy, the direct beam at the center pixel; the
+        intensity is averaged over the incident tilts, so it sums to the
+        transmitted fraction when every disk is on the detector),
+        'sampling' (1/Angstroms per pixel), 'disk_radius' (1/Angstroms),
+        'thicknesses', 'hkl' (nb, 3) and 'g_xy' (nb, 2) of the beams, 000
+        first.
     """
     lam = electron_wavelength_angstrom(energy_ev)
     alpha_k = semiconv_mrad * 1e-3 / lam
@@ -709,10 +835,12 @@ def calculate_cbed(
     for dx in (0, 1):
         for dy in (0, 1):
             w = (wx if dx else 1 - wx) * (wy if dy else 1 - wy)
-            jx = np.clip(ix0 + dx, 0, H - 1)
-            jy = np.clip(iy0 + dy, 0, H - 1)
+            jx = ix0 + dx
+            jy = iy0 + dy
+            # samples beyond the detector are dropped, not piled on its edge
+            ok = (jx >= 0) & (jx < H) & (jy >= 0) & (jy < H)
             for ti in range(T):
-                np.add.at(pattern[ti], (jx, jy), w * inten_np[:, ti, :])
+                np.add.at(pattern[ti], (jx[ok], jy[ok]), (w * inten_np[:, ti, :])[ok])
     pattern /= tilts.shape[0]
 
     return {
@@ -733,7 +861,7 @@ def calculate_lacbed(
     energy_ev: float = 300e3,
     semiconv_mrad: float = 10.0,
     n_pixels: int = 48,
-    sg_max: float = 0.1,
+    sg_max: float = SG_MAX,
     k_max: float | None = None,
     tilt_batch: int = 64,
 ) -> dict:
@@ -743,10 +871,42 @@ def calculate_lacbed(
     disk on a square grid (parallax / LACBED view of a single disk, without
     the geometric overlap of neighboring disks).
 
+    Parameters
+    ----------
+    crystal : Crystal
+        With structure factors calculated, and preferably
+        calculate_dynamical_structure_factors at this energy (absorption).
+    orientation : torch.Tensor
+        Unit quaternion (4,), crystal to lab.
+    thicknesses_A : float | array-like
+        One or more specimen thicknesses in Angstroms.
+    hkl : sequence of int
+        The reflection to map; (0, 0, 0) gives the bright field disk.
+    energy_ev : float, default=300e3
+        Beam energy in eV.
+    semiconv_mrad : float, default=10.0
+        Convergence semiangle in mrad.
+    n_pixels : int, default=48
+        Pixels across the disk (the incident-tilt sampling).
+    sg_max : float, default=SG_MAX
+        Excitation error cutoff (1/Angstroms), widened automatically by
+        the aperture tilt range.
+    k_max : float | None
+        Largest |g| (1/Angstroms) of an included beam.
+    tilt_batch : int, default=64
+        Incident tilts per batched eigendecomposition.
+
     Returns
     -------
-    dict with 'disk' ((T, n, n) squeezed), 'tilt_max' (1/Angstroms),
-    'thicknesses'. Pixels outside the aperture are NaN.
+    dict
+        'disk' ((T, n, n), squeezed for one thickness; rows are the y
+        tilt, columns the x tilt; NaN outside the aperture), 'tilt_max'
+        (aperture radius, 1/Angstroms), 'thicknesses'.
+
+    Raises
+    ------
+    ValueError
+        If the reflection is not among the excited beams.
     """
     lam = electron_wavelength_angstrom(energy_ev)
     alpha_k = semiconv_mrad * 1e-3 / lam
@@ -794,12 +954,37 @@ def calculate_cbed_library(
 
     The starting point for CBED orientation matching: all patterns share
     the same sampling and extent, ready for polar transformation and
-    correlation. One entry per orientation.
+    correlation. One entry per orientation, all at one thickness.
+
+    Parameters
+    ----------
+    crystal : Crystal
+        With structure factors calculated.
+    orientations : torch.Tensor
+        (N, 4) unit quaternions, crystal to lab.
+    thickness_A : float
+        Specimen thickness in Angstroms.
+    energy_ev : float, default=300e3
+        Beam energy in eV.
+    semiconv_mrad : float, default=3.0
+        Convergence semiangle in mrad.
+    k_max : float | None
+        Largest |g| (1/Angstroms) of an included beam.
+    q_max_plot : float | None
+        Half-width of the detector (1/Angstroms); default k_max (or half
+        the crystal's structure factor range) plus two disk radii.
+    pixel_size : float | None
+        Detector sampling (1/Angstroms per pixel); default disk radius / 12.
+    progress_bar : bool, default=True
+        Show a progress bar over orientations.
+    **kwargs
+        Passed to calculate_cbed() (n_rings, sg_max, tilt_batch).
 
     Returns
     -------
-    dict with 'patterns' (N, H, W), 'quats' (N, 4), 'sampling',
-    'disk_radius', 'thickness_A'.
+    dict
+        'patterns' (N, H, H), 'quats' (N, 4), 'sampling' (1/Angstroms per
+        pixel), 'disk_radius' (1/Angstroms), 'thickness_A'.
     """
     lam = electron_wavelength_angstrom(energy_ev)
     alpha_k = semiconv_mrad * 1e-3 / lam
@@ -857,10 +1042,10 @@ def calculate_kossel(
     field disk alone is the LACBED view). One Bloch computation over the
     incident-tilt grid yields both:
 
-    - 'bright_field': the (000) beam intensity at each incident tilt --
-      the deficiency (dark) line system, every line at a Bragg condition.
+    - 'bright_field': the (000) beam intensity at each incident tilt, the
+      deficiency (dark) line system, every line at a Bragg condition.
     - 'pattern': the full detector intensity, the incoherent sum of every
-      diffracted cone shifted by its g -- deficiency lines from the direct
+      diffracted cone shifted by its g: deficiency lines from the direct
       beam plus the excess (bright) lines of the diffracted beams.
 
     Line positions are exact; line profiles carry the many-beam dynamical
@@ -870,28 +1055,43 @@ def calculate_kossel(
     Parameters
     ----------
     crystal : Crystal
-        With structure factors calculated (cover 2x k_max for couplings),
-        and ideally calculate_dynamical_structure_factors for absorption.
+        With structure factors calculated, and preferably
+        calculate_dynamical_structure_factors at this energy (absorption).
     orientation : torch.Tensor
-        Unit quaternion (4,).
+        Unit quaternion (4,), crystal to lab.
     thicknesses_A : float | array-like
         One or more thicknesses in Angstroms.
+    energy_ev : float, default=300e3
+        Beam energy in eV.
     semiconv_mrad : float, default=40.0
-        Convergence semiangle; the pattern covers this angular radius.
+        Convergence semiangle in mrad; the pattern covers this angular
+        radius.
     n_pixels : int, default=192
         Detector pixels across the pattern (also the tilt sampling; the
         1-2 mrad dynamical line widths need ~0.5 mrad per pixel).
     sg_max : float, default=0.05
-        Excitation error cutoff; the beam list is widened by the aperture
-        automatically.
+        Excitation error cutoff (1/Angstroms). Smaller than the SG_MAX of
+        the spot pattern functions: the beam list is widened by the
+        aperture (alpha |g|, already 0.04 1/A for |g| = 1 at 40 mrad), so
+        the base cutoff can be tighter without losing lines, and the
+        eigensolves over tens of thousands of tilts stay affordable.
     k_max : float | None
-        In-plane cutoff for included reflections.
+        Largest |g| (1/Angstroms) of an included reflection.
+    tilt_batch : int, default=64
+        Incident tilts per batched eigendecomposition.
+    fast_absorption : bool, default=False
+        First-order absorption (Hermitian eigensolver, faster); see
+        _bloch_solve.
+    progress_bar : bool, default=True
+        Show a progress bar over tilt batches.
 
     Returns
     -------
-    dict with 'bright_field' and 'pattern' ((T, n, n), squeezed for one
-    thickness; NaN / 0 outside the aperture), 'sampling' (1/Angstroms per
-    pixel), 'mrad_per_pixel', 'thicknesses', 'hkl'.
+    dict
+        'bright_field' and 'pattern' ((T, n, n), squeezed for one
+        thickness; rows are theta_y, columns theta_x, as in
+        render_kossel_lines; NaN / 0 outside the aperture), 'sampling'
+        (1/Angstroms per pixel), 'mrad_per_pixel', 'thicknesses', 'hkl'.
     """
     lam = electron_wavelength_angstrom(energy_ev)
     alpha_k = semiconv_mrad * 1e-3 / lam
@@ -943,8 +1143,9 @@ def calculate_kossel(
                 jy = iy0 + dy
                 ok = (jx >= 0) & (jx < n_pixels) & (jy >= 0) & (jy < n_pixels)
                 w = (wx if dx else 1 - wx) * (wy if dy else 1 - wy)
+                # (row, col) = (theta_y, theta_x), as the bright field
                 for ti in range(T):
-                    np.add.at(pattern[ti], (jx[ok], jy[ok]), (w * inten_np[:, ti, b])[ok])
+                    np.add.at(pattern[ti], (jy[ok], jx[ok]), (w * inten_np[:, ti, b])[ok])
     pattern[:, ~m] = 0.0
 
     return {
@@ -1048,7 +1249,7 @@ def calculate_kossel_reference(
     pattern for every specimen orientation at once (called a master pattern
     in parts of the EBSD literature). Patterns for arbitrary orientations,
     convergence angles, and all precomputed thicknesses are then
-    interpolation lookups via kossel_from_reference(), microseconds instead
+    interpolation lookups via kossel_from_reference(), milliseconds instead
     of a fresh dynamical calculation.
 
     The wedge samples are expanded by the crystal's proper rotations plus
@@ -1060,24 +1261,46 @@ def calculate_kossel_reference(
     Parameters
     ----------
     crystal : Crystal
-        With structure factors calculated (cover 2x k_max), and ideally
-        calculate_dynamical_structure_factors for absorption.
+        With structure factors calculated, and preferably
+        calculate_dynamical_structure_factors at this energy (absorption).
     thicknesses_A : float | array-like
-        Thickness grid; all thicknesses share the eigendecompositions, so a
-        thickness AXIS is nearly free -- precompute the matching range here.
+        Thickness grid in Angstroms; all thicknesses share the
+        eigendecompositions, so a thickness axis is nearly free.
+    energy_ev : float, default=300e3
+        Beam energy in eV.
     angle_step_mrad : float, default=1.0
-        Angular sampling of the wedge. The dynamical line widths are
-        1-2 mrad; 0.5 for production masters, 1-2 for quick looks.
+        Angular sampling of the wedge, and the pixel size of the Lambert
+        grid (in Lambert radius units of 1e-3). The dynamical line widths
+        are 1-2 mrad; 0.5 for production references, 1-2 for quick looks.
+    sg_max : float, default=0.05
+        Excitation error cutoff (1/Angstroms) at the center of each chunk
+        of directions, widened by the chunk's angular radius; as in
+        calculate_kossel, tighter than SG_MAX because of that widening.
+    k_max : float | None
+        Largest |g| (1/Angstroms) of an included beam; None keeps every
+        reflection of the factor set, which is slow for large sets. The
+        cost grows steeply with it.
     theta_max_deg : float, default=90.0
-        Polar cutoff of the WEDGE samples. Keep at 90 unless the wedge's
+        Polar cutoff of the wedge samples. Keep at 90 unless the wedge's
         far corners are never observed: cutting the wedge leaves coverage
         holes at all their symmetry equivalents.
+    chunk : int, default=256
+        Directions per batch; each batch shares one beam list and one
+        coupling matrix.
+    fast_absorption : bool, default=True
+        First-order absorption (Hermitian eigensolver, several times
+        faster); see _bloch_solve.
+    progress_bar : bool, default=True
+        Show a progress bar over chunks.
 
     Returns
     -------
-    dict with 'lambert' (T, n, n) master on the equal-area grid (NaN where
-    unsampled), 'rho_max', 'thicknesses', 'energy_ev', and the raw wedge
-    'directions' / 'intensity'.
+    dict
+        'lambert' (T, n, n) bright field on the equal-area grid of the
+        upper hemisphere (NaN where unsampled), 'rho_max' (Lambert radius
+        of the equator, sqrt(2)), 'step' (Lambert grid spacing),
+        'thicknesses', 'energy_ev', 'k_max' (as given, possibly None), and
+        the raw wedge samples 'directions' (N, 3) and 'intensity' (N, T).
     """
     lam = electron_wavelength_angstrom(energy_ev)
     k0 = 1.0 / lam
@@ -1108,7 +1331,7 @@ def calculate_kossel_reference(
     out = torch.zeros((N, T), dtype=torch.float64)
     chunks = range(0, N, chunk)
     if progress_bar:
-        chunks = tqdm(chunks, desc="Kossel master")
+        chunks = tqdm(chunks, desc="Kossel reference")
     for c0 in chunks:
         c1 = min(c0 + chunk, N)
         d = dirs[c0:c1]  # (B, 3) beam directions in the crystal frame
@@ -1188,39 +1411,53 @@ def _lambert_lookup(lambert: np.ndarray, step: float, d_c: torch.Tensor) -> np.n
 
 
 def kossel_from_reference(
-    master: dict,
+    reference: dict,
     orientation: torch.Tensor,
     semiconv_mrad: float = 40.0,
     n_pixels: int = 192,
 ) -> dict:
     """Extract a bright field Kossel pattern from a reference pattern.
 
-    Interpolation only -- microseconds per pattern per thickness. The
-    detector tilt grid is mapped into the crystal frame by the orientation
-    and looked up on the master's Lambert grid.
+    Interpolation only, no Bloch calculation. The detector tilt grid is
+    mapped into the crystal frame by the orientation and looked up
+    bilinearly on the reference's Lambert grid, so the pattern has the
+    reference's angular resolution (angle_step_mrad), whatever n_pixels.
+
+    Parameters
+    ----------
+    reference : dict
+        From calculate_kossel_reference().
+    orientation : torch.Tensor
+        Unit quaternion (4,), crystal to lab.
+    semiconv_mrad : float, default=40.0
+        Convergence semiangle in mrad; the pattern covers this radius.
+    n_pixels : int, default=192
+        Pixels across the pattern.
 
     Returns
     -------
-    dict with 'bright_field' ((T, n, n), squeezed), 'mrad_per_pixel',
-    'thicknesses'.
+    dict
+        'bright_field' ((T, n, n), squeezed for one thickness; rows are
+        theta_y, columns theta_x; NaN outside the aperture),
+        'mrad_per_pixel', 'thicknesses'.
     """
-    lam = electron_wavelength_angstrom(master["energy_ev"])
+    lam = electron_wavelength_angstrom(reference["energy_ev"])
     d_c, inside, _, _ = _detector_directions(
         lam, orientation, semiconv_mrad, False, n_pixels, 1, 1
     )
-    bf = _lambert_lookup(master["lambert"], master["step"], d_c)
+    bf = _lambert_lookup(reference["lambert"], reference["step"], d_c)
     bf[:, ~inside.numpy()] = np.nan
     T = bf.shape[0]
 
     return {
         "bright_field": bf[0] if T == 1 else bf,
-        "mrad_per_pixel": 2 * semiconv_mrad / n_pixels,
-        "thicknesses": master["thicknesses"],
+        "mrad_per_pixel": 2 * semiconv_mrad / (n_pixels - 1),
+        "thicknesses": reference["thicknesses"],
     }
 
 
 def plot_kossel_reference(
-    master: dict,
+    reference: dict,
     crystal: Crystal,
     thickness_index: int = 0,
     max_index: int = 2,
@@ -1250,10 +1487,12 @@ def plot_kossel_reference(
 
     Parameters
     ----------
-    master : dict
+    reference : dict
         From calculate_kossel_reference().
     crystal : Crystal
         The crystal the reference was computed for.
+    thickness_index : int, default=0
+        Which thickness of the reference to show.
     max_index : int, default=2
         Largest direction index to label.
     theta_max_label_deg : float, default=75.0
@@ -1282,8 +1521,9 @@ def plot_kossel_reference(
         beyond this contribute little, since their band edges are too far
         from the zone axis to read as a crossing.
     lines : dict | None
-        Line set from kossel_lines() for the crossing strength; computed
-        from the crystal and the reference's thickness and k_max if
+        Line set from kossel_lines() for the crossing strength, on the
+        reference's thickness grid; computed from the crystal, the chosen
+        thickness and the reference's k_max (1.2 1/A when it has none) if
         omitted.
     theta_circles : sequence, default=()
         Polar angles (degrees) at which to draw dashed circles; off by
@@ -1293,8 +1533,19 @@ def plot_kossel_reference(
         drawn behind each label.
     upsample : int, default=2
         Bilinear upsampling factor of the displayed pattern.
+    cmap : str, default="gray"
+        Colormap of the pattern.
+    axsize : tuple[float, float], default=(9.0, 9.0)
+        Figure size in inches when a new figure is made.
     filename : str | None
         If given, save the figure (PDF recommended).
+    figax : tuple | None
+        (fig, ax) to draw into; a new figure if None.
+
+    Returns
+    -------
+    fig, ax
+        The matplotlib figure and axes.
     """
     import matplotlib.pyplot as plt
     from matplotlib import patheffects
@@ -1302,8 +1553,8 @@ def plot_kossel_reference(
     from quantem.diffraction.crystal import miller_to_miller_bravais
     from quantem.diffraction.rotations import quat_to_matrix
 
-    L = master["lambert"][thickness_index]
-    step = master["step"]
+    L = reference["lambert"][thickness_index]
+    step = reference["step"]
     half = (L.shape[-1] - 1) // 2
     if upsample > 1:
         from scipy.ndimage import zoom
@@ -1348,9 +1599,11 @@ def plot_kossel_reference(
     if lines is None:
         lines = kossel_lines(
             crystal,
-            master["thicknesses"][thickness_index],
-            energy_ev=master["energy_ev"],
-            k_max=master.get("k_max", 1.2),
+            reference["thicknesses"][thickness_index],
+            energy_ev=reference["energy_ev"],
+            # a reference computed without a cutoff stores k_max=None; the
+            # line set needs a finite one
+            k_max=reference.get("k_max") or 1.2,
         )
         ti = 0
     else:
@@ -1440,7 +1693,7 @@ def plot_kossel_reference(
 
 
 def kossel_polar_from_reference(
-    master: dict,
+    reference: dict,
     orientation: torch.Tensor,
     semiconv_mrad: float = 40.0,
     n_radial: int = 64,
@@ -1450,26 +1703,40 @@ def kossel_polar_from_reference(
 
     Dictionary matching correlates over the in-plane rotation, which is a
     cyclic shift of the azimuthal axis in polar coordinates: sampling the
-    master directly at the polar detector positions avoids the intermediate
+    reference directly at the polar detector positions avoids the intermediate
     Cartesian raster and its interpolation.
+
+    Parameters
+    ----------
+    reference : dict
+        From calculate_kossel_reference().
+    orientation : torch.Tensor
+        Unit quaternion (4,), crystal to lab.
+    semiconv_mrad : float, default=40.0
+        Outer radius of the polar grid in mrad.
+    n_radial : int, default=64
+        Radial samples, at radii semiconv_mrad * (1 ... n_radial) / n_radial.
+    n_azimuthal : int, default=180
+        Azimuthal samples, at 2 pi (0 ... n_azimuthal - 1) / n_azimuthal.
 
     Returns
     -------
-    dict with 'polar' ((T, n_azimuthal, n_radial), squeezed; rows are
-    azimuth, columns radius, matching the quantem polar transform
-    convention), 'radii_mrad', 'azimuth_rad', 'thicknesses'.
+    dict
+        'polar' ((T, n_azimuthal, n_radial), squeezed for one thickness;
+        rows are azimuth, columns radius, matching the quantem polar
+        transform convention), 'radii_mrad', 'azimuth_rad', 'thicknesses'.
     """
-    lam = electron_wavelength_angstrom(master["energy_ev"])
+    lam = electron_wavelength_angstrom(reference["energy_ev"])
     d_c, _, axes, _ = _detector_directions(
         lam, orientation, semiconv_mrad, True, 1, n_radial, n_azimuthal
     )
-    out = _lambert_lookup(master["lambert"], master["step"], d_c)
+    out = _lambert_lookup(reference["lambert"], reference["step"], d_c)
     T = out.shape[0]
     return {
         "polar": out[0] if T == 1 else out,
         "radii_mrad": axes["radii_mrad"],
         "azimuth_rad": axes["azimuth_rad"],
-        "thicknesses": master["thicknesses"],
+        "thicknesses": reference["thicknesses"],
     }
 
 
@@ -1504,9 +1771,16 @@ def kossel_lines(
 
     Parameters
     ----------
+    crystal : Crystal
+        With structure factors calculated, and preferably
+        calculate_dynamical_structure_factors at this energy (absorption).
+    thicknesses_A : float | array-like
+        Thickness grid in Angstroms.
+    energy_ev : float, default=300e3
+        Beam energy in eV.
     k_max : float, default=1.2
-        Reflections with |g| up to this are included; a row keeps every
-        order |n| |g| <= k_max.
+        Reflections with |g| up to this (1/Angstroms) are included; a row
+        keeps every order |n| |g| <= k_max. Must be a number.
     u_step_mrad : float, default=0.05
         Profile sampling; the line widths are 1-2 mrad.
     u_tail_mrad : float, default=150.0
@@ -1517,6 +1791,8 @@ def kossel_lines(
     min_depth : float, default=0.005
         Lines (and rows) whose deepest deficit at any thickness is below
         this fraction of the background are dropped.
+    fast_absorption : bool, default=False
+        First-order absorption in the row calculations; see _bloch_solve.
 
     Returns
     -------
@@ -1527,10 +1803,21 @@ def kossel_lines(
     'line_order' (K,) the order n, 'line_hkl' (K, 3), 'line_u' (K,) the
     cone position u = n lambda |g| / 2, 'line_depth' (K, T) the deepest
     deficit fraction and 'line_width_mrad' (K, T) the equivalent width
-    (integrated deficit over depth).
+    (integrated deficit over depth); also 'energy_ev' and 'thicknesses'.
+
+    Raises
+    ------
+    ValueError
+        If k_max is None, or no line reaches min_depth.
     """
     if crystal.g_vec is None:
         raise RuntimeError("Run crystal.calculate_structure_factors() first.")
+    if k_max is None:
+        raise ValueError(
+            "kossel_lines needs a numeric k_max: every reflection up to it gets a "
+            "row profile, so the full factor set would be very slow"
+        )
+    k_max = float(k_max)
     lam = electron_wavelength_angstrom(energy_ev)
     k0 = 1.0 / lam
     gamma_rel = relativistic_gamma(energy_ev)
@@ -1609,6 +1896,11 @@ def kossel_lines(
             l_u.append(u_n)
             l_depth.append(dep)
             l_width.append(width)
+    if not g_hat_out:
+        raise ValueError(
+            f"no Kossel line reaches min_depth={min_depth} with k_max={k_max} 1/A: "
+            "raise k_max or lower min_depth"
+        )
 
     return {
         "g_hat": torch.stack(g_hat_out),
@@ -1655,7 +1947,7 @@ def _detector_directions(
         ax = torch.linspace(-alpha_k, alpha_k, n_pixels, dtype=torch.float64)
         ty, tx = torch.meshgrid(ax, ax, indexing="ij")
         inside = (tx**2 + ty**2) <= alpha_k**2
-        axes = {"mrad_per_pixel": 2 * semiconv_mrad / n_pixels}
+        axes = {"mrad_per_pixel": 2 * semiconv_mrad / (n_pixels - 1)}
     tz = torch.sqrt((k0**2 - tx**2 - ty**2).clamp_min(0))
     # the beam landing at detector tilt +t propagates along (t, -tz); the
     # line set and the reference parameterize the anti-propagation direction
@@ -1684,23 +1976,42 @@ def _lines_bright_field(lines: dict, d_c: torch.Tensor) -> torch.Tensor:
     return lines["background"] * torch.exp(v.sum(dim=-2))
 
 
-def kossel_reference_residual(master: dict, lines: dict, crystal: Crystal) -> dict:
+def kossel_reference_residual(reference: dict, lines: dict, crystal: Crystal) -> dict:
     """Add the many-beam residual of the line model to a reference pattern.
 
     The line model is evaluated at the reference's own wedge samples and
     rasterized onto the same Lambert grid, and the difference (reference
-    minus line model) is stored as master['residual']. It is zero away
+    minus line model) is stored as reference['residual']. It is zero away
     from the zone axes, where the rows are independent, and carries the
     many-beam correction of the zone axis rosettes. render_kossel_lines()
     adds it by lookup when given the reference.
+
+    Parameters
+    ----------
+    reference : dict
+        From calculate_kossel_reference(); modified in place.
+    lines : dict
+        From kossel_lines(), on the same thickness grid and energy.
+    crystal : Crystal
+        The crystal both were computed for.
+
+    Returns
+    -------
+    dict
+        The reference, with 'residual' (T, n, n) added.
+
+    Raises
+    ------
+    ValueError
+        If the thickness grids differ.
     """
-    if not np.allclose(master["thicknesses"], lines["thicknesses"]):
+    if not np.allclose(reference["thicknesses"], lines["thicknesses"]):
         raise ValueError("reference and line set must share the thickness grid")
-    dirs = torch.as_tensor(master["directions"], dtype=torch.float64)
+    dirs = torch.as_tensor(reference["directions"], dtype=torch.float64)
     I_lines = _lines_bright_field(lines, dirs)  # (N, T)
-    lambert_lines = _lambert_raster(crystal, dirs, I_lines, master["step"])
-    master["residual"] = np.nan_to_num(master["lambert"] - lambert_lines, nan=0.0)
-    return master
+    lambert_lines = _lambert_raster(crystal, dirs, I_lines, reference["step"])
+    reference["residual"] = np.nan_to_num(reference["lambert"] - lambert_lines, nan=0.0)
+    return reference
 
 
 def render_kossel_lines(
@@ -1723,6 +2034,19 @@ def render_kossel_lines(
 
     Parameters
     ----------
+    lines : dict
+        From kossel_lines().
+    orientation : torch.Tensor
+        Unit quaternion (4,), crystal to lab.
+    semiconv_mrad : float, default=40.0
+        Convergence semiangle in mrad; the pattern covers this radius.
+    n_pixels : int, default=256
+        Pixels across a Cartesian pattern.
+    polar : bool, default=False
+        Sample on a polar grid instead (see kossel_polar_from_reference
+        for the grid).
+    n_radial, n_azimuthal : int, default=64, 180
+        Polar grid size.
     reference : dict | None
         A reference pattern carrying the many-beam residual from
         kossel_reference_residual(). If given, the residual is added to
@@ -1733,8 +2057,8 @@ def render_kossel_lines(
 
     Returns
     -------
-    dict with 'bright_field' ((T, n, n), squeezed; NaN outside the
-    aperture) or, with polar=True, 'polar' ((T, n_azimuthal, n_radial),
+    dict with 'bright_field' ((T, n, n), squeezed; rows are theta_y,
+    columns theta_x; NaN outside the aperture) or, with polar=True, 'polar' ((T, n_azimuthal, n_radial),
     squeezed; rows are azimuth, columns radius), plus the grid axes and
     'thicknesses'.
     """
@@ -1771,6 +2095,17 @@ def kossel_line_segments(
     the aperture is a straight line in the detector tilt plane (the
     curvature term is |g_z| alpha^2 / 2, below 0.1 mrad at 40 mrad). The
     end points on the aperture edge are computed exactly from the cone.
+
+    Parameters
+    ----------
+    lines : dict
+        From kossel_lines().
+    orientation : torch.Tensor
+        Unit quaternion (4,), crystal to lab.
+    semiconv_mrad : float, default=40.0
+        Aperture radius in mrad.
+    thickness_index : int, default=0
+        Thickness of the line set for 'depth' and 'width_mrad'.
 
     Returns
     -------
@@ -1856,7 +2191,37 @@ def overlay_kossel_segments(
     segments run between their aperture-edge end points; on a polar axis
     (rows azimuth, columns radius) each straight line becomes the curve
     radius = distance / cos(azimuth - azimuth_normal), drawn from end
-    point to end point and split at the azimuth wrap.
+    point to end point and split at the azimuth wrap. The pixel registration
+    is that of render_kossel_lines and the reference lookups: Cartesian
+    pixel i at angle -semiconv + 2 semiconv i / (n_pixels - 1), polar
+    column j at radius semiconv (j + 1) / n_radial and row i at azimuth
+    2 pi i / n_azimuthal.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Axes showing the rendered pattern (imshow pixel coordinates).
+    segments : dict
+        From kossel_line_segments().
+    semiconv_mrad : float
+        Aperture radius of the pattern in mrad.
+    n_pixels : int | None
+        Pixels across a Cartesian pattern.
+    polar : bool, default=False
+        Draw on a polar pattern instead.
+    n_radial, n_azimuthal : int | None
+        Polar grid size.
+    color : color, default=(0.9, 0.0, 0.0)
+        Line color.
+    width_scale : float, default=1.0
+        Multiplier of the drawn line width.
+    min_depth : float, default=0.05
+        Lines shallower than this deficit fraction are not drawn.
+
+    Returns
+    -------
+    matplotlib.axes.Axes
+        The axes.
     """
     sel = segments["depth"] >= min_depth
     n_lines = int(sel.sum())
@@ -1867,6 +2232,7 @@ def overlay_kossel_segments(
     dep = segments["depth"][sel]
     wid = segments["width_mrad"][sel]
     if polar:
+        # radius r_j = semiconv (j + 1) / n_radial, azimuth phi_i = 2 pi i / n_az
         px_r = n_radial / semiconv_mrad
         px_phi = n_azimuthal / (2 * np.pi)
         tang = np.stack([-nrm[:, 1], nrm[:, 0]], axis=1)
@@ -1879,24 +2245,25 @@ def overlay_kossel_segments(
             jumps = np.abs(np.diff(phi)) > np.pi
             phi = np.ma.array(phi, mask=np.r_[False, jumps])
             ax.plot(
-                r * px_r - 0.5,
-                phi * px_phi - 0.5,
+                r * px_r - 1.0,
+                phi * px_phi,
                 color=color,
                 lw=wid[k] * px_r * width_scale,
                 alpha=float(dep[k]),
                 solid_capstyle="butt",
             )
     else:
-        px = n_pixels / (2 * semiconv_mrad)
+        # linspace(-semiconv, semiconv, n_pixels): pixel centers at the ends
+        px = (n_pixels - 1) / (2 * semiconv_mrad)
         for k in range(n_lines):
             ax.plot(
                 [
-                    (start[k, 1] + semiconv_mrad) * px - 0.5,
-                    (stop[k, 1] + semiconv_mrad) * px - 0.5,
+                    (start[k, 1] + semiconv_mrad) * px,
+                    (stop[k, 1] + semiconv_mrad) * px,
                 ],
                 [
-                    (start[k, 0] + semiconv_mrad) * px - 0.5,
-                    (stop[k, 0] + semiconv_mrad) * px - 0.5,
+                    (start[k, 0] + semiconv_mrad) * px,
+                    (stop[k, 0] + semiconv_mrad) * px,
                 ],
                 color=color,
                 lw=wid[k] * px * width_scale,
@@ -1949,12 +2316,50 @@ def average_bloch_fourier(
     The absorption is the full complex matrix (there is no first-order
     variant here). Cost: a sparse block matrix of size (2 n_harmonics +
     1) x nb per trial tilt and one Krylov exponential action over the
-    thickness grid; see the benchmark in the tests for how it compares
-    with the batched eigensolves of the quadrature, which reuse one
-    eigendecomposition for every thickness.
+    thickness grid.
 
-    Returns (intensities (M_trial, T, nb) with the direct beam first,
-    g_xy (nb, 2)).
+    Status: an alternative to the azimuthal quadrature of
+    illumination_nodes(), verified against it in the tests but not used by
+    the refinement functions of this module, which average batched
+    eigensolves instead (one eigendecomposition serves every thickness).
+
+    Parameters
+    ----------
+    crystal : Crystal
+        With structure factors calculated.
+    orientation : torch.Tensor
+        Unit quaternion (4,), crystal to lab.
+    trial_tilts : torch.Tensor
+        (M, 2) ring centers as in-plane incident wavevectors (1/Angstroms).
+    thicknesses_A : float | array-like
+        Thickness grid in Angstroms; a uniform grid is propagated in one
+        pass.
+    energy_ev : float
+        Beam energy in eV.
+    precession_deg : float
+        Precession semi-angle in degrees.
+    sg_max : float, default=SG_MAX
+        Excitation error cutoff (1/Angstroms) of the beam list.
+    k_max : float | None
+        Largest |g| (1/Angstroms) of a beam.
+    deform : torch.Tensor | None
+        (3, 3) deformation of the lab-frame reciprocal vectors.
+    beams : torch.Tensor | None
+        Explicit beam list (nb, 3), 000 first; selected here if None.
+    n_harmonics : int, default=48
+        Azimuthal modes kept, |n| <= n_harmonics.
+    n_geometry : int, default=128
+        Azimuths sampled for the coefficients of a displaced ring.
+    n_matrix_harmonics : int | None
+        Fourier coefficients of the displaced ring kept; default
+        n_harmonics // 3.
+
+    Returns
+    -------
+    intensities : torch.Tensor
+        (M, T, nb) ring-averaged intensities, direct beam first.
+    g_xy : torch.Tensor
+        (nb, 2) in-plane positions of the beams (1/Angstroms).
     """
     from scipy.sparse import csr_matrix, diags, kron
     from scipy.sparse.linalg import expm_multiply
@@ -2042,8 +2447,7 @@ def illumination_nodes(
     maped_tilts_deg=None,
     maped_weights=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Incident beam tilts (M, 2) in 1/Angstroms and their weights (M,)
-    whose Bloch intensities are averaged to model one measured pattern.
+    """Incident beam tilts and weights that model one measured pattern.
 
     Precession is a ring of radius k0 sin(theta_p) sampled uniformly in
     azimuth (the Gauss-Chebyshev quadrature of the ring integral); the
@@ -2054,6 +2458,30 @@ def illumination_nodes(
     MAPED is an explicit tilt list with exposure weights. Ring and disk
     combine as a product measure. Zero tilt with unit weight when none
     apply.
+
+    Parameters
+    ----------
+    energy_ev : float
+        Beam energy in eV.
+    precession_deg : float, default=0.0
+        Precession semi-angle in degrees; 0 for none.
+    n_precession : int, default=32
+        Azimuthal samples on the precession ring.
+    semiconv_mrad : float, default=0.0
+        Convergence semiangle in mrad; 0 for a parallel beam.
+    n_disk_radial, n_disk_azimuthal : int, default=4, 16
+        Gauss-Legendre radii and azimuths of the convergence disk.
+    maped_tilts_deg : array-like | None
+        (M, 2) explicit beam tilts in degrees (MAPED), replacing the ring.
+    maped_weights : array-like | None
+        (M,) exposure weights of the MAPED tilts; equal if None.
+
+    Returns
+    -------
+    tilts : torch.Tensor
+        (M, 2) in-plane incident wavevectors (1/Angstroms).
+    weights : torch.Tensor
+        (M,) weights summing to one.
     """
     lam = electron_wavelength_angstrom(energy_ev)
     k0 = 1.0 / lam
@@ -2157,6 +2585,46 @@ def _fit_deformation(sq, qxy, w_exp, delta):
     return S, wz, pair
 
 
+# matched orientations of two positions closer than this (degrees) belong to
+# one grain for the neighbor rescue: above the error of kinematical matching
+# (a few tenths of a degree), below typical grain boundary angles
+_RESCUE_SAME_GRAIN_DEG = 2.0
+
+
+def _closest_symmetry_variant(q: torch.Tensor, ref: torch.Tensor, sym_quats) -> torch.Tensor:
+    """The symmetry equivalent q * s of orientation q closest to ref."""
+    if sym_quats is None:
+        return q
+    from quantem.diffraction.rotations import qmult
+
+    variants = qmult(q[None], torch.as_tensor(sym_quats, dtype=q.dtype))  # (S, 4)
+    return variants[int((variants @ ref).abs().argmax())]
+
+
+def _tilt_twist(dq: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split a lab-frame rotation into dq = tilt * twist: the twist is a
+    rotation about the beam (z), the tilt one about an in-plane axis.
+
+    Returns the tilt as its rotation vector (wx, wy) in radians, and the
+    twist quaternion."""
+    from quantem.diffraction.rotations import qconj, qmult
+
+    dq = dq / torch.linalg.norm(dq)
+    n = float(torch.hypot(dq[0], dq[3]))
+    if n < 1e-12:
+        twist = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=dq.dtype)
+    else:
+        twist = torch.stack([dq[0], torch.zeros_like(dq[0]), torch.zeros_like(dq[0]), dq[3]]) / n
+    swing = qmult(dq, qconj(twist))
+    if swing[0] < 0:
+        swing = -swing
+    sin_half = float(torch.linalg.norm(swing[1:3]))
+    if sin_half < 1e-15:
+        return torch.zeros(2, dtype=dq.dtype), twist
+    angle = 2 * np.arctan2(sin_half, float(swing[0]))
+    return swing[1:3] / sin_half * angle, twist
+
+
 def refine_dynamical(
     phase_map,
     thicknesses_A: np.ndarray | None = None,
@@ -2228,8 +2696,8 @@ def refine_dynamical(
     phase_map : PhaseMap
         A fitted PhaseMap (fit() has been run).
     thicknesses_A : np.ndarray | None
-        Thickness grid in Angstroms; default 50 ... 2000 in 25 A steps (the
-        thickness axis is free: all thicknesses come from one
+        Thickness grid in Angstroms; default 50 to 2000 in 25 A steps (the
+        thickness axis is nearly free: all thicknesses come from one
         eigendecomposition).
     tilt_stages : sequence of (half_range_deg, step_deg)
         Successive tilt grids, each centered on the previous optimum.
@@ -2248,13 +2716,29 @@ def refine_dynamical(
         Convergence semiangle (inherited); the intensities are averaged
         over the disk with n_disk_radial Gauss-Legendre radii times
         n_disk_azimuthal azimuths (64 nodes by default, times the ring).
+    n_disk_radial, n_disk_azimuthal : int, default=4, 16
+        Convergence disk sampling, see semiconv_mrad.
     maped_tilts_deg : array-like | None
         Explicit (M, 2) beam tilt list (degrees) for MAPED, overriding
         precession.
-    min_sim_intensity_rel : float, default=0.02
+    pair_distance : float | None
+        Largest distance (1/Angstroms) at which a simulated and a measured
+        peak are paired; inherited from the phase fit.
+    power_intensity : float | None
+        Intensities are compared as I ** power_intensity; inherited from
+        the phase fit.
+    min_sim_intensity_rel : float | None
         Unpaired simulated beams weaker than this fraction of the
         strongest simulated beam do not count against a candidate (the
-        detector would not have seen them).
+        detector would not have seen them). Inherited from the phase fit,
+        else MIN_SIM_INTENSITY_REL (0.02).
+    sg_max : float, default=SG_MAX
+        Excitation error cutoff (1/Angstroms) of the Bloch beam list,
+        widened by the tilt search range and the illumination.
+    k_max : float | None
+        Largest |g| (1/Angstroms) of a beam; None keeps every reflection
+        within the cutoff. Recorded in the metadata, so the image
+        refinement uses the same beam set.
     min_number_peaks : int | None
         Positions with fewer measured peaks, direct beam included, are
         skipped. None inherits the minimum of the phase fit, itself the
@@ -2288,17 +2772,28 @@ def refine_dynamical(
         orientation to well inside the fine stages, so this removes about
         half of the eigensolves; the in-plane deformation and rotation are
         still fit from the position's own peaks, and the final evaluation
-        is unchanged.
+        is unchanged. The reported tilt and zero-tilt cost still refer to
+        the position's own matched orientation.
+    neighbor_rescue : bool, default=True
+        Second pass: positions whose winning solution differs from a
+        4-neighbor in the same grain (same crystal, matched orientations
+        within 2 degrees; the nearest refined position
+        within two steps, so a mask of every second position works too) by
+        more than rescue_thickness_A in thickness or rescue_tilt_deg in
+        orientation are refined again from that neighbor's solution, and
+        the lower cost is kept. Repairs isolated wrong basins (thickness
+        aliases, tilt minima at a grid edge).
+    rescue_thickness_A : float, default=100.0
+        Thickness difference (Angstroms) to a neighbor that triggers a
+        rescue.
+    rescue_tilt_deg : float, default=0.05
+        Misorientation (degrees) between the refined orientations of a
+        position and a neighbor that triggers a rescue. Neighbors in one
+        grain differ by the true orientation gradient, so keep it above
+        that.
     rescue_max_starts : int, default=2
         Neighbor solutions tried per rescued position, lowest cost first,
         skipping neighbors whose solution repeats one already tried.
-    neighbor_rescue : bool, default=True
-        Second pass: positions whose winning solution differs from a
-        4-neighbor of the same crystal (the nearest refined position within
-        two steps, so a mask of every second position works too) by more
-        than rescue_thickness_A or rescue_tilt_deg are refined again from
-        that neighbor's solution, and the lower cost is kept. Repairs isolated wrong basins
-        (thickness aliases, tilt minima at a grid edge).
     num_workers : int | None
         Threads refining positions side by side; None uses every core.
         The Bloch eigensolves are too small to spread over cores on their
@@ -2306,26 +2801,42 @@ def refine_dynamical(
         out in contiguous raster-order blocks and warm starts stay inside a
         block, so the result depends on the number of blocks, never on
         which thread finishes first.
+    progress_bar : bool, default=True
+        Show progress bars over positions and rescues.
 
     Returns
     -------
-    dict with 'thickness' (R, C) at the winning candidate, 'tilt_deg'
-    (R, C, 2) its tilt correction, 'quats' (R, C, F, 4) refined
-    orientations, 'deformation' (R, C, F, 2, 2) symmetric in-plane
-    deformation A of the tilted cell in the calibrated frame (measured
-    reciprocal positions = A x ideal), 'cost' (R, C, F), 'cost_zero_tilt'
-    (R, C, F) the cost at the matched orientation (its difference to
-    'cost' is the gain of the tilt search; a small gain means the
-    intensities do not constrain the tilt), 'quats_base' (R, C, F, 4) the
-    matched orientation with the in-plane rotation folded in, from which
-    'tilt_deg' leads to 'quats', 'warm_started' (R, C, F) and 'rescued'
-    (R, C) flags, 'phase_index' (R, C),
-    'candidate' (R, C), 'thickness_per_candidate' (R, C, F).
+    dict
+        Per position (R, C) at the winning candidate: 'thickness',
+        'thickness_contrast' (range of the final cost over the thickness
+        grid; a small value means the thickness is not determined) and
+        'tilt_deg' (R, C, 2), the tilt about the lab x and y axes (degrees)
+        from 'quats_base' to 'quats'. Per candidate (R, C, F): 'quats'
+        (..., 4) refined orientations; 'quats_base' (..., 4) the matched
+        orientation with the in-plane rotation of the refinement folded in
+        (a symmetry equivalent of it closest to the solution), so quats =
+        tilt x quats_base whether or not the position was warm started or
+        rescued; 'deformation' (..., 2, 2) symmetric in-plane deformation
+        A of the tilted cell in the calibrated frame (measured reciprocal
+        positions = A x ideal); 'cost'; 'cost_zero_tilt', the best cost
+        over thickness at 'quats_base', evaluated like the final cost (its
+        difference to 'cost' is the gain of the tilt search; a small gain
+        means the intensities do not constrain the tilt);
+        'thickness_per_candidate'; 'warm_started' flags. Also 'rescued'
+        (R, C) flags, 'phase_index' (R, C) the winning crystal and
+        'candidate' (R, C) the winning candidate (both -1 where nothing
+        was refined), and 'metadata', the resolved parameters. Values are
+        NaN where a candidate was not refined.
     """
-    from quantem.diffraction.rotations import misorientation_angle_deg, qmult, quat_from_axis_angle
+    from quantem.diffraction.rotations import (
+        misorientation_angle_deg,
+        qconj,
+        qmult,
+        quat_from_axis_angle,
+    )
 
     if thicknesses_A is None:
-        thicknesses_A = np.arange(50.0, 2000.0, 25.0)
+        thicknesses_A = np.arange(50.0, 2000.0 + 1e-6, 25.0)
     t_grid = torch.as_tensor(thicknesses_A, dtype=torch.float64)
     T = t_grid.shape[0]
 
@@ -2431,10 +2942,13 @@ def refine_dynamical(
     warm_out = torch.zeros((R, C, F), dtype=torch.bool)
     rescued_out = torch.zeros((R, C), dtype=torch.bool)
 
-    def refine_from(crystal, q_start, qxy, im, w_exp, stages):
+    def refine_from(crystal, q_start, q_match, qxy, im, w_exp, stages):
         """Search from q_start: in-plane deformation and rotation from the
         positions, one beam list, the tilt stages, and the exact final
-        evaluation. Returns None or a dict with the solution."""
+        evaluation. q_match is the kinematically matched orientation of the
+        position, the reference of the reported tilt and of the zero-tilt
+        cost (q_start differs from it on a warm start or a rescue). Returns
+        None or a dict with the solution."""
         q0 = q_start
         S = None
         deform3 = None
@@ -2458,23 +2972,57 @@ def refine_dynamical(
                 q0 = qmult(dqz, q0)
                 deform3 = torch.eye(3, dtype=torch.float64)
                 deform3[:2, :2] = S
+        # the matched orientation with the in-plane rotation of q0: the
+        # base the reported tilt is measured from (equal to q0 on a cold
+        # start), and its tilt away from q0
+        q_m = _closest_symmetry_variant(q_match, q0, crystal.sym_quats)
+        base_tilt, twist = _tilt_twist(qmult(q0, qconj(q_m)))
+        q_base = qmult(twist, q_m)
+        offset = float(torch.linalg.norm(base_tilt))
         # one beam list for the whole search of this candidate: every
-        # trial center, the illumination and the deformation are inside
-        # its selection, so all stages compare the same truncated system
+        # trial center, the base, the illumination and the deformation are
+        # inside its selection, so all stages compare the same truncated
+        # system
         beam_list = select_dynamical_beams(
             crystal,
             q0,
             energy_ev,
-            np.deg2rad(stages[0][0]) * np.sqrt(2) + alpha_ill,
+            np.deg2rad(stages[0][0]) * np.sqrt(2) + alpha_ill + offset,
             sg_max,
             k_max,
             deform3,
         )
         if beam_list.shape[0] < 2:
             return None
+
+        def exact_cost(q):
+            # full illumination and exact absorption at one orientation
+            inten, g_xy, _ = _cbed_amplitudes(
+                crystal,
+                q,
+                ring,
+                t_grid,
+                energy_ev,
+                sg_max,
+                k_max,
+                tilt_batch=max(64, Mr * 8),
+                progress_bar=False,
+                fast_absorption=False,
+                deform=deform3,
+                beams=beam_list,
+            )
+            inten = (inten * w_ring[:, None, None]).sum(dim=0, keepdim=True)
+            cost, _, _, _ = _dynamical_cost(
+                inten[:, :, 1:], g_xy[1:], qxy, im, delta, power_intensity, min_sim_intensity_rel
+            )
+            return cost
+
+        # untilted reference: the best thickness at the matched orientation,
+        # for the gain the tilt search achieves
+        cost_base = exact_cost(q_base)
+        cost0 = float("nan") if cost_base is None else float(cost_base[0].min())
         center = torch.zeros(2, dtype=torch.float64)
         best = None
-        cost0 = float("nan")
         n_stages = len(stages)
         for i_stage, (half, step) in enumerate(stages):
             half = np.deg2rad(half)
@@ -2516,11 +3064,6 @@ def refine_dynamical(
             flat = int(cost.argmin())
             m_best, t_best = flat // T, flat % T
             i_b, j_b = m_best // n, m_best % n
-            if i_stage == 0:
-                # untilted reference: the best thickness at the start
-                # orientation, for the gain the tilt search achieves
-                m0 = int(((w_grid**2).sum(1)).argmin())
-                cost0 = float(cost[m0].min())
             cost_t = cost[:, t_best].reshape(n, n)
             wx, wy = float(w_grid[m_best, 0]), float(w_grid[m_best, 1])
             if 0 < i_b < n - 1:
@@ -2549,24 +3092,7 @@ def refine_dynamical(
         # stored cost and thickness belong to the stored orientation at full
         # accuracy (the beam-offset search geometry is paraxially, not
         # exactly, equivalent to it)
-        inten, g_xy, _ = _cbed_amplitudes(
-            crystal,
-            q,
-            ring,
-            t_grid,
-            energy_ev,
-            sg_max,
-            k_max,
-            tilt_batch=max(64, Mr * 8),
-            progress_bar=False,
-            fast_absorption=False,
-            deform=deform3,
-            beams=beam_list,
-        )
-        inten = (inten * w_ring[:, None, None]).sum(dim=0, keepdim=True)
-        cost, _, _, _ = _dynamical_cost(
-            inten[:, :, 1:], g_xy[1:], qxy, im, delta, power_intensity, min_sim_intensity_rel
-        )
+        cost = exact_cost(q)
         t_contrast = float("nan")
         if cost is not None:
             t_best = int(cost[0].argmin())
@@ -2575,8 +3101,22 @@ def refine_dynamical(
             # orientation: a flat curve means the thickness is not
             # determined by these intensities (precession, few beams)
             t_contrast = float(cost[0].max() - cost[0].min())
+        # the reported tilt and base split the rotation from the matched
+        # orientation exactly, q = tilt x base; on a cold start they are the
+        # search's own (wx, wy) and q0, on a warm start the base differs
+        # from the zero-tilt one above only at second order in the tilt
+        tilt, twist = _tilt_twist(qmult(q, qconj(q_m)))
+        q_base = qmult(twist, q_m)
         return dict(
-            cost=c_best, t=t_fit, wx=wx, wy=wy, q=q, q0=q0, S=S, cost0=cost0, t_contrast=t_contrast
+            cost=c_best,
+            t=t_fit,
+            wx=float(tilt[0]),
+            wy=float(tilt[1]),
+            q=q,
+            q_base=q_base,
+            S=S,
+            cost0=cost0,
+            t_contrast=t_contrast,
         )
 
     def store(rx, ry, f, sol):
@@ -2585,7 +3125,7 @@ def refine_dynamical(
         tcontrast_out[rx, ry, f] = sol.get("t_contrast", float("nan"))
         tilt_out[rx, ry, f, 0] = sol["wx"]
         tilt_out[rx, ry, f, 1] = sol["wy"]
-        quat_base[rx, ry, f] = sol["q0"]
+        quat_base[rx, ry, f] = sol["q_base"]
         quat_out[rx, ry, f] = sol["q"]
         if sol["S"] is not None:
             deform_out[rx, ry, f] = sol["S"]
@@ -2651,7 +3191,7 @@ def refine_dynamical(
                         stages = tilt_stages[1:]
                         warm_out[rx, ry, f] = True
                         break
-            sol = refine_from(om.crystal, q_start, qxy, im, w_exp, stages)
+            sol = refine_from(om.crystal, q_start, om.quats[rx, ry, m], qxy, im, w_exp, stages)
             if sol is None:
                 continue
             store(rx, ry, f, sol)
@@ -2675,6 +3215,10 @@ def refine_dynamical(
             for job in jobs:
                 run(job)
         else:
+            # one intra-op thread per worker: the worker threads already
+            # fill the cores, and torch's own pool on top of them would
+            # oversubscribe. The setting is process-global, so the previous
+            # value is restored afterwards.
             n_threads = torch.get_num_threads()
             torch.set_num_threads(1)
             try:
@@ -2709,6 +3253,18 @@ def refine_dynamical(
         done = torch.isfinite(cost_out).any(dim=-1)
         rescue_list = []
 
+        def miso(r0, c0, f0, r1, c1, f1):
+            # misorientation (degrees) of two refined solutions of the same
+            # crystal: the tilt corrections have different bases (the
+            # matched orientations of the two positions), the solutions not
+            return float(
+                misorientation_angle_deg(
+                    quat_out[r0, c0, f0][None],
+                    quat_out[r1, c1, f1][None],
+                    oms[cands[f0][0]].crystal.sym_quats,
+                )[0]
+            )
+
         def nearest_done(rx, ry, dr, dc):
             # the refined position one step away, or two on a sparse mask
             for k in (1, 2):
@@ -2731,11 +3287,20 @@ def refine_dynamical(
                 fn = int(f_win[nr, nc])
                 if cands[fn][0] != i_om:
                     continue
+                # same grain only: a start from another grain is no rescue,
+                # and its tilt from the matched orientation would widen the
+                # beam list without bound
+                if (
+                    misorientation_angle_deg(
+                        oms[i_om].quats[rx, ry, cands[f][1]][None],
+                        oms[i_om].quats[nr, nc, cands[fn][1]][None],
+                        oms[i_om].crystal.sym_quats,
+                    )[0]
+                    >= _RESCUE_SAME_GRAIN_DEG
+                ):
+                    continue
                 dt = abs(float(thick_out[nr, nc, fn]) - float(thick_out[rx, ry, f]))
-                dtilt = float(
-                    torch.rad2deg(torch.linalg.norm(tilt_out[nr, nc, fn] - tilt_out[rx, ry, f]))
-                )
-                if dt > rescue_thickness_A or dtilt > rescue_tilt_deg:
+                if dt > rescue_thickness_A or miso(nr, nc, fn, rx, ry, f) > rescue_tilt_deg:
                     starts.append((float(cost_out[nr, nc, fn]), nr, nc, fn))
             if starts:
                 # lowest-cost neighbors first, one start per distinct
@@ -2749,12 +3314,7 @@ def refine_dynamical(
                         if (
                             abs(float(thick_out[nr, nc, fn]) - float(thick_out[kr, kc, kf]))
                             <= rescue_thickness_A
-                            and float(
-                                torch.rad2deg(
-                                    torch.linalg.norm(tilt_out[nr, nc, fn] - tilt_out[kr, kc, kf])
-                                )
-                            )
-                            <= rescue_tilt_deg
+                            and miso(nr, nc, fn, kr, kc, kf) <= rescue_tilt_deg
                         ):
                             dup = True
                             break
@@ -2774,14 +3334,13 @@ def refine_dynamical(
             if pk is None:
                 return
             qxy, im, w_exp = pk
-            crystal = oms[cands[f][0]].crystal
+            i_om, m = cands[f]
+            crystal = oms[i_om].crystal
+            q_match = oms[i_om].quats[rx, ry, m]
             for q_n in starts:
-                sol = refine_from(crystal, q_n, qxy, im, w_exp, tilt_stages[1:])
+                sol = refine_from(crystal, q_n, q_match, qxy, im, w_exp, tilt_stages[1:])
                 if sol is not None and sol["cost"] < float(cost_out[rx, ry, f]) - 1e-9:
-                    cost0_keep = float(cost0_out[rx, ry, f])
                     store(rx, ry, f, sol)
-                    if np.isfinite(cost0_keep):
-                        cost0_out[rx, ry, f] = cost0_keep
                     rescued_out[rx, ry] = True
 
         n_jobs = 1 if n_workers == 1 else 4 * n_workers
@@ -2796,13 +3355,15 @@ def refine_dynamical(
     cost_phase = torch.full((R, C, n_maps), torch.inf, dtype=torch.float64)
     for f, (i_om, _) in enumerate(cands):
         cost_phase[..., i_om] = torch.minimum(cost_phase[..., i_om], cost_f[..., f])
-    phase_index = cost_phase.argmin(dim=-1)
+    done = torch.isfinite(cost_out).any(dim=-1)
+    phase_index = torch.where(done, cost_phase.argmin(dim=-1), -1)
     f_best = cost_f.argmin(dim=-1)
     thickness = torch.gather(thick_out, 2, f_best[..., None]).squeeze(-1)
     thickness_contrast = torch.gather(tcontrast_out, 2, f_best[..., None]).squeeze(-1)
     tilt_deg = torch.rad2deg(
         torch.gather(tilt_out, 2, f_best[..., None, None].expand(R, C, 1, 2)).squeeze(2)
     )
+    tilt_deg[~done] = torch.nan
 
     if update_orientations:
         for f, (i_om, m) in enumerate(cands):
@@ -2821,7 +3382,7 @@ def refine_dynamical(
         "warm_started": warm_out,
         "rescued": rescued_out,
         "phase_index": phase_index,
-        "candidate": f_best,
+        "candidate": torch.where(done, f_best, -1),
         "thickness_per_candidate": thick_out,
         "metadata": used,
     }
@@ -2835,19 +3396,36 @@ def dynamical_maps(
 ) -> dict:
     """Maps of the winning candidate of a refine_dynamical() result.
 
-    Returns 'thickness' (A), 'tilt_deg' (magnitude of the tilt correction),
-    'gain' (cost at the start orientation minus the final cost), 'cost',
-    'phase_index', 'mask' (positions refined, and of the given crystal when
-    crystal_index is set), 'quats' (R, C, 4), 'deformation' (R, C, 2, 2)
-    'thickness_contrast' (range of the cost over the thickness grid at the
-    refined orientation) and 'strain', the crystal-frame strain components
-    of strain_crystal_frame(); unrefined or masked positions are NaN. The
-    thickness is NaN where the contrast is below min_thickness_contrast:
-    a flat cost curve, typical of precessed data with few beams, does not
-    determine the thickness and the grid minimum there is not a measurement.
+    Parameters
+    ----------
+    result : dict
+        From refine_dynamical().
+    phase_map : PhaseMap
+        The PhaseMap that was refined (for the candidate list).
+    crystal_index : int | None
+        Keep only positions won by this crystal; None keeps all.
+    min_thickness_contrast : float, default=0.02
+        The thickness is NaN where the thickness contrast is below this: a
+        flat cost curve, typical of precessed data with few beams, does not
+        determine the thickness and the grid minimum there is not a
+        measurement.
+
+    Returns
+    -------
+    dict
+        (R, C) maps 'thickness' (Angstroms), 'tilt_deg' (magnitude of the
+        tilt from the matched orientation, degrees), 'gain' (cost at the
+        matched orientation minus the final cost), 'cost',
+        'thickness_contrast', 'phase_index' (-1 outside the mask), 'mask'
+        (positions refined, and of the given crystal when crystal_index is
+        set), 'quats' (R, C, 4), 'deformation' (R, C, 2, 2) and 'strain',
+        the crystal-frame strain components of strain_crystal_frame().
+        Positions outside the mask are NaN.
     """
     cand = result["candidate"]
     R, C = cand.shape
+    refined = cand >= 0
+    cand = cand.clamp_min(0)
     idx4 = cand[..., None, None]
     quats = torch.gather(result["quats"], 2, idx4.expand(R, C, 1, 4)).squeeze(2)
     deform = torch.gather(
@@ -2858,7 +3436,7 @@ def dynamical_maps(
     tcon = result.get("thickness_contrast")
     if tcon is None:
         tcon = torch.full_like(cost, torch.nan)
-    mask = torch.isfinite(cost)
+    mask = refined & torch.isfinite(cost)
     if crystal_index is not None:
         i_om = torch.tensor([c[0] for c in phase_map.candidates])
         mask &= i_om[cand] == crystal_index
@@ -2872,10 +3450,10 @@ def dynamical_maps(
         "gain": torch.where(mask, cost0 - cost, nan),
         "thickness_contrast": torch.where(mask, tcon, nan),
         "cost": torch.where(mask, cost, nan),
-        "phase_index": result["phase_index"],
+        "phase_index": torch.where(mask, result["phase_index"], -1),
         "mask": mask,
-        "quats": quats,
-        "deformation": deform,
+        "quats": torch.where(mask[..., None], quats, torch.nan),
+        "deformation": torch.where(mask[..., None, None], deform, torch.nan),
         "strain": {k: torch.where(mask, v, nan) for k, v in strain.items() if k != "eps_crystal"},
     }
     return out
@@ -2890,7 +3468,28 @@ def plot_dynamical_maps(
     axsize: tuple[float, float] = (4.0, 4.0),
 ):
     """Thickness, tilt correction, gain of the tilt search and final cost
-    of a dynamical refinement, from dynamical_maps()."""
+    of a dynamical refinement.
+
+    Parameters
+    ----------
+    maps : dict
+        From dynamical_maps().
+    scalebar : dict | None
+        Passed to show_2d.
+    thickness_range_A : tuple[float, float], default=(0.0, 2000.0)
+        Color range of the thickness map (Angstroms).
+    tilt_range_deg : tuple[float, float], default=(0.0, 0.3)
+        Color range of the tilt map (degrees).
+    gain_range : tuple[float, float], default=(0.0, 0.05)
+        Color range of the gain map.
+    axsize : tuple[float, float], default=(4.0, 4.0)
+        Size of each panel in inches.
+
+    Returns
+    -------
+    fig, axs
+        From show_2d. NaN positions are shown as zero.
+    """
     from quantem.core.visualization import show_2d
 
     imgs = [
@@ -2984,6 +3583,27 @@ def plot_strain_crystal_frame(
     the ab, ac and bc shears below, in percent, masked where the fit is
     not trusted. Components with a c (beam-direction) index are the
     rotated in-plane measurement only; see strain_crystal_frame().
+
+    Parameters
+    ----------
+    strain : dict
+        (R, C) arrays 'aa', 'bb', 'cc', 'ab', 'ac', 'bc', as returned by
+        strain_crystal_frame() or dynamical_maps()['strain'].
+    mask : np.ndarray | None
+        (R, C) weights (0 hides a position); None shows all.
+    strain_range_percent : tuple[float, float], default=(-2.0, 2.0)
+        Color range in percent.
+    scalebar : dict | None
+        Passed to show_2d.
+    axsize : tuple[float, float], default=(4.0, 4.0)
+        Size of each panel in inches.
+    cmap : str, default="RdBu_r"
+        Colormap.
+
+    Returns
+    -------
+    fig, axs
+        From show_2d.
     """
     from quantem.core.visualization import show_2d
 
@@ -3035,9 +3655,29 @@ def render_disks(
     disk_radius_px: float,
     edge_px: float,
 ) -> torch.Tensor:
-    """Sum of soft-edged disks: (..., ny, nx) images for intensities (..., N)
-    at centers (N, 2) [row, col]. The edge is a logistic of width edge_px
-    (the disk profile of a defocused or blurred aperture)."""
+    """Sum of soft-edged disks on a pixel grid.
+
+    The edge is a logistic of width edge_px (the disk profile of a
+    defocused or blurred aperture).
+
+    Parameters
+    ----------
+    centers_px : torch.Tensor
+        (N, 2) disk centers in pixels, (row, col).
+    intensities : torch.Tensor
+        (..., N) disk intensities; leading dimensions give a stack.
+    shape : tuple[int, int]
+        Image shape (ny, nx).
+    disk_radius_px : float
+        Disk radius in pixels (the logistic's half point).
+    edge_px : float
+        Edge width in pixels.
+
+    Returns
+    -------
+    torch.Tensor
+        (..., ny, nx) images.
+    """
     ny, nx = shape
     rows = torch.arange(ny, dtype=torch.float64)
     cols = torch.arange(nx, dtype=torch.float64)
@@ -3070,12 +3710,62 @@ def render_pattern_image(
     tilt_weights: torch.Tensor | None = None,
     beams: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Dynamical diffraction pattern images: Bloch intensities (averaged over
-    the precession / convergence tilt set `tilts`) rendered as disks on the
-    detector grid, for every trial orientation tilt and every thickness.
+    """Dynamical diffraction pattern images on the detector grid.
 
-    Returns (images (M, T, ny, nx), centers_px (N, 2), intensities
-    (M, T, N)); M is the number of trial tilts (1 when None)."""
+    Bloch intensities, averaged over the precession / convergence tilt set
+    `tilts`, rendered as disks for every trial orientation tilt and every
+    thickness.
+
+    Parameters
+    ----------
+    crystal : Crystal
+        With structure factors calculated.
+    orientation : torch.Tensor
+        Unit quaternion (4,), crystal to lab.
+    thicknesses_A : float | array-like
+        Thicknesses in Angstroms.
+    energy_ev : float
+        Beam energy in eV.
+    shape : tuple[int, int]
+        Detector shape (ny, nx).
+    origin_rc : array-like
+        Direct beam position (row, col) in pixels.
+    pixel_size : float
+        Detector sampling (1/Angstroms per pixel).
+    rotation_ccw_deg : float, default=0.0
+        Scan-to-detector rotation of the calibration, undone here.
+    ellipse : sequence | None
+        Elliptic distortion (e11, e12) of the calibration, undone here.
+    deform : torch.Tensor | None
+        (3, 3) deformation of the lab-frame reciprocal vectors.
+    disk_radius_px, edge_px : float, default=3.0, 1.0
+        Disk shape, see render_disks.
+    tilts : torch.Tensor | None
+        (Mr, 2) illumination tilts (1/Angstroms), e.g. from
+        illumination_nodes(); a single untilted beam if None.
+    trial_tilts : torch.Tensor | None
+        (M, 2) crystal tilts about the lab x and y axes (radians); none if
+        None.
+    sg_max : float, default=SG_MAX
+        Excitation error cutoff (1/Angstroms) of the beam list.
+    k_max : float | None
+        Largest |g| (1/Angstroms) of a beam.
+    fast_absorption : bool, default=True
+        First-order absorption; see _bloch_solve.
+    tilt_weights : torch.Tensor | None
+        (Mr,) weights of the illumination tilts; equal if None.
+    beams : torch.Tensor | None
+        Explicit beam list (nb, 3), 000 first.
+
+    Returns
+    -------
+    images : torch.Tensor
+        (M, T, ny, nx), M the number of trial tilts (1 when None).
+    centers_px : torch.Tensor
+        (nb, 2) disk centers (row, col), direct beam first.
+    intensities : torch.Tensor
+        (M, T, nb) illumination-averaged intensities.
+    """
     t_grid = torch.atleast_1d(torch.as_tensor(thicknesses_A, dtype=torch.float64))
     lam = electron_wavelength_angstrom(energy_ev)
     k0 = 1.0 / lam
@@ -3190,9 +3880,9 @@ def fit_disk_shape(
     r_max_px: float | None = None,
     exclude_direct_px: float | None = None,
     background: str = "constant",
-    sg_max: float = SG_MAX,
+    sg_max: float | None = None,
     k_max: float | None = None,
-    fast_absorption: bool = True,
+    fast_absorption: bool | None = None,
     progress_bar: bool = True,
 ) -> dict:
     """Global disk radius and edge width from the best-fit patterns.
@@ -3204,6 +3894,59 @@ def fit_disk_shape(
     compared with the measured image over a grid of (radius, edge), and
     the pair minimizing the summed image cost is returned for
     refine_dynamical_image() to use.
+
+    The illumination, intensity power and beam set (sg_max, k_max,
+    fast_absorption) default to those of the refine_dynamical() result.
+
+    Parameters
+    ----------
+    dataset : Dataset4dstem
+        Measured patterns; anything with `.array` (R, C, ny, nx) and
+        `.shape`.
+    phase_map : PhaseMap
+        The refined PhaseMap.
+    result : dict
+        From refine_dynamical().
+    origins : np.ndarray
+        (R, C, 2) direct beam positions (row, col) in pixels.
+    pixel_size : float
+        Detector sampling (1/Angstroms per pixel).
+    rotation_ccw_deg : float, default=0.0
+        Scan-to-detector rotation of the calibration.
+    ellipse : sequence | None
+        Elliptic distortion (e11, e12) of the calibration.
+    positions : list of (int, int) | None
+        Positions to fit; None takes the n_positions with the lowest
+        dynamical cost.
+    n_positions : int, default=20
+        Number of positions when positions is None.
+    radii_px : array-like | None
+        Disk radii to try (pixels); default 1.5 to 6 in steps of 0.5.
+    edges_px : array-like | None
+        Edge widths to try (pixels); default 0.5, 0.75, 1, 1.5, 2.
+    power_intensity : float | None
+        Images are compared as I ** power_intensity; inherited.
+    r_max_px : float | None
+        Ignore pixels farther than this from the origin; None uses all.
+    exclude_direct_px : float | None
+        Ignore pixels within this distance of the origin; default 1.5
+        times the largest radius tried.
+    background : {"constant", "radial"}, default="constant"
+        Background model of the image cost: a constant, or a quadratic in
+        the distance from the direct beam.
+    sg_max, k_max : float | None
+        Beam set; inherited from the result's metadata (SG_MAX if absent).
+    fast_absorption : bool | None
+        First-order absorption; inherited (True if absent).
+    progress_bar : bool, default=True
+        Show a progress bar over positions.
+
+    Returns
+    -------
+    dict
+        'disk_radius_px', 'edge_px' the best pair, 'cost' (n_radii,
+        n_edges) the summed image cost, 'radii_px', 'edges_px',
+        'positions'.
     """
     oms = phase_map.orientation_maps
     cands = phase_map.candidates
@@ -3212,6 +3955,10 @@ def fit_disk_shape(
     power_intensity = float(
         resolve(power_intensity, "power_intensity", md, default=POWER_INTENSITY)
     )
+    # the beam set of the Bragg-vector refinement, unless overridden
+    sg_max = float(resolve(sg_max, "sg_max", md, default=SG_MAX))
+    k_max = resolve(k_max, "k_max", md)
+    fast_absorption = bool(resolve(fast_absorption, "fast_absorption", md, default=True))
     tilts, tilt_w = illumination_nodes(
         energy_ev,
         md.get("precession_deg", 0.0),
@@ -3308,9 +4055,9 @@ def refine_dynamical_image(
     exclude_direct_px: float | None = None,
     background: str = "constant",
     mask: np.ndarray | None = None,
-    sg_max: float = SG_MAX,
+    sg_max: float | None = None,
     k_max: float | None = None,
-    fast_absorption: bool = True,
+    fast_absorption: bool | None = None,
     update_orientations: bool = True,
     progress_bar: bool = True,
 ) -> dict:
@@ -3321,8 +4068,8 @@ def refine_dynamical_image(
     of the measured pattern is compared with a rendered pattern: Bloch
     intensities averaged over the precession / convergence tilt set,
     drawn as disks of the global radius and edge width from
-    fit_disk_shape(), with a free intensity scale and constant
-    background. The thickness and the orientation tilt are re-searched
+    fit_disk_shape(), with a free intensity scale and a constant or
+    radial background. The thickness and the orientation tilt are re-searched
     on a local grid (thickness +- thickness_half_range_A, tilt +- the
     stage half-range), the deformation and in-plane rotation are kept
     from the position fit. The image cost is the residual after the
@@ -3335,11 +4082,62 @@ def refine_dynamical_image(
     refinement is not accurate enough; it costs one rendered image per
     trial (tilt, thickness) on top of the Bloch solves.
 
+    The illumination, intensity power and beam set (sg_max, k_max,
+    fast_absorption) default to those of the refine_dynamical() result.
+
+    Parameters
+    ----------
+    dataset : Dataset4dstem
+        Measured patterns; anything with `.array` (R, C, ny, nx) and
+        `.shape`.
+    phase_map : PhaseMap
+        The refined PhaseMap.
+    result : dict
+        From refine_dynamical().
+    origins : np.ndarray
+        (R, C, 2) direct beam positions (row, col) in pixels.
+    pixel_size : float
+        Detector sampling (1/Angstroms per pixel).
+    disk_radius_px, edge_px : float
+        Disk shape, from fit_disk_shape().
+    rotation_ccw_deg : float, default=0.0
+        Scan-to-detector rotation of the calibration.
+    ellipse : sequence | None
+        Elliptic distortion (e11, e12) of the calibration.
+    thickness_half_range_A : float, default=100.0
+        Half-width (Angstroms) of the thickness search around the
+        Bragg-vector thickness.
+    thickness_step_A : float, default=10.0
+        Thickness step in Angstroms.
+    tilt_stage : (float, float), default=(0.03, 0.01)
+        Tilt search half-range and step in degrees.
+    power_intensity : float | None
+        Images are compared as I ** power_intensity; inherited.
+    r_max_px : float | None
+        Ignore pixels farther than this from the origin; None uses all.
+    exclude_direct_px : float | None
+        Ignore pixels within this distance of the origin; default 1.5
+        disk radii.
+    background : {"constant", "radial"}, default="constant"
+        Background model: a constant, or a quadratic in the distance from
+        the direct beam (the diffuse scattering floor).
+    mask : np.ndarray | None
+        Positions to refine, as in refine_dynamical; None refines all.
+    sg_max, k_max : float | None
+        Beam set; inherited from the result's metadata (SG_MAX if absent).
+    fast_absorption : bool | None
+        First-order absorption; inherited (True if absent).
+    update_orientations : bool, default=True
+        Write the refined quaternions back into the OrientationMaps.
+    progress_bar : bool, default=True
+        Show a progress bar over positions.
+
     Returns
     -------
-    dict with 'thickness' (R, C), 'tilt_deg' (R, C, 2) the additional
-    tilt over the Bragg-vector result, 'quats' (R, C, 4), 'cost' (R, C)
-    the normalized image residual, and 'metadata'.
+    dict
+        'thickness' (R, C), 'tilt_deg' (R, C, 2) the additional tilt over
+        the Bragg-vector result, 'quats' (R, C, 4), 'cost' (R, C) the
+        normalized image residual (NaN where not refined), and 'metadata'.
     """
     from quantem.diffraction.rotations import qmult, quat_from_axis_angle
 
@@ -3350,6 +4148,10 @@ def refine_dynamical_image(
     power_intensity = float(
         resolve(power_intensity, "power_intensity", md, default=POWER_INTENSITY)
     )
+    # the beam set of the Bragg-vector refinement, unless overridden
+    sg_max = float(resolve(sg_max, "sg_max", md, default=SG_MAX))
+    k_max = resolve(k_max, "k_max", md)
+    fast_absorption = bool(resolve(fast_absorption, "fast_absorption", md, default=True))
     if exclude_direct_px is None:
         exclude_direct_px = 1.5 * disk_radius_px
     tilts, tilt_w = illumination_nodes(
@@ -3383,7 +4185,7 @@ def refine_dynamical_image(
         iterator = tqdm(iterator, desc="image refinement")
     for rx, ry in iterator:
         f = int(result["candidate"][rx, ry])
-        if not torch.isfinite(result["cost"][rx, ry, f]):
+        if f < 0 or not torch.isfinite(result["cost"][rx, ry, f]):
             continue
         i_om, m = cands[f]
         om = oms[i_om]

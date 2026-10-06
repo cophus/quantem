@@ -19,6 +19,8 @@ Conventions
 from __future__ import annotations
 
 import json
+import warnings
+from contextlib import contextmanager
 from importlib import resources
 from pathlib import Path
 
@@ -34,16 +36,60 @@ from quantem.diffraction.rotations import qrotate, symmetry_quaternions
 # unicode combining overline, applies to the preceding character
 _B = "\u0305"
 
+_EXCITATION_MODELS = ("gaussian", "slab")
+
+
+@contextmanager
+def _spglib_raises():
+    """Within the block, spglib raises SpglibError on failure.
+
+    spglib 2.7 reports failures by returning None and emitting a
+    DeprecationWarning on every call, success or not, unless
+    ``spglib.error.OLD_ERROR_HANDLING`` is False, which spglib 2.8 makes the
+    default. Every spglib call here is wrapped in try/except, so the flag is
+    switched for the block only and restored afterwards, leaving other
+    spglib users in the process unaffected. Older spglib versions without
+    the flag are left as they are.
+    """
+    import spglib
+
+    err = getattr(spglib, "error", None)
+    if err is None or not hasattr(err, "OLD_ERROR_HANDLING"):
+        yield
+        return
+    old = err.OLD_ERROR_HANDLING
+    err.OLD_ERROR_HANDLING = False
+    try:
+        yield
+    finally:
+        err.OLD_ERROR_HANDLING = old
+
 
 def direction_indices(
     lat_real: torch.Tensor | np.ndarray, d, max_multiple: int = 12, atol: float = 2e-3
 ) -> np.ndarray | None:
-    """Smallest integer [uvw] along a Cartesian direction, or None if the
-    direction is not a lattice direction with indices up to max_multiple.
+    """Smallest integer [uvw] along a Cartesian direction.
 
-    `atol` is the allowed deviation of the normalized indices from integers;
-    loosen it to index the axes of a pseudo-symmetry, which are lattice
-    directions of an ideal parent but only nearly so in the real cell."""
+    Parameters
+    ----------
+    lat_real : torch.Tensor | np.ndarray
+        Real-space lattice vectors as rows (3, 3), Angstroms.
+    d : array-like
+        Cartesian direction (3,) in the crystal frame; need not be
+        normalized.
+    max_multiple : int, default=12
+        Largest multiplier tried to make the indices integer.
+    atol : float, default=2e-3
+        Allowed deviation of the scaled indices from integers. Loosen it to
+        index the axes of a pseudo-symmetry, which are lattice directions of
+        an ideal parent but only nearly so in the real cell.
+
+    Returns
+    -------
+    np.ndarray | None
+        Integer [uvw] (3,) with no common factor, or None if `d` is not a
+        lattice direction with indices up to `max_multiple`.
+    """
     A_T_inv = np.linalg.inv(np.asarray(lat_real, dtype=float).T)
     v = A_T_inv @ np.asarray(d, dtype=float)
     v = v / np.abs(v).max()
@@ -57,8 +103,24 @@ def direction_indices(
 
 
 def format_direction(uvw, hexagonal: bool = False, mathtext: bool = True) -> str:
-    """Direction label such as [011] or [10-10], with overlines on negative
-    indices (mathtext for figures, combining overlines for text)."""
+    """Direction label such as [011] or [10-10], with overlines on negatives.
+
+    Parameters
+    ----------
+    uvw : array-like | None
+        Integer 3-index direction [uvw].
+    hexagonal : bool, default=False
+        Write the 4-index [UVTW] symbol instead, see
+        :func:`miller_to_miller_bravais`.
+    mathtext : bool, default=True
+        Overlines as matplotlib mathtext (``$\\bar{1}$``) for figures; False
+        uses unicode combining overlines for plain text.
+
+    Returns
+    -------
+    str
+        The label, or an empty string for None.
+    """
     if uvw is None:
         return ""
     ks = miller_to_miller_bravais(uvw) if hexagonal else np.asarray(uvw)
@@ -75,6 +137,16 @@ def miller_to_miller_bravais(uvw: np.ndarray) -> np.ndarray:
 
     u = (2u' - v') / 3, v = (2v' - u') / 3, t = -(u + v), w = w', cleared to
     the smallest integer form.
+
+    Parameters
+    ----------
+    uvw : array-like
+        Integer 3-index directions, (3,) or (N, 3).
+
+    Returns
+    -------
+    np.ndarray
+        Integer [u v t w], (4,) or (N, 4).
     """
     uvw = np.atleast_2d(np.asarray(uvw, dtype=float))
     u = (2 * uvw[:, 0] - uvw[:, 1]) / 3
@@ -85,19 +157,30 @@ def miller_to_miller_bravais(uvw: np.ndarray) -> np.ndarray:
     gcd = np.gcd.reduce(np.abs(np.round(out)).astype(int), axis=1)
     gcd[gcd == 0] = 1
     out = out / gcd[:, None]
-    return out.astype(int).squeeze()
+    return np.rint(out).astype(int).squeeze()
 
 
 def miller_bravais_to_miller(uvtw: np.ndarray) -> np.ndarray:
     """Convert 4-index [u v t w] direction indices to 3-index [u'v'w'].
 
-    u' = 2u + v, v' = 2v + u, w' = w (t is redundant: t = -(u + v)).
+    u' = 2u + v, v' = 2v + u, w' = w (t is redundant: t = -(u + v)),
+    cleared to the smallest integer form.
+
+    Parameters
+    ----------
+    uvtw : array-like
+        Integer 4-index directions, (4,) or (N, 4).
+
+    Returns
+    -------
+    np.ndarray
+        Integer [u'v'w'], (3,) or (N, 3).
     """
     uvtw = np.atleast_2d(np.asarray(uvtw, dtype=float))
     out = np.stack([2 * uvtw[:, 0] + uvtw[:, 1], 2 * uvtw[:, 1] + uvtw[:, 0], uvtw[:, 3]], axis=1)
     gcd = np.gcd.reduce(np.abs(np.round(out)).astype(int), axis=1)
     gcd[gcd == 0] = 1
-    return (out / gcd[:, None]).astype(int).squeeze()
+    return np.rint(out / gcd[:, None]).astype(int).squeeze()
 
 
 # point group -> Laue class
@@ -233,6 +316,44 @@ class Crystal(AutoSerialize):
     Build with `from_ase` or `from_cif`, then call
     `calculate_structure_factors` before generating patterns or orientation
     plans.
+
+    Parameters
+    ----------
+    atoms : ase.Atoms
+        The structure. Fractional site occupancies are read from
+        ``atoms.arrays['occupancy']`` when present (see :meth:`from_cif`).
+    name : str | None
+        Display name; defaults to the chemical formula.
+    symprec : float, default=1e-4
+        spglib tolerance (Angstroms) for the cell's own symmetry.
+    pseudo_symmetry_tol : float | None, default=0.01
+        Dimensionless distance tolerance for the symmetry used in
+        orientation matching: a fraction of the shortest lattice vector
+        within which atoms and lattice vectors are allowed to deviate from a
+        higher-symmetry parent (a 4 A cell with an atom at
+        (0.5, 0.5, 0.50001) is body centered at any tolerance above 1e-5).
+        Cells within it are matched with the parent group, so variants no
+        experiment can separate are never sampled as distinct orientations;
+        the library builders warn when the matching group differs from the
+        cell's own. None matches with the exact symmetry.
+    pseudo_symmetry_intensity_tol : float, default=0.05
+        Largest intensity difference allowed between reflections that a
+        candidate pseudo-symmetry would make equivalent, as a fraction of
+        the strongest reflection's kinematical intensity |F|^2. Each extra
+        rotation is applied to every reflection within 2.0 1/A and each
+        intensity compared with its image's; if any pair differs by more
+        than this fraction, the orientations the rotation relates are
+        distinguishable and it is rejected. 0.05 merges only orientations
+        whose patterns differ by reflections at 5% of the strongest; 0.4
+        also merges orientations told apart only by a reflection at 40%,
+        appropriate when that reflection is known to be weak or absent in
+        the data (stacking disorder, cation mixing). Candidates are the
+        relaxed-position group, the lattice's own holohedry, and the
+        holohedries of the parent lattices generated by the strong
+        reflections, so superstructure twin variants are tested as well.
+        The printout names the reflection pair that decides each candidate.
+    verbose : bool, default=True
+        Print :meth:`symmetry_summary` after the symmetry analysis.
     """
 
     def __init__(
@@ -244,40 +365,6 @@ class Crystal(AutoSerialize):
         pseudo_symmetry_intensity_tol: float = 0.05,
         verbose: bool = True,
     ):
-        """
-        Parameters
-        ----------
-        symprec : float, default=1e-4
-            spglib tolerance (Angstroms) for the cell's own symmetry.
-        pseudo_symmetry_tol : float | None, default=0.01
-            Dimensionless distance tolerance for the symmetry used in
-            orientation matching: a fraction of the shortest lattice vector
-            within which atoms and lattice vectors are allowed to deviate
-            from a higher-symmetry parent (a 4 A cell with an atom at
-            (0.5, 0.5, 0.50001) is body centered at any tolerance above
-            1e-5). Cells within it are matched with the parent group, so
-            variants no experiment can separate are never sampled as
-            distinct orientations; the library builders warn when the
-            matching group differs from the cell's own. None matches with
-            the exact symmetry.
-        pseudo_symmetry_intensity_tol : float, default=0.05
-            Largest intensity difference allowed between reflections that a
-            candidate pseudo-symmetry would make equivalent, as a fraction of
-            the strongest reflection's kinematical intensity |F|^2. Each
-            extra rotation is applied to every reflection within 2.0 1/A and
-            each intensity compared with its image's; if any pair differs by
-            more than this fraction, the orientations the rotation relates
-            are distinguishable and it is rejected. 0.05 merges only
-            orientations whose patterns differ by reflections at 5% of the
-            strongest; 0.4 also merges orientations told apart only by a
-            reflection at 40%, appropriate when that reflection is known to
-            be weak or absent in the data (stacking disorder, cation mixing).
-            Candidates are the relaxed-position group, the lattice's own
-            holohedry, and the holohedries of the parent lattices generated
-            by the strong reflections, so superstructure twin variants are
-            tested as well. The printout names the reflection pair that
-            decides each candidate.
-        """
         self.atoms = atoms
         self.name = name if name is not None else atoms.get_chemical_formula()
         self._pseudo_symmetry_tol = pseudo_symmetry_tol
@@ -291,7 +378,8 @@ class Crystal(AutoSerialize):
         occupancy = atoms.arrays.get("occupancy", np.ones(len(atoms)))
         self.occupancy = torch.as_tensor(np.asarray(occupancy, dtype=float))
 
-        self._setup_symmetry(symprec, pseudo_symmetry_tol, pseudo_symmetry_intensity_tol)
+        with _spglib_raises():
+            self._setup_symmetry(symprec, pseudo_symmetry_tol, pseudo_symmetry_intensity_tol)
         # the summary states any pseudo-symmetry adopted; when it has been
         # shown, the orientation plan does not warn about it again
         self._summary_shown = bool(verbose)
@@ -306,8 +394,31 @@ class Crystal(AutoSerialize):
         self.struct_factors: torch.Tensor | None = None
         self.struct_factors_int: torch.Tensor | None = None
 
+        # populated by calculate_dynamical_structure_factors
+        self.hkl_dyn: torch.Tensor | None = None
+        self.g_len_dyn: torch.Tensor | None = None
+        self.U_dyn: torch.Tensor | None = None
+        self.dyn_energy_ev: float | None = None
+        self.dyn_k_max: float | None = None
+
     @classmethod
     def from_ase(cls, atoms: Atoms, name: str | None = None, **kwargs) -> "Crystal":
+        """Build a Crystal from an ase.Atoms object.
+
+        Parameters
+        ----------
+        atoms : ase.Atoms
+            The structure, e.g. from ``ase.build.bulk``.
+        name : str, optional
+            Display name; defaults to the chemical formula.
+        **kwargs
+            Passed to the Crystal constructor, e.g. `pseudo_symmetry_tol` or
+            `verbose`.
+
+        Returns
+        -------
+        Crystal
+        """
         return cls(atoms, name=name, **kwargs)
 
     @classmethod
@@ -343,6 +454,7 @@ class Crystal(AutoSerialize):
 
     @property
     def volume(self) -> float:
+        """Unit cell volume, cubic Angstroms."""
         return float(torch.abs(torch.linalg.det(self.lat_real)))
 
     @property
@@ -389,12 +501,26 @@ class Crystal(AutoSerialize):
             self.positions_frac.numpy(),
             self.numbers.numpy(),
         )
-        dataset = spglib.get_symmetry_dataset(cell, symprec=symprec)
-        self.spacegroup: str = f"{dataset.international} ({dataset.number})"
-        pg = spglib.get_pointgroup(dataset.rotations)[0].strip()
+        try:
+            dataset = spglib.get_symmetry_dataset(cell, symprec=symprec)
+        except Exception:
+            dataset = None
+        if dataset is None:
+            # no symmetry found at all (e.g. overlapping atoms): carry on in P1
+            warnings.warn(
+                f"{self.name}: spglib found no symmetry at symprec={symprec:g}; "
+                "using P1. Check the structure for overlapping atoms.",
+                stacklevel=3,
+            )
+            rotations = np.eye(3, dtype=np.intc)[None]
+            self.spacegroup: str = "P1 (1)"
+        else:
+            rotations = dataset.rotations
+            self.spacegroup = f"{dataset.international} ({dataset.number})"
+        pg = spglib.get_pointgroup(rotations)[0].strip()
         self.pointgroup: str = pg
         self.laue_group: str = _LAUE_CLASS.get(pg, "-1")
-        self.sym_quats = symmetry_quaternions(dataset.rotations, self.lat_real.numpy())
+        self.sym_quats = symmetry_quaternions(rotations, self.lat_real.numpy())
 
         self.pointgroup_matching = pg
         self.laue_group_matching = self.laue_group
@@ -749,7 +875,7 @@ class Crystal(AutoSerialize):
             gz, iz = g[zol], inten[zol]
             if gz.shape[0] < 3:
                 continue
-            i_max = float(iz.max()).__abs__() or 1.0
+            i_max = abs(float(iz.max())) or 1.0
             ux = torch.tensor(
                 [[0.0, -u[2], u[1]], [u[2], 0.0, -u[0]], [-u[1], u[0], 0.0]],
                 dtype=torch.float64,
@@ -836,10 +962,17 @@ class Crystal(AutoSerialize):
         if self.pointgroup_matching == self.pointgroup:
             return None
         n_extra = self.sym_quats_matching.shape[0] // max(self.sym_quats.shape[0], 1)
+        # a partially accepted group has no Laue class of its own, and keeps
+        # the cell's: name it only when it differs
+        laue = (
+            f"Laue class {self.laue_group_matching}, "
+            if self.laue_group_matching != self.laue_group
+            else ""
+        )
         return (
             f"{self.name}: orientation libraries are built with the "
-            f"pseudo-symmetry point group {self.pointgroup_matching} (Laue "
-            f"class {self.laue_group_matching}, found at pseudo_symmetry_tol = "
+            f"pseudo-symmetry point group {self.pointgroup_matching} ({laue}"
+            f"found at pseudo_symmetry_tol = "
             f"{self._pseudo_symmetry_tol:g} of the shortest lattice vector, "
             f"intensities matching within {self.pseudo_symmetry_report.get('intensity_mismatch', 0.0):.2f} "
             "of the strongest reflection), "
@@ -865,9 +998,13 @@ class Crystal(AutoSerialize):
             f"  point group      {self.pointgroup}   (Laue class {self.laue_group})",
         ]
         if self.pointgroup_matching != self.pointgroup:
-            lines += [
-                f"  pseudo-symmetry  {self.pointgroup_matching} "
+            laue = (
                 f"(Laue class {self.laue_group_matching}) "
+                if self.laue_group_matching != self.laue_group
+                else ""
+            )
+            lines += [
+                f"  pseudo-symmetry  {self.pointgroup_matching} {laue}"
                 "-- used for orientation matching",
             ]
             rep = self.pseudo_symmetry_report
@@ -1012,6 +1149,24 @@ class Crystal(AutoSerialize):
             Maximum |g| of stored factors; defaults to the kinematical k_max.
             For Bloch calculations with beams out to k, the couplings reach
             2k, but the factors fall off fast and 1.5k is enough.
+        include_core : bool, default=True
+            Include the core-loss (inner-shell ionization) absorptive part.
+        include_phonon : bool, default=True
+            Include the phonon (thermal diffuse scattering) absorptive part.
+
+        Returns
+        -------
+        Crystal
+            self, for chaining. Sets ``hkl_dyn`` (N, 3) and ``g_len_dyn`` (N,)
+            for every reflection with |g| <= k_max including (000),
+            ``U_dyn`` (N,) complex128 in 1/Angstroms^2, and the
+            ``dyn_energy_ev`` and ``dyn_k_max`` they were computed for.
+
+        Raises
+        ------
+        RuntimeError
+            If `k_max` is None and :meth:`calculate_structure_factors` has
+            not been run.
         """
         from quantem.diffraction.wk_scattering_factors import compute_WK_factor
 
@@ -1110,9 +1265,10 @@ class Crystal(AutoSerialize):
             Unit quaternion (4,) rotating crystal vectors into the lab frame.
         energy_ev : float, default=300e3
             Beam energy in eV.
-        sigma_excitation : float, default=0.02
+        sigma_excitation : float, default=SIGMA_EXCITATION
             Excitation error tolerance (1/Angstroms) in the shape-factor
-            envelope exp(-s_g^2 / 2 sigma^2).
+            envelope exp(-s_g^2 / 2 sigma^2); the default is
+            :data:`quantem.diffraction.defaults.SIGMA_EXCITATION`.
         tol_excitation_mult : float, default=3.0
             Include reflections with |s_g| below this multiple of sigma.
         k_max : float | None
@@ -1141,12 +1297,26 @@ class Crystal(AutoSerialize):
 
         Returns
         -------
-        dict with 'qx', 'qy', 'intensity', 'hkl', 's_g' (the central
-        excitation error, along the rod when `foil_normal` is given), 'a'
-        and 'b' (ring and disk sweep amplitudes).
+        dict
+            'qx', 'qy' (1/Angstroms), 'intensity', 'hkl', 's_g' (the central
+            excitation error, along the rod when `foil_normal` is given), 'a'
+            and 'b' (ring and disk sweep amplitudes), one entry per excited
+            reflection.
+
+        Raises
+        ------
+        RuntimeError
+            If :meth:`calculate_structure_factors` has not been run.
+        ValueError
+            If `excitation_model` is not "gaussian" or "slab", or the slab
+            model is asked for without `thickness_A`.
         """
         if self.g_vec is None:
             raise RuntimeError("Run calculate_structure_factors first.")
+        if excitation_model not in _EXCITATION_MODELS:
+            raise ValueError(
+                f"excitation_model must be one of {_EXCITATION_MODELS}, got {excitation_model!r}"
+            )
         from quantem.diffraction.illumination import (
             averaged_gaussian_intensity_envelope,
             excitation_coefficients,

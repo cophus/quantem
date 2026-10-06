@@ -139,3 +139,28 @@ def test_refine_batched_matches_loop():
         out.append(om.quats[0, :, 0].clone())
     d = misorientation_angle_deg(out[0], out[1], xtl.sym_quats).numpy()
     assert d.max() < 1e-4
+
+
+def test_relrod_factor():
+    from quantem.diffraction.illumination import relrod_factor
+
+    rng = np.random.default_rng(0)
+    g = rng.normal(0, 0.5, (40, 3))
+    g[:, 2] *= 0.05
+    # normal along the beam: the excitation error is already along the rod
+    assert np.allclose(relrod_factor(g, np.array([0.0, 0.0, 1.0]), 200e3), 1.0)
+    # tilted normal: g + t n with t = -f s_g lies on the Ewald sphere to
+    # first order in s_g
+    n = np.array([np.sin(0.3), 0.0, np.cos(0.3)])
+    f = relrod_factor(g, n, 200e3, precession_deg=0.0)
+    s, _, _ = excitation_coefficients(g, 200e3)
+    spot = g - (f * s)[:, None] * n[None]
+    s_spot, _, _ = excitation_coefficients(spot, 200e3)
+    big = np.abs(s) > 1e-3
+    assert np.all(np.abs(s_spot[big]) < 0.05 * np.abs(s[big]))
+    # torch in, torch out, same values
+    f_t = relrod_factor(torch.as_tensor(g), torch.as_tensor(n), 200e3)
+    assert isinstance(f_t, torch.Tensor) and np.allclose(f_t.numpy(), f)
+    # an edge-on plate is never excited
+    edge = relrod_factor(np.array([[0.0, 0.0, 0.0]]), np.array([1.0, 0.0, 0.0]), 200e3)
+    assert edge[0] >= 1e6

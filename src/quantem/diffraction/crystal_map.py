@@ -195,7 +195,25 @@ class CrystalMap(AutoSerialize):
 
     @classmethod
     def from_orientation_maps(cls, orientation_maps: list[OrientationMap]) -> "CrystalMap":
-        """Wrap maps that were built and matched by hand."""
+        """Wrap maps that were built and matched by hand.
+
+        Parameters
+        ----------
+        orientation_maps : list of OrientationMap
+            One per crystal, all sharing a scan shape and with unique
+            crystal names. The scattering-vector limit is taken from the
+            crystals, which must share one.
+
+        Returns
+        -------
+        CrystalMap
+
+        Raises
+        ------
+        ValueError
+            If the list is empty, names repeat, scan shapes differ, or the
+            crystals have no common k_max.
+        """
         return cls(list(orientation_maps), _token=cls._token)
 
     # ------------------------------------------------------------------
@@ -344,14 +362,38 @@ class CrystalMap(AutoSerialize):
         oms = self.orientation_maps
         if competitive_margin is None or len(oms) < 2 or "positions" in kwargs:
             return self._fanout("refine_orientations", overrides, **kwargs)
+        overrides = self._check_overrides(overrides)
         corr = np.stack([om.corr[..., 0].numpy() for om in oms])
         best = corr.max(axis=0)
         for i, om in enumerate(oms):
-            kw = dict(kwargs)
-            kw.update((overrides or {}).get(om.crystal.name, {}))
+            kw = {**kwargs, **overrides.get(om.crystal.name, {})}
             kw.setdefault("positions", corr[i] >= best - competitive_margin)
             om.refine_orientations(**kw)
         return self
+
+    def _check_overrides(self, overrides: dict | None) -> dict:
+        """Per-crystal overrides, checked against the crystal names.
+
+        Parameters
+        ----------
+        overrides : dict or None
+            Keyword arguments per crystal name.
+
+        Returns
+        -------
+        dict
+            `overrides`, or an empty dict for None.
+
+        Raises
+        ------
+        KeyError
+            If an override names a crystal not in this map.
+        """
+        overrides = overrides or {}
+        unknown = set(overrides) - set(self.names)
+        if unknown:
+            raise KeyError(f"overrides name unknown crystals {sorted(unknown)}; have {self.names}")
+        return overrides
 
     def _fanout(self, method: str, overrides: dict | None, **kwargs) -> "CrystalMap":
         """Call ``method`` on every OrientationMap, with per-crystal overrides.
@@ -375,10 +417,7 @@ class CrystalMap(AutoSerialize):
         KeyError
             If an override names a crystal not in this map.
         """
-        overrides = overrides or {}
-        unknown = set(overrides) - set(self.names)
-        if unknown:
-            raise KeyError(f"overrides name unknown crystals {sorted(unknown)}; have {self.names}")
+        overrides = self._check_overrides(overrides)
         for om in self.orientation_maps:
             kw = {**kwargs, **overrides.get(om.crystal.name, {})}
             getattr(om, method)(**kw)
@@ -396,7 +435,11 @@ class CrystalMap(AutoSerialize):
         return self
 
     def refine_dynamical(
-        self, mask=None, k_max_coupling: float | None = None, **kwargs
+        self,
+        mask=None,
+        k_max: float | None = None,
+        k_max_coupling: float | None = None,
+        **kwargs,
     ) -> "CrystalMap":
         """Dynamical refinement of orientation, thickness, strain and phase.
 
@@ -421,7 +464,7 @@ class CrystalMap(AutoSerialize):
             None refines every matched position, which takes hours.
         k_max : float, optional
             Largest |g| (1/Angstroms) of the beams in the Bloch calculation.
-            Defaults to the k_max of the kinematical simulation. Cutting it
+            None takes the k_max of the kinematical simulation. Cutting it
             low saves time but drops beams that carry real dynamical
             coupling.
         k_max_coupling : float, optional
@@ -442,7 +485,7 @@ class CrystalMap(AutoSerialize):
         from quantem.diffraction import bloch
 
         pm = self._require_fit("refine_dynamical()")
-        k_max = float(kwargs.pop("k_max", None) or self._k_max_or_crystals())
+        k_max = float(k_max if k_max is not None else self._k_max_or_crystals())
         k_c = float(k_max_coupling if k_max_coupling is not None else 1.5 * k_max)
         energy_ev = self.orientation_maps[0].energy_ev
         for om in self.orientation_maps:
@@ -650,15 +693,30 @@ class CrystalMap(AutoSerialize):
         -------
         np.ndarray
             ``(scan_row, scan_col)`` mask in [0, 1].
+
+        Raises
+        ------
+        KeyError
+            If `phase` names no crystal in this map.
         """
         conf = self.signal_confidence(signal_range, gamma)
         if phase is None:
             return conf
-        i = self.names.index(phase) if isinstance(phase, str) else int(phase)
+        i = self._phase_indices(phase)[0]
         return (self.phase_index == i) * conf
 
     def phase_fractions(self) -> dict[str, float]:
-        """Fraction of the scan won by each crystal, plus the unindexed share."""
+        """Fraction of the scan won by each crystal, plus the unindexed share.
+
+        These are area fractions of the phase decision, counted over every
+        probe position. The per-position model weights are
+        `phases.crystal_weights`.
+
+        Returns
+        -------
+        dict[str, float]
+            "unindexed" and one entry per crystal name; the values sum to 1.
+        """
         ph = self.phase_index
         out = {"unindexed": float((ph == -1).mean())}
         for i, n in enumerate(self.names):
@@ -747,8 +805,10 @@ class CrystalMap(AutoSerialize):
 
         Returns
         -------
-        list of tuple
-            One ``(fig, ax)`` per crystal and direction.
+        tuple or list of tuple
+            A single ``(fig, ax)`` when `phase` names one crystal and one
+            direction is given; otherwise one ``(fig, ax)`` per crystal and
+            direction, the same rule as :meth:`plot_pole_figure`.
         """
         dirs = [direction] if isinstance(direction, str) else list(direction)
         out = []
@@ -758,7 +818,7 @@ class CrystalMap(AutoSerialize):
                 out.append(
                     self.orientation_maps[i].plot_orientation(direction=d, mask=m, **kwargs)
                 )
-        return out
+        return out[0] if phase is not None and len(out) == 1 else out
 
     def plot_pole_figure(
         self,
@@ -774,7 +834,8 @@ class CrystalMap(AutoSerialize):
         Parameters
         ----------
         pole : tuple of int, default=(0, 0, 1)
-            Crystal direction plotted, in Miller indices.
+            Crystal direction plotted, in Miller indices [uvw] or [uvtw] of
+            each crystal.
         phase : int or str, optional
             Restrict to one crystal. None (default) plots all of them.
         mask : np.ndarray, optional
@@ -790,14 +851,15 @@ class CrystalMap(AutoSerialize):
         Returns
         -------
         tuple or list of tuple
-            ``(fig, ax)`` when `phase` names one crystal, otherwise one
-            ``(fig, ax)`` per crystal.
+            A single ``(fig, ax)`` when `phase` names one crystal; otherwise
+            one ``(fig, ax)`` per crystal, the same rule as
+            :meth:`plot_orientation`.
         """
         out = []
         for i in self._phase_indices(phase):
             m = mask if mask is not None else self.mask(i, signal_range, shade_gamma)
             out.append(self.orientation_maps[i].plot_pole_figure(pole=pole, mask=m, **kwargs))
-        return out[0] if phase is not None else out
+        return out[0] if phase is not None and len(out) == 1 else out
 
     def plot_matches(self, positions, phase=None, **kwargs):
         """Matched patterns at a few probe positions, over the measured peaks.
@@ -817,9 +879,11 @@ class CrystalMap(AutoSerialize):
         phase : int or str, optional
             Restrict to one crystal. None (default) shows all of them.
         matches : tuple of int, default=(0, 1)
-            Which matches of each crystal to draw. With `num_matches` of 2,
-            (0, 1) shows the best and the residual match side by side, which
-            is how a probe straddling two grains shows itself.
+            Which matches of each crystal to draw; indices a crystal does not
+            hold are skipped, so the default draws one panel per crystal after
+            `num_matches=1`. With `num_matches` of 2, (0, 1) shows the best
+            and the residual match side by side, which is how a probe
+            straddling two grains shows itself.
         dataset : Dataset4dstem, optional
             Show the recorded diffraction pattern behind the overlay.
         norm : dict or str, optional
@@ -1048,11 +1112,22 @@ class CrystalMap(AutoSerialize):
         Returns
         -------
         list of int
+
+        Raises
+        ------
+        KeyError
+            If `phase` names no crystal in this map, by name or index.
         """
         if phase is None:
             return list(range(len(self.orientation_maps)))
-        i = self.names.index(phase) if isinstance(phase, str) else int(phase)
-        return [i]
+        if isinstance(phase, str):
+            if phase not in self.names:
+                raise KeyError(f"no crystal named {phase!r}; have {self.names}")
+            return [self.names.index(phase)]
+        i = int(phase)
+        if not -len(self.names) <= i < len(self.names):
+            raise KeyError(f"no crystal {i}; have {len(self.names)}")
+        return [i % len(self.names)]
 
     # ------------------------------------------------------------------
     # checkpointing
@@ -1061,12 +1136,21 @@ class CrystalMap(AutoSerialize):
     def save(self, path, mode: str = "w", include_plan: bool = False, **kwargs):
         """Save the whole analysis to one file.
 
+        Load it back with :func:`quantem.core.io.serialize.load`.
+
         Parameters
         ----------
+        path : str or Path
+            Target path; a ".zip" extension writes one zip file, anything
+            else a directory.
+        mode : {"w", "o"}, default="w"
+            "w" refuses to replace an existing file, "o" overwrites it.
         include_plan : bool, default=False
             The correlation plan dominates the file size and is rebuilt in
             seconds by :meth:`build_plan`, so it is dropped by default. Pass
             True to keep it and reload a map ready to match again.
+        **kwargs
+            Passed to :meth:`AutoSerialize.save`, e.g. `compression_level`.
         """
         if include_plan:
             return AutoSerialize.save(self, path, mode=mode, **kwargs)

@@ -33,10 +33,28 @@ MIN_PAIRS = 4
 
 
 def resolve(value, key: str, *sources: dict | None, default=None):
-    """First non-None of: the explicit `value`, `key` in each metadata
-    source (dicts, searched in order, None sources skipped), the default.
+    """First non-None of an explicit value, metadata entries and a default.
+
     The refinement stages call this so a parameter left as None inherits
-    the value the previous stage used."""
+    the value the previous stage used.
+
+    Parameters
+    ----------
+    value : object
+        Explicit value; returned whenever it is not None.
+    key : str
+        Key looked up in each source.
+    *sources : dict | None
+        Metadata dicts, searched in order; None sources are skipped, as are
+        entries that are None.
+    default : object, optional
+        Returned when nothing else is found.
+
+    Returns
+    -------
+    object
+        The resolved value.
+    """
     if value is not None:
         return value
     for src in sources:

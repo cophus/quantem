@@ -19,19 +19,67 @@ from quantem.spectroscopy import (
 )
 
 
-def _rsciio_reader(file_path: str | PathLike, file_type: str | None = None):
-    """rosettasciio file_reader from a plugin name ("digitalmicrograph") or extension ("dm3")."""
-    if file_type is None:
-        file_type = Path(file_path).suffix.lstrip(".")
-    try:
-        return importlib.import_module(f"rsciio.{file_type.lower()}").file_reader
-    except ModuleNotFoundError:
-        import rsciio
+def _resolve_rsciio_plugin(file_path: str | PathLike, file_type: str | None = None) -> str:
+    """
+    Resolve the RosettaSciIO plugin module used to read a file.
 
-        for plugin in rsciio.IO_PLUGINS:
-            if file_type.lower() in (ext.lower() for ext in plugin["file_extensions"]):
-                return importlib.import_module(plugin["api"]).file_reader
-        raise ValueError(f"No rosettasciio reader for file type '{file_type}'")
+    Parameters
+    ----------
+    file_path : str | PathLike
+        Path to the file. Its extension is used when ``file_type`` is None.
+    file_type : str, optional
+        RosettaSciIO plugin name (e.g. "digitalmicrograph", "quantumdetector")
+        or a file extension (e.g. "dm4", "mib"). Case-insensitive.
+
+    Returns
+    -------
+    str
+        Module name of the plugin, e.g. "rsciio.digitalmicrograph".
+
+    Raises
+    ------
+    ValueError
+        If no plugin matches, or if an extension is listed by more than one
+        plugin (e.g. ".h5"); pass the plugin name as ``file_type`` in that case.
+    """
+    import rsciio
+
+    key = file_type if file_type is not None else Path(file_path).suffix.lstrip(".")
+    key = str(key).lower().lstrip(".")
+    if not key:
+        raise ValueError(
+            f"Cannot infer the file type of '{file_path}'; pass file_type= "
+            "(a RosettaSciIO plugin name such as 'digitalmicrograph')."
+        )
+
+    plugins = rsciio.IO_PLUGINS
+    by_name = sorted({p["api"] for p in plugins if p["api"].lower() == f"rsciio.{key}"})
+    if by_name:
+        return by_name[0]
+
+    by_ext = sorted(
+        {p["api"] for p in plugins if key in (ext.lower() for ext in p["file_extensions"])}
+    )
+    if len(by_ext) == 1:
+        return by_ext[0]
+    if len(by_ext) > 1:
+        names = ", ".join(f"'{api.removeprefix('rsciio.')}'" for api in by_ext)
+        raise ValueError(
+            f"File extension '{key}' is used by several RosettaSciIO plugins ({names}). "
+            "Pass one of them as file_type=."
+        )
+    raise ValueError(f"No RosettaSciIO reader for file type '{key}'.")
+
+
+def _rsciio_reader(file_path: str | PathLike, file_type: str | None = None):
+    """
+    Return ``(plugin, file_reader)`` for a file, see `_resolve_rsciio_plugin`.
+
+    An ImportError raised here means the plugin exists but one of its optional
+    dependencies is missing.
+    """
+    plugin = _resolve_rsciio_plugin(file_path, file_type)
+    return plugin, importlib.import_module(plugin).file_reader
 
 
 def _print_available_datasets(data_list):
@@ -59,7 +107,9 @@ def read_4dstem(
     file_path : str | PathLike
         Path to data.
     file_type : str, optional
-        The type of file reader needed. See RosettaSciIO for supported formats:
+        RosettaSciIO plugin name (e.g. "arina", "digitalmicrograph") or file
+        extension. If None, the extension of `file_path` is used. Extensions
+        shared by several plugins (e.g. "h5") require the plugin name. See
         https://hyperspy.org/rosettasciio/supported_formats/index.html
     dataset_index : int, optional
         Index of the dataset to load if file contains multiple datasets.
@@ -129,7 +179,7 @@ def read_4dstem(
     def _reshape_3d_to_4d(
         imported_data: dict,
         *,
-        dataset_index_local: int | None,
+        dataset_index_local: int,
         scan_length_local: int,
         scan_axis_local: int,
         transpose_scan_axes_local: bool,
@@ -139,9 +189,6 @@ def read_4dstem(
             raise ValueError(
                 f"Expected 3D data to reshape, got ndim={data.ndim} with shape {data.shape}"
             )
-
-        if scan_axis_local not in (0, 1):
-            raise ValueError(f"scan_axis must be 0 or 1, got {scan_axis_local}")
 
         # Move scan axis to front so it becomes the frame axis
         if scan_axis_local != 0:
@@ -185,8 +232,8 @@ def read_4dstem(
             "name": "scan_x",
         }
 
-        ax_qy = dict(old_axes[1])
-        ax_qx = dict(old_axes[2])
+        # Detector calibrations come from the two axes that are not the scan axis.
+        ax_qy, ax_qx = (dict(ax) for i, ax in enumerate(old_axes) if i != scan_axis_local)
 
         imported_data_4d = imported_data.copy()
         imported_data_4d["data"] = data_4d
@@ -194,33 +241,28 @@ def read_4dstem(
 
         original_shape = imported_data["data"].shape
         new_shape = data_4d.shape
-        if dataset_index_local is not None:
-            print(
-                f"Using 3D dataset {dataset_index_local} with shape {original_shape} "
-                f"interpreted as 4D with shape={new_shape} "
-                f"(scan_axis={scan_axis_local}, scan_length={scan_length_local}, "
-                f"transpose_scan_axes={transpose_scan_axes_local})."
-            )
-        else:
-            print(
-                f"Using 3D dataset with shape {original_shape} "
-                f"interpreted as 4D with shape={new_shape} "
-                f"(scan_axis={scan_axis_local}, scan_length={scan_length_local}, "
-                f"transpose_scan_axes={transpose_scan_axes_local})."
-            )
+        print(
+            f"Using 3D dataset {dataset_index_local} with shape {original_shape} "
+            f"interpreted as 4D with shape={new_shape} "
+            f"(scan_axis={scan_axis_local}, scan_length={scan_length_local}, "
+            f"transpose_scan_axes={transpose_scan_axes_local})."
+        )
 
         return imported_data_4d
+
+    if scan_axis not in (0, 1):
+        raise ValueError(f"scan_axis must be 0 or 1, got {scan_axis}")
 
     sampling_override = kwargs.pop("sampling", None)
     origin_override = kwargs.pop("origin", None)
     units_override = kwargs.pop("units", None)
     name_override = kwargs.pop("name", None)
 
-    file_reader = _rsciio_reader(file_path, file_type)
+    plugin, file_reader = _rsciio_reader(file_path, file_type)
     data_list = file_reader(file_path, **kwargs)
 
     if not data_list:
-        raise ValueError(f"No datasets returned by rsciio.{file_type} for '{file_path}'")
+        raise ValueError(f"No datasets returned by {plugin} for '{file_path}'")
 
     # Case 1: dataset_index specified explicitly
     if dataset_index is not None:
@@ -279,8 +321,6 @@ def read_4dstem(
             candidates: list[tuple[int, dict]] = []
             for i, d in three_d_datasets:
                 shape = d["data"].shape
-                if scan_axis < 0 or scan_axis > 2:
-                    raise ValueError(f"scan_axis must be in [0, 2] for 3D data, got {scan_axis}")
                 n_frames_axis = shape[scan_axis]
                 if n_frames_axis % scan_length == 0:
                     candidates.append((i, d))
@@ -366,7 +406,7 @@ def read_3d_spectroscopy(
     """
     data_type_normalized = str(data_type).upper()
 
-    file_reader = _rsciio_reader(file_path, file_type)
+    plugin, file_reader = _rsciio_reader(file_path, file_type)
     data_list = file_reader(file_path)
 
     # If specific index provided, use it
@@ -395,13 +435,10 @@ def read_3d_spectroscopy(
         )
 
     imported_axes = imported_data["axes"]
-    # axis_order = (0, 1, 2) if file_type == "digitalmicrograph" else (2, 0, 1)
-    axis_order = (1, 2, 0) if file_type == "digitalmicrograph" else (0, 1, 2)
-    array = (
-        imported_data["data"].transpose(axis_order)
-        if file_type == "digitalmicrograph"
-        else imported_data["data"]
-    )
+    # DigitalMicrograph spectrum images are reordered so that axis 0 moves last.
+    is_dm = plugin == "rsciio.digitalmicrograph"
+    axis_order = (1, 2, 0) if is_dm else (0, 1, 2)
+    array = imported_data["data"].transpose(axis_order) if is_dm else imported_data["data"]
     ordered_axes = [imported_axes[idx] for idx in axis_order]
     sampling = [ax.get("scale", 1) for ax in ordered_axes]
     origin = [ax.get("offset", 0) for ax in ordered_axes]
@@ -452,7 +489,7 @@ def read_2d(
     --------
     Dataset
     """
-    file_reader = _rsciio_reader(file_path, file_type)
+    _, file_reader = _rsciio_reader(file_path, file_type)
     imported_data = file_reader(file_path)[0]
 
     dataset = Dataset2d.from_array(

@@ -55,10 +55,28 @@ from quantem.diffraction.rotations import (
 def position_mask(positions, shape: tuple[int, int]) -> torch.Tensor:
     """Normalize a `positions` argument into an (R, C) boolean mask.
 
-    Accepts None (every position), a list of (row, col) scan positions, or
-    an (R, C) boolean array. Used by the staged workflow: run matching or
-    refinement on a handful of positions, look at the fits, then run the
-    whole scan with the same arguments.
+    Used by the staged workflow: run matching or refinement on a handful of
+    positions, look at the fits, then run the whole scan with the same
+    arguments.
+
+    Parameters
+    ----------
+    positions : None | list[tuple[int, int]] | np.ndarray
+        None for every position, a list of (row, col) scan positions, or an
+        (R, C) boolean array.
+    shape : tuple[int, int]
+        Scan shape (R, C) in probe positions.
+
+    Returns
+    -------
+    torch.Tensor
+        (R, C) boolean mask.
+
+    Raises
+    ------
+    ValueError
+        If a boolean mask has the wrong shape, the input is neither a mask
+        nor a list of (row, col), or a position lies outside the scan.
     """
     R, C = shape
     if positions is None:
@@ -82,9 +100,17 @@ def position_mask(positions, shape: tuple[int, int]) -> torch.Tensor:
 def scan_scalebar(metadata: dict) -> dict | None:
     """Scale bar arguments from the scan calibration recorded on the peaks.
 
-    Returns {"sampling": step, "units": units} when the scan was calibrated,
-    or None when it is still in pixels, which is the signal that a plot
-    should draw no scale bar.
+    Parameters
+    ----------
+    metadata : dict
+        Peak metadata carrying "scan_sampling" and "scan_units".
+
+    Returns
+    -------
+    dict | None
+        {"sampling": step, "units": units} when the scan was calibrated, or
+        None when it is still in pixels, which tells a plot to draw no
+        scale bar.
     """
     step = (metadata or {}).get("scan_sampling")
     units = (metadata or {}).get("scan_units")
@@ -116,6 +142,27 @@ def smooth_quaternions(
     This is an average, not a fit: it moves each orientation away from the one
     that best explains its own pattern. Use it to display a map, not to
     produce the orientations a later step will measure from.
+
+    Parameters
+    ----------
+    quats : torch.Tensor
+        (R, C, 4) orientation quaternions.
+    active : torch.Tensor
+        (R, C) boolean mask of positions to smooth and to average over.
+    sym_quats : torch.Tensor
+        (S, 4) symmetry rotations used to reduce the misorientations.
+    sigma_px : float, default=1.0
+        Spatial width of the kernel in probe positions.
+    sigma_deg : float, default=1.0
+        Angular width of the kernel in degrees.
+    max_angle_deg : float, default=5.0
+        Neighbours misoriented by more than this many degrees are dropped.
+
+    Returns
+    -------
+    torch.Tensor
+        (R, C, 4) smoothed quaternions; inactive positions, and positions
+        with no neighbour inside `max_angle_deg`, are returned unchanged.
     """
     q = torch.as_tensor(quats, dtype=torch.float64)
     R, C = q.shape[:2]
@@ -249,9 +296,10 @@ class OrientationMap(AutoSerialize):
         om.match_orientations(num_matches=1)
         om.plot_orientation()
 
-    The object is both the engine and the result: after `match`, `quats`
-    holds (R, C, M, 4) orientation quaternions, `corr` the correlation
-    scores, and `mirror` the inversion flags.
+    The object is both the engine and the result: after
+    `match_orientations()`, `quats` holds (R, C, M, 4) orientation
+    quaternions, `corr` the correlation scores, and `mirror` the inversion
+    flags.
     """
 
     _token = object()
@@ -263,6 +311,24 @@ class OrientationMap(AutoSerialize):
         energy_ev: float,
         _token: object | None = None,
     ):
+        """Private constructor; use :meth:`from_vectors`.
+
+        Parameters
+        ----------
+        peaks : Vector
+            Calibrated Bragg peaks over the scan.
+        crystal : Crystal
+            Candidate crystal with structure factors already calculated.
+        energy_ev : float
+            Beam energy in eV.
+        _token : object
+            Guard against direct construction.
+
+        Raises
+        ------
+        RuntimeError
+            If called without the class token.
+        """
         if _token is not self._token:
             raise RuntimeError("Use OrientationMap.from_vectors() to construct.")
         self.peaks = peaks
@@ -810,16 +876,6 @@ class OrientationMap(AutoSerialize):
     # experimental polar images
     # ------------------------------------------------------------------
 
-    def _polar_image(
-        self, qx: torch.Tensor, qy: torch.Tensor, intensity: torch.Tensor
-    ) -> torch.Tensor:
-        """Sparse polar image (S, G) of one measured pattern."""
-        qr = torch.hypot(qx, qy)
-        qphi = torch.atan2(qy, qx)
-        amp = intensity.clamp_min(0) ** self.power_intensity_experiment * qr**self.power_radial
-        out = torch.zeros((self.shell_radii.shape[0], self.num_gamma), dtype=torch.float64)
-        return self._deposit_polar(qr, qphi, amp, out)
-
     def _grid_quats(self, flat_idx: torch.Tensor, Z: int, G: int, n_ch: int) -> torch.Tensor:
         """Library orientations at flat (channel, zone, gamma) indices.
 
@@ -942,13 +998,40 @@ class OrientationMap(AutoSerialize):
             sharing a zone axis but rotated in plane past this angle are
             therefore kept as separate matches. The same test picks the
             second-best score used in `reliability`.
+        top_k_matches : int, default=256
+            Number of highest-scoring library entries searched, in order,
+            for a candidate that passes the separation test, both for the
+            matches after the first and for `corr_second`. Most of the top
+            entries are symmetry copies or near neighbours of the best one,
+            so too small a value leaves later matches empty.
         subpixel_gamma : bool, default=True
             Parabolic sub-bin refinement of the in-plane angle.
         subpixel_zone : bool, default=True
             Sub-grid zone axis from a quadratic fit of the correlation over
             the best zone and its grid neighbors (centroid fallback).
+        min_detector_fraction : float, default=0.3
+            With a detector footprint in the plan (`detector_q_max`), library
+            orientations that put less than this fraction of their template
+            weight on the detector at a given in-plane angle score zero
+            there. Ignored when the plan has no detector correction.
         batch_size : int, default=128
             Number of patterns correlated at once.
+        progress_bar : bool, default=True
+            Show a progress bar over the batches.
+
+        Returns
+        -------
+        OrientationMap
+            Self, with `quats` (R, C, M, 4), `corr` and `corr_residual`
+            (R, C, M), `corr_second` and `reliability` (R, C), `mirror`
+            (R, C, M) and `computed` (R, C) filled in. Positions not matched
+            keep the identity orientation and a correlation of zero.
+
+        Raises
+        ------
+        RuntimeError
+            If the plan has not been built, or no requested position has
+            `min_number_peaks` peaks.
         """
         if self.plan_fft is None:
             raise RuntimeError("Run build_plan() first.")
@@ -1022,6 +1105,8 @@ class OrientationMap(AutoSerialize):
                 im_fft = torch.fft.fft(im_stack, dim=-1)  # (B, S, G)
             # frequency ramp used to roll a template to an in-plane angle
             k_ramp = torch.fft.fftfreq(G, d=1.0 / G).to(im_fft.dtype).to(device)
+            # orientations accepted so far in this batch, one (B, 4) per match
+            q_prev: list[torch.Tensor] = []
 
             for m in range(M):
                 norms = torch.linalg.norm(
@@ -1070,10 +1155,9 @@ class OrientationMap(AutoSerialize):
                         keep[:, 0] = True
                     else:
                         ok = torch.ones((B, K), dtype=torch.bool)
-                        for mm in range(m):
-                            q_prev = self._qprev[mm]  # (B, 4)
+                        for q_mm in q_prev:  # (B, 4) each
                             ang = misorientation_angle_deg(
-                                q_prev[:, None, :].expand(-1, K, -1).reshape(-1, 4),
+                                q_mm[:, None, :].expand(-1, K, -1).reshape(-1, 4),
                                 q_top.reshape(-1, 4),
                                 self.crystal.sym_quats_matching,
                             ).reshape(B, K)
@@ -1192,9 +1276,7 @@ class OrientationMap(AutoSerialize):
                             corr_second[rx, ry] = c2[b]
 
                 if M > 1:
-                    if m == 0:
-                        self._qprev = []
-                    self._qprev.append(q.clone())
+                    q_prev.append(q.clone())
 
                 if M > 1 and m < M - 1 and suppress_matched > 0:
                     # Deflate the matched template out of the measured polar
@@ -1316,7 +1398,21 @@ class OrientationMap(AutoSerialize):
         return self
 
     def smoothed_quats(self, match: int = 0, **kwargs) -> torch.Tensor:
-        """Smoothed copy of the orientations, leaving the stored ones alone."""
+        """Smoothed copy of the orientations, leaving the stored ones alone.
+
+        Parameters
+        ----------
+        match : int, default=0
+            Which match index to smooth.
+        **kwargs
+            `sigma_px`, `sigma_deg` and `max_angle_deg` of
+            :func:`smooth_quaternions`.
+
+        Returns
+        -------
+        torch.Tensor
+            (R, C, 4) smoothed quaternions.
+        """
         assert self.quats is not None
         R, C = self.quats.shape[:2]
         active = torch.ones((R, C), dtype=torch.bool)
@@ -1409,6 +1505,10 @@ class OrientationMap(AutoSerialize):
             Excitation-error width of the envelope objective; defaults to
             half the plan's sigma_excitation (the plan value is widened for
             grid robustness).
+        batched : bool, default=True
+            Refine positions in vectorized chunks instead of one at a time,
+            which is several times faster. `refine_tilt=True` disables it,
+            since only the per-position path solves the tilt from positions.
         neighbor_rescue : bool, default=True
             Retry every position that disagrees with a matched neighbour by
             more than `rescue_threshold_deg`, from every distinct candidate
@@ -1442,6 +1542,14 @@ class OrientationMap(AutoSerialize):
             eight neighbours; the Friedel twin is adopted only this way,
             never on its score alone. 0 judges every position by its own
             pattern alone.
+        progress_bar : bool, default=True
+            Show one progress bar covering refinement and neighbour rescue.
+
+        Returns
+        -------
+        OrientationMap
+            Self, with `quats` refined in place and `score` (R, C) holding
+            the correlation of match 0 with the measured peaks.
 
         Notes
         -----
@@ -1663,7 +1771,6 @@ class OrientationMap(AutoSerialize):
             w_exp = w_exp / w_exp.max().clamp_min(1e-12)
             return q_exp, w_exp
 
-        scores = torch.zeros((R, C), dtype=torch.float64)
         # positions to refine: those requested, or everything matched
         active = position_mask(positions, (R, C))
         if self.computed is not None:
@@ -1676,7 +1783,6 @@ class OrientationMap(AutoSerialize):
         bar = tqdm(total=0, desc=f"refining {self.crystal.name}") if progress_bar else None
         if batched and not refine_tilt:
             self._refine_batched(
-                scores,
                 active=active,
                 delta=delta,
                 sigma=sigma,
@@ -1703,10 +1809,8 @@ class OrientationMap(AutoSerialize):
                 for m in range(M):
                     if self.corr[rx, ry, m] <= 0:
                         continue
-                    q, sc = refine_single(self.quats[rx, ry, m], q_exp, w_exp)
+                    q, _ = refine_single(self.quats[rx, ry, m], q_exp, w_exp)
                     self.quats[rx, ry, m] = q
-                    if m == 0:
-                        scores[rx, ry] = sc
 
         # Refinement polishes the orientation on paired peak positions, which
         # is accurate for small corrections but can jump to another basin on
@@ -1955,7 +2059,6 @@ class OrientationMap(AutoSerialize):
 
     def _refine_batched(
         self,
-        scores: torch.Tensor,
         active: torch.Tensor,
         delta: float,
         sigma: float,
@@ -2051,7 +2154,6 @@ class OrientationMap(AutoSerialize):
                     continue
                 q = quats[i0:i1, m].clone()  # (B, 4)
                 tilt_total = torch.zeros((B, 2), dtype=torch.float64)
-                sc = torch.zeros(B, dtype=torch.float64)
                 for _ in range(num_iterations):
                     Rm = quat_to_matrix(q)  # (B, 3, 3)
                     g = torch.einsum("bij,gj->bgi", Rm, g_all)  # (B, G, 3)
@@ -2076,7 +2178,6 @@ class OrientationMap(AutoSerialize):
                     ok = act & (n_pair >= min_pairs)
                     if not bool(ok.any()):
                         break
-                    sc = torch.where(ok, w_g.sum(dim=1), sc)
                     tgt = torch.gather(qe, 1, j_min[..., None].expand(-1, -1, 2))  # (B, G, 2)
                     r_vec = tgt - spot
                     # in-plane closed form
@@ -2168,12 +2269,29 @@ class OrientationMap(AutoSerialize):
                             q_nz = q[nz]
                             q[nz] = qmult(dq_t, q_nz)
                 quats[i0:i1, m] = torch.where(act[:, None], q, quats[i0:i1, m])
-                if m == 0:
-                    scores.reshape(-1)[i0:i1] = torch.where(act, sc, scores.reshape(-1)[i0:i1])
         self.quats = quats.reshape(R, C, M, 4)
 
     def generate_pattern(self, rx: int, ry: int, match: int = 0, **kwargs):
-        """Simulated pattern for the matched orientation at (rx, ry)."""
+        """Simulated pattern for the matched orientation at one probe position.
+
+        The illumination (precession, convergence) and foil normal recorded
+        on this map are used unless overridden.
+
+        Parameters
+        ----------
+        rx, ry : int
+            Scan row and column.
+        match : int, default=0
+            Which match index to simulate.
+        **kwargs
+            Passed to :meth:`Crystal.generate_pattern`, e.g. `k_max`.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            The simulated reflections, as returned by
+            :meth:`Crystal.generate_pattern` ("qx", "qy", "intensity", ...).
+        """
         assert self.quats is not None
         kwargs.setdefault("precession_deg", self.metadata.get("precession_deg", 0.0))
         kwargs.setdefault("semiconv_mrad", self.metadata.get("semiconv_mrad", 0.0))
@@ -2197,11 +2315,13 @@ class OrientationMap(AutoSerialize):
 
         For overlapping patterns (e.g. a thin lath on a matrix), the direct
         match of the minority phase is poisoned by the majority phase's
-        peaks. Here the majority candidate's simulated pattern is used to
-        delete its measured peaks at each position, and this crystal is
-        re-matched against the residual peaks only. Where the residual match
-        beats this map's stored second match, it replaces it (match index 1),
-        so the joint phase fit sees one clean candidate per phase.
+        peaks. Here the other crystal's simulated pattern is used to delete
+        its measured peaks at each position, and this crystal is matched and
+        refined against the remaining peaks only, with this map's plan.
+        Where the residual match scores above this map's stored second
+        match, it replaces it (match index 1), so the joint phase fit sees
+        one clean candidate per phase. A map with a single match is first
+        extended to two, the second empty (correlation zero).
 
         Parameters
         ----------
@@ -2210,22 +2330,39 @@ class OrientationMap(AutoSerialize):
         delete_radius : float, default=0.04
             Measured peaks within this distance (1/Angstroms) of one of the
             other crystal's simulated peaks are removed.
+        min_number_peaks : int, default=MIN_NUMBER_PEAKS (5)
+            Positions with fewer measured peaks, or fewer residual peaks,
+            are not re-matched.
         min_corr_other : float, default=0.0
-            Skip positions where the other crystal's correlation is below
-            this (nothing trustworthy to delete).
+            Positions where the other crystal's correlation is at or below
+            this are not re-matched (nothing trustworthy to delete).
+        progress_bar : bool, default=True
+            Show progress bars for the residual matching and refinement.
+
+        Returns
+        -------
+        OrientationMap
+            Self, with `quats`, `corr`, `corr_residual` and `mirror` holding
+            at least two matches. Where the residual match was taken, both
+            `corr[..., 1]` and `corr_residual[..., 1]` hold its correlation
+            with the residual peaks. When no position has enough residual
+            peaks, nothing is replaced.
         """
-        assert self.quats is not None and other.quats is not None
+        if self.quats is None or other.quats is None:
+            raise RuntimeError("Run match_orientations() on both maps first.")
+        if self.plan_fft is None:
+            raise RuntimeError("Run build_plan() first.")
         peaks = self.peaks
         R, C = peaks.shape[0], peaks.shape[1]
         fields = peaks.fields
         ix = [fields.index(f) for f in ("qx", "qy", "intensity")]
-
-        residual = Vector.from_shape(
-            (R, C),
-            fields=["qx", "qy", "intensity"],
-            units=["A^-1", "A^-1", "counts"],
-            name="residual_peaks",
+        self.metadata["match_residual"] = dict(
+            other=other.crystal.name,
+            delete_radius=float(delete_radius),
+            min_number_peaks=int(min_number_peaks),
+            min_corr_other=float(min_corr_other),
         )
+
         cells = []
         for rx, ry in np.ndindex(R, C):
             data = peaks[rx, ry].numpy().astype(np.float64)
@@ -2233,7 +2370,7 @@ class OrientationMap(AutoSerialize):
                 cells.append(np.zeros((0, 3)))
                 continue
             sim = other.generate_pattern(rx, ry)
-            sq = torch.stack((sim["qx"], sim["qy"]), dim=1)
+            sq = torch.stack((sim["qx"], sim["qy"]), dim=1).to(torch.float64)
             if sq.shape[0] == 0:
                 cells.append(data[:, ix])
                 continue
@@ -2241,15 +2378,38 @@ class OrientationMap(AutoSerialize):
             d_min = torch.cdist(qxy, sq).min(dim=1).values
             keep = (d_min > delete_radius).numpy()
             cells.append(data[keep][:, ix])
-        nested = [cells[r * C : (r + 1) * C] for r in range(R)]
+
+        # extend to two matches first, so the result has the same layout
+        # whether or not anything is replaced
+        if self.quats.shape[2] < 2:
+            pad_q = torch.zeros((R, C, 1, 4), dtype=self.quats.dtype)
+            pad_q[..., 0] = 1.0
+            self.quats = torch.cat([self.quats, pad_q], dim=2)
+            pad = torch.zeros((R, C, 1), dtype=self.corr.dtype)
+            self.corr = torch.cat([self.corr, pad], dim=2)
+            if self.corr_residual is not None:
+                self.corr_residual = torch.cat([self.corr_residual, pad.clone()], dim=2)
+            self.mirror = torch.cat([self.mirror, torch.zeros((R, C, 1), dtype=torch.bool)], dim=2)
+        if self.corr_residual is None:
+            self.corr_residual = self.corr.clone()
+
+        # positions with enough residual peaks, among those this map covers
+        wanted = torch.as_tensor(
+            np.array([c.shape[0] >= min_number_peaks for c in cells]).reshape(R, C)
+        )
+        if self.computed is not None:
+            wanted &= self.computed
+        if not bool(wanted.any()):
+            return self
+
         residual = Vector.from_data(
-            nested,
+            [cells[r * C : (r + 1) * C] for r in range(R)],
             fields=["qx", "qy", "intensity"],
             units=["A^-1", "A^-1", "counts"],
             name="residual_peaks",
+            metadata=dict(peaks.metadata or {}),
             dtype=peaks.dtype,
         )
-
         om_res = OrientationMap.from_vectors(
             residual,
             self.crystal,
@@ -2258,12 +2418,17 @@ class OrientationMap(AutoSerialize):
             semiconv_mrad=self.metadata.get("semiconv_mrad", 0.0) or 0.0,
             foil_normal=self.metadata.get("foil_normal"),
         )
+        # share this map's plan rather than rebuilding it
         for attr in (
             "device",
+            "dtype",
+            "cdtype",
             "corr_kernel_size",
             "sigma_excitation",
             "power_radial",
             "power_intensity",
+            "power_intensity_experiment",
+            "zone_axis_range",
             "zone_axes",
             "zone_quats",
             "zone_step_deg",
@@ -2279,25 +2444,24 @@ class OrientationMap(AutoSerialize):
             "plan_frac_shift",
         ):
             setattr(om_res, attr, getattr(self, attr))
+        om_res.metadata["plan"] = dict(self.metadata.get("plan") or {})
         om_res.match_orientations(
             num_matches=1,
+            positions=wanted.numpy(),
             min_number_peaks=min_number_peaks,
             progress_bar=progress_bar,
         )
         om_res.refine_orientations(progress_bar=progress_bar)
 
         # replace the stored second match where the residual match is better
-        if self.quats.shape[2] < 2:
-            pad_q = torch.zeros((R, C, 1, 4), dtype=torch.float64)
-            pad_q[..., 0] = 1.0
-            self.quats = torch.cat([self.quats, pad_q], dim=2)
-            self.corr = torch.cat([self.corr, torch.zeros((R, C, 1), dtype=torch.float64)], dim=2)
-            self.mirror = torch.cat([self.mirror, torch.zeros((R, C, 1), dtype=torch.bool)], dim=2)
-        better = om_res.corr[..., 0] > self.corr[..., 1]
+        better = om_res.computed & (om_res.corr[..., 0] > self.corr[..., 1])
         self.quats[..., 1, :] = torch.where(
             better[..., None], om_res.quats[..., 0, :], self.quats[..., 1, :]
         )
         self.corr[..., 1] = torch.where(better, om_res.corr[..., 0], self.corr[..., 1])
+        self.corr_residual[..., 1] = torch.where(
+            better, om_res.corr[..., 0], self.corr_residual[..., 1]
+        )
         self.mirror[..., 1] = torch.where(better, om_res.mirror[..., 0], self.mirror[..., 1])
         return self
 
@@ -2318,11 +2482,15 @@ class OrientationMap(AutoSerialize):
         Parameters
         ----------
         mask : np.ndarray | None
-            Boolean or weight mask of positions to include (e.g. phase mask).
+            (R, C) boolean or weight mask of positions to include, e.g. a
+            phase mask. A position is included where the mask is above 0.5,
+            the same rule as :meth:`calculate_strain`.
         threshold_deg : float, default=5.0
-            Misorientation radius of a cluster.
+            Misorientation radius of a cluster, degrees.
         min_cluster_size : int, default=10
             Smaller clusters are discarded (labels stay -1).
+        match : int, default=0
+            Which match index to cluster.
 
         Returns
         -------
@@ -2396,6 +2564,28 @@ class OrientationMap(AutoSerialize):
         lattice-vector strain mapping it is absolute, not relative to a
         reference region.
 
+        Parameters
+        ----------
+        match : int, default=0
+            Which match index to measure.
+        pair_distance : float | None
+            Largest distance (1/Angstroms) between a simulated and a measured
+            peak that are paired; inherits the refinement's, then the plan's.
+        min_pairs : int | None
+            Positions with fewer paired peaks are left as NaN; inherits the
+            refinement's value, else MIN_PAIRS (4).
+        mask : np.ndarray | None
+            (R, C) boolean or weight mask of positions to measure. A position
+            is measured where the mask is above 0.5, the same rule as
+            :meth:`cluster_orientations`. None measures every matched
+            position.
+        ds_sampling : float | None
+            Scan step, passed to StrainMap for scale bars.
+        ds_units : str | None
+            Units of `ds_sampling`.
+        progress_bar : bool, default=True
+            Show a progress bar over the positions.
+
         Returns
         -------
         StrainMap
@@ -2426,12 +2616,13 @@ class OrientationMap(AutoSerialize):
 
         A_map = np.full((R, C, 2, 2), np.nan)
         num_pairs = np.zeros((R, C), dtype=int)
+        include = None if mask is None else np.asarray(mask, dtype=float) > 0.5
 
         iterator = list(np.ndindex(R, C))
         if progress_bar:
             iterator = tqdm(iterator, desc=f"strain mapping {self.crystal.name}")
         for rx, ry in iterator:
-            if mask is not None and not mask[rx, ry]:
+            if include is not None and not include[rx, ry]:
                 continue
             if self.corr[rx, ry, match] <= 0:
                 continue
@@ -2464,12 +2655,12 @@ class OrientationMap(AutoSerialize):
         # StrainMap's reciprocal-space branch (U_ref @ inv(U) = F^T) then
         # yields the real-space strain with the shared sign conventions
         sm = StrainMap(
-            u_array=A_map[..., :, 0],
-            v_array=A_map[..., :, 1],
+            g1_array=A_map[..., :, 0],
+            g2_array=A_map[..., :, 1],
             ds_shape=(R, C),
             real_space=False,
-            u_ref=np.array([1.0, 0.0]),
-            v_ref=np.array([0.0, 1.0]),
+            g1_ref=np.array([1.0, 0.0]),
+            g2_ref=np.array([0.0, 1.0]),
             mask=None if mask is None else np.asarray(mask, dtype=float),
             ds_sampling=ds_sampling,
             ds_units=ds_units,
@@ -2538,7 +2729,27 @@ class OrientationMap(AutoSerialize):
         return scan_scalebar(md)
 
     def plot_orientation(self, direction: str = "z", match: int = 0, **kwargs):
-        """IPF-colored orientation map; see orientation_visualization."""
+        """IPF-colored orientation map with the color wedge beside it.
+
+        Parameters
+        ----------
+        direction : {"z", "r", "c"} | float | array-like, default="z"
+            Lab direction whose crystal-frame coordinates are colored; see
+            :func:`~quantem.diffraction.orientation_visualization.plot_orientation_map`.
+        match : int, default=0
+            Which match index to plot.
+        **kwargs
+            Passed to
+            :func:`~quantem.diffraction.orientation_visualization.plot_orientation_map`.
+            The scale bar defaults to the scan calibration, and after a
+            staged run on a subset of positions the mask defaults to those
+            positions.
+
+        Returns
+        -------
+        tuple
+            ``(fig, ax)``.
+        """
         from quantem.diffraction.orientation_visualization import plot_orientation_map
 
         kwargs.setdefault("scalebar", self.scan_scalebar)
@@ -2547,15 +2758,94 @@ class OrientationMap(AutoSerialize):
         )
 
     def plot_pole_figure(self, pole=(0, 0, 1), match: int = 0, **kwargs):
-        """Stereographic pole figure; see orientation_visualization."""
+        """Stereographic pole figure of a crystal direction family over the map.
+
+        Parameters
+        ----------
+        pole : array-like, default=(0, 0, 1)
+            Crystal direction in Miller indices, [uvw] or [uvtw].
+        match : int, default=0
+            Which match index to plot.
+        **kwargs
+            Passed to
+            :func:`~quantem.diffraction.orientation_visualization.plot_pole_figure`.
+            After a staged run on a subset of positions the mask defaults
+            to those positions.
+
+        Returns
+        -------
+        tuple
+            ``(fig, ax)``.
+        """
         from quantem.diffraction.orientation_visualization import plot_pole_figure
 
         return plot_pole_figure(self, pole=pole, match=match, **self._default_mask(kwargs))
 
-    def misorientation_map(self, reference: torch.Tensor | None = None) -> torch.Tensor:
-        """Misorientation angle (deg) of match 0 to a reference orientation."""
+    def plot_cluster_map(self, clusters: dict, **kwargs):
+        """Map of the orientation clusters, one color per cluster.
+
+        Parameters
+        ----------
+        clusters : dict
+            Output of :meth:`cluster_orientations`.
+        **kwargs
+            Passed to
+            :func:`~quantem.diffraction.orientation_visualization.plot_cluster_map`.
+            The scale bar defaults to the scan calibration.
+
+        Returns
+        -------
+        tuple
+            ``(fig, ax)``.
+        """
+        from quantem.diffraction.orientation_visualization import plot_cluster_map
+
+        kwargs.setdefault("scalebar", self.scan_scalebar)
+        return plot_cluster_map(self, clusters, **kwargs)
+
+    def plot_cluster_pole_figure(self, clusters: dict, pole=(0, 0, 1), **kwargs):
+        """Pole figure of the cluster mean orientations, one color per cluster.
+
+        Parameters
+        ----------
+        clusters : dict
+            Output of :meth:`cluster_orientations`.
+        pole : array-like, default=(0, 0, 1)
+            Crystal direction in Miller indices, [uvw] or [uvtw].
+        **kwargs
+            Passed to
+            :func:`~quantem.diffraction.orientation_visualization.plot_cluster_pole_figure`,
+            e.g. `pole_label` and `overlay`.
+
+        Returns
+        -------
+        tuple
+            ``(fig, ax)``.
+        """
+        from quantem.diffraction.orientation_visualization import plot_cluster_pole_figure
+
+        return plot_cluster_pole_figure(self, clusters, pole=pole, **kwargs)
+
+    def misorientation_map(
+        self, reference: torch.Tensor | None = None, match: int = 0
+    ) -> torch.Tensor:
+        """Misorientation angle of every position to a reference orientation.
+
+        Parameters
+        ----------
+        reference : torch.Tensor | None
+            (4,) reference quaternion; None is the identity.
+        match : int, default=0
+            Which match index to compare.
+
+        Returns
+        -------
+        torch.Tensor
+            (R, C) misorientation angles in degrees, reduced by the matching
+            symmetry of the crystal.
+        """
         assert self.quats is not None
-        q = self.quats[..., 0, :]
+        q = self.quats[..., match, :]
         if reference is None:
             reference = torch.tensor([1.0, 0, 0, 0], dtype=torch.float64)
         return misorientation_angle_deg(reference, q, self.crystal.sym_quats_matching)

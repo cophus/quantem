@@ -46,9 +46,7 @@ def test_rotation_roundtrip(rot_scan_deg):
         units=["px", "px", "counts"],
         name="synthetic",
     )
-    peaks = calibration.peaks_to_calibrated(
-        peaks_px, pixel_size, rotation_ccw_deg=rot_scan_deg
-    )
+    peaks = calibration.peaks_to_calibrated(peaks_px, pixel_size, rotation_ccw_deg=rot_scan_deg)
 
     om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
     om.build_plan(power_intensity=0.0)
@@ -59,7 +57,5 @@ def test_rotation_roundtrip(rot_scan_deg):
     # (modulo crystal symmetry) -- independent of the detector rotation
     from quantem.diffraction.rotations import misorientation_angle_deg
 
-    err = float(
-        misorientation_angle_deg(q_true, om.quats[0, 0, 0], xtl.sym_quats)
-    )
+    err = float(misorientation_angle_deg(q_true, om.quats[0, 0, 0], xtl.sym_quats))
     assert err < 1.0, f"misorientation {err:.2f} deg at rot {rot_scan_deg}"
