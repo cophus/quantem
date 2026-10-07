@@ -316,3 +316,32 @@ def test_fit_geometry_on_synthetic_lattice(tmp_path):
         out.set_envelope(envelope)
         assert out.envelope == envelope
         assert np.isfinite(out._update_residual())
+
+
+def test_shell_correlations_match_warren_cowley(rmc):
+    sc = rmc.shell_correlations(n_shells=4)
+    sro = rmc.warren_cowley(n_shells=4)
+    ratio = sc["ratio"]
+    np.testing.assert_allclose(sc["radius"], sro["radius"])
+    # pair counts are symmetric, and an unlike pair has ratio = 1 - alpha
+    np.testing.assert_allclose(ratio, np.swapaxes(ratio, 1, 2), atol=1e-9)
+    np.testing.assert_allclose(ratio[:, 0, 1], 1 - sro["alpha"][:, 0, 1], atol=0.02)
+    # a random arrangement sits near 1 in every shell
+    assert np.abs(ratio - 1).max() < 0.2
+    assert sc["shell"][:3] == ["1/2<111>", "<100>", "<110>"]
+    # the default radius reaches five lattice parameters, or half the supercell
+    far = rmc.shell_correlations()
+    assert far["radius"][-1] <= min(5, rmc.cells / 2) * rmc.lattice_parameter + 1e-6
+    assert len(far["shell"]) == len(far["radius"])
+
+
+def test_plot_shell_correlations(rmc):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axs = rmc.plot_shell_correlations()
+    K = len(rmc.species)
+    assert len(axs) == K * (K + 1) // 2
+    plt.close(fig)

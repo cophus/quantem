@@ -1894,7 +1894,7 @@ class ReverseMonteCarlo(AutoSerialize):
         diffuse = self.model_images(diffuse_only=True)
         return [f - d for f, d in zip(full, diffuse)]
 
-    def warren_cowley(self, n_shells: int = 6) -> dict:
+    def warren_cowley(self, n_shells: int | None = 6, max_radius: float | None = None) -> dict:
         """Warren-Cowley alpha for every species pair over the first neighbour shells.
 
         ``alpha[shell, s, t] = 1 - P(t | s) / c_t`` for unlike pairs and
@@ -1905,7 +1905,11 @@ class ReverseMonteCarlo(AutoSerialize):
         Parameters
         ----------
         n_shells : int, optional
-            Number of neighbour shells. Default 6.
+            Largest number of neighbour shells. Default 6; None keeps every shell within
+            `max_radius`.
+        max_radius : float, optional
+            Largest neighbour distance in A. Default None (no limit beyond half the
+            supercell).
 
         Returns
         -------
@@ -1913,6 +1917,23 @@ class ReverseMonteCarlo(AutoSerialize):
             "radius": (n_shells,) shell radii in A; "alpha": (n_shells, K, K)
             Warren-Cowley parameters; "species": the K species in index order.
         """
+        radii, prob = self._pair_probabilities(n_shells=n_shells, max_radius=max_radius)
+        c = self.concentrations
+        K = len(self.species)
+        alpha = np.zeros_like(prob)
+        for s in range(K):
+            for t in range(K):
+                p = prob[:, s, t]
+                alpha[:, s, t] = (p - c[t]) / (1 - c[t]) if s == t else 1 - p / c[t]
+        return dict(radius=radii, alpha=alpha, species=list(self.species))
+
+    def _pair_probabilities(
+        self, n_shells: int | None = None, max_radius: float | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Shell radii (A) and ``P(t | s)`` (n_shells, K, K): the fraction of the sites in each
+        neighbour shell of an ``s`` atom that hold a ``t`` atom, averaged over every ``s`` atom
+        of the supercell (periodic boundaries). Shells are kept up to `n_shells` and up to
+        `max_radius` (A), whichever ends first, and never beyond half the supercell."""
         d = self.grid_divisor
         n = self.cells * d
         xs = self.site_x // self.refine
@@ -1929,19 +1950,73 @@ class ReverseMonteCarlo(AutoSerialize):
         ss = np.real(np.fft.ifftn(fsite * np.conj(fsite)))
         v = np.stack(np.meshgrid(*(np.fft.fftfreq(n, 1 / n),) * 3, indexing="ij"), -1)
         r = np.linalg.norm(v, axis=-1) / d * self.lattice_parameter
-        valid = ss > 0.5
-        radii = np.unique(np.round(r[valid], 4))[1 : n_shells + 1]
-        shells = [valid & (np.abs(r - rad) < 1e-3) for rad in radii]
-        c = self.concentrations
-        alpha = np.zeros((len(radii), K, K))
+        half_box = self.cells * self.lattice_parameter / 2
+        r_max = half_box if max_radius is None else min(max_radius, half_box)
+        valid = (ss > 0.5) & (r <= r_max + 1e-6)
+        radii = np.unique(np.round(r[valid], 4))[1:]
+        if n_shells is not None:
+            radii = radii[:n_shells]
+        shell = np.searchsorted(radii, np.round(r, 4))
+        inside = valid & (shell < len(radii))
+        inside[inside] = radii[shell[inside]] == np.round(r[inside], 4)
+        index = shell[inside]
+
+        def shell_sums(a):
+            return np.bincount(index, weights=a[inside], minlength=len(radii))
+
+        prob = np.zeros((len(radii), K, K))
         for s in range(K):
-            cs_site = np.real(np.fft.ifftn(focc[s] * np.conj(fsite)))
+            cs_site = shell_sums(np.real(np.fft.ifftn(focc[s] * np.conj(fsite))))
             for t in range(K):
-                cst = np.real(np.fft.ifftn(focc[s] * np.conj(focc[t])))
-                for k, m in enumerate(shells):
-                    p = cst[m].sum() / cs_site[m].sum()
-                    alpha[k, s, t] = (p - c[t]) / (1 - c[t]) if s == t else 1 - p / c[t]
-        return dict(radius=radii, alpha=alpha, species=list(self.species))
+                cst = shell_sums(np.real(np.fft.ifftn(focc[s] * np.conj(focc[t]))))
+                prob[:, s, t] = cst / cs_site
+        return radii, prob
+
+    def shell_correlations(
+        self, n_shells: int | None = None, max_radius: float | None = None
+    ) -> dict:
+        """Pair correlation of every species pair per neighbour shell, relative to a random
+        alloy.
+
+        ``ratio[shell, s, t] = P(t | s) / c_t``, the number of ``s``-``t`` pairs in the shell
+        divided by the number expected for a random arrangement at the same composition. It
+        is symmetric in ``s`` and ``t``, equals 1 for a random alloy, is above 1 for pairs that
+        are favoured and below 1 for pairs that are avoided. ``c_t`` is the composition of
+        the supercell itself. For an unlike pair, ``ratio = 1 - alpha`` with the Warren-Cowley
+        parameter of :meth:`warren_cowley`, up to the rounding of the composition to whole
+        atoms.
+
+        Parameters
+        ----------
+        n_shells : int, optional
+            Largest number of neighbour shells. Default None (every shell within
+            `max_radius`).
+        max_radius : float, optional
+            Largest neighbour distance in A. Default None: five lattice parameters, far
+            enough for the short-range order to decay. Never beyond half the supercell.
+
+        Returns
+        -------
+        dict
+            "radius": (n_shells,) shell radii in A; "shell": bond-vector labels in units of a
+            (e.g. "1/2<111>"), or None for site lattices other than BCC; "ratio":
+            (n_shells, K, K) pair correlations relative to random; "species": the K species
+            in index order.
+        """
+        if max_radius is None:
+            max_radius = 5 * self.lattice_parameter
+        radii, prob = self._pair_probabilities(n_shells=n_shells, max_radius=max_radius)
+        # the supercell's own composition, so that the ratio is exactly symmetric
+        counts = np.bincount(self.species_index, minlength=len(self.species))
+        ratio = prob / (counts / counts.sum())[None, None, :]
+        shell = None
+        if self.grid_divisor == 2:
+            reach = int(np.ceil(radii[-1] / (self.lattice_parameter / 2))) + 1
+            offsets = self._shells(len(radii), reach=reach)
+            dist = [np.linalg.norm(o[0]) * self.lattice_parameter / 2 for o in offsets]
+            if len(offsets) == len(radii) and np.allclose(dist, radii, atol=1e-3):
+                shell = [self._shell_label(o[0]) for o in offsets]
+        return dict(radius=radii, shell=shell, ratio=ratio, species=list(self.species))
 
     def _u2(self, disp: np.ndarray) -> np.ndarray:
         """Squared displacement (A^2) of each displacement vector (..., 3)."""
@@ -2190,18 +2265,33 @@ class ReverseMonteCarlo(AutoSerialize):
             **kwargs,
         )
 
-    def plot_warren_cowley(self, n_shells: int = 8):
-        """Warren-Cowley alpha against neighbour distance (< 0 unlike neighbours preferred, > 0
-        like); one curve for a binary site, one per species pair otherwise."""
+    def plot_warren_cowley(self, max_radius: float | None = None):
+        """Warren-Cowley alpha against neighbour distance (0 = random, < 0 unlike neighbours
+        preferred, > 0 like); one curve for a binary site, one per species pair otherwise.
+
+        Parameters
+        ----------
+        max_radius : float, optional
+            Largest neighbour distance in A. Default None: five lattice parameters.
+
+        Returns
+        -------
+        fig, ax
+        """
         import matplotlib.pyplot as plt
 
-        sro = self.warren_cowley(n_shells)
+        max_radius = self._default_shell_radius(max_radius)
+        sro = self.warren_cowley(n_shells=None, max_radius=max_radius)
+        sc = self.shell_correlations(max_radius=max_radius)
+        labelled = self._direction_shells(sc["radius"], sc["shell"])
         K = len(self.species)
-        fig, ax = plt.subplots(figsize=(5.5, 4))
+        fig, ax = plt.subplots(figsize=(8.0, 3.6))
         ax.axhline(0, color="0.6", lw=0.8)
+        for radius, _ in labelled:
+            ax.axvline(radius, color="0.9", lw=0.6, zorder=0)
         if K == 2:  # a binary site has one alpha for every pair
-            ax.plot(sro["radius"], sro["alpha"][:, 0, 0], "o-", ms=4, color="k")
-            ax.set_title(f"{self.species[0]}-{self.species[1]}")
+            ax.plot(sro["radius"], sro["alpha"][:, 0, 0], "o-", ms=3, lw=1.2, color="tab:blue")
+            ax.set_ylabel(f"Warren-Cowley alpha, {self.species[0]}-{self.species[1]}")
         else:
             for s_ in range(K):
                 for t in range(s_, K):
@@ -2209,14 +2299,111 @@ class ReverseMonteCarlo(AutoSerialize):
                         sro["radius"],
                         sro["alpha"][:, s_, t],
                         "o-" if s_ == t else "s--",
-                        ms=4,
+                        ms=3,
+                        lw=1.2,
                         label=f"{self.species[s_]}-{self.species[t]}",
                     )
             ax.legend(fontsize=8)
+            ax.set_ylabel("Warren-Cowley alpha")
         ax.set_xlabel("neighbour distance (A)")
-        ax.set_ylabel("Warren-Cowley alpha")
+        ax.set_xlim(0, sro["radius"][-1] * 1.02)
         fig.tight_layout()
+        self._label_direction_shells(fig, ax, labelled, sro["radius"][-1] * 1.02)
         return fig, ax
+
+    def _default_shell_radius(self, max_radius: float | None) -> float:
+        """Largest neighbour distance of the shell plots: `max_radius`, or five lattice parameters."""
+        return 5 * self.lattice_parameter if max_radius is None else max_radius
+
+    @staticmethod
+    def _direction_shells(radii, labels) -> list[tuple[float, str]]:
+        """(radius, label) of the shells along <100>, <110> and <111>, from the bond-vector
+        labels of :meth:`shell_correlations`; empty when there are no labels."""
+        if labels is None:
+            return []
+        out = []
+        for radius, label in zip(radii, labels):
+            digits = [int(c) for c in label.split("<")[1].rstrip(">")]
+            if (
+                digits[1:] == [0, 0]
+                or (digits[0] == digits[1] and digits[2] == 0)
+                or digits[0] == digits[1] == digits[2]
+            ):
+                out.append((radius, label))
+        return out
+
+    @staticmethod
+    def _label_direction_shells(fig, ax, labelled, span: float) -> None:
+        """Write shell labels above `ax`, stacked in rows so that none overlap, and make room
+        for them at the top of the figure. Call after ``tight_layout``."""
+        last: list[float] = []
+        for radius, label in labelled:
+            width = 0.012 * span * len(label)
+            row = next((k for k, x in enumerate(last) if radius - width / 2 > x), len(last))
+            if row == len(last):
+                last.append(0.0)
+            last[row] = radius + width / 2
+            ax.annotate(
+                label,
+                (radius, 1.0),
+                xycoords=("data", "axes fraction"),
+                xytext=(0, 3 + 11 * row),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                annotation_clip=False,
+            )
+        if last:
+            height = fig.get_size_inches()[1]
+            fig.subplots_adjust(top=fig.subplotpars.top - (0.03 + 0.15 * len(last)) / height)
+
+    def plot_shell_correlations(
+        self,
+        max_radius: float | None = None,
+        panel_size: tuple[float, float] = (8.0, 2.2),
+    ):
+        """Pair correlation of every species pair against neighbour distance, relative to a
+        random alloy (1 = random), one panel per pair stacked on shared distance and ratio axes. The
+        shells along <100>, <110> and <111> are labelled above the top panel (BCC only).
+
+        Parameters
+        ----------
+        max_radius : float, optional
+            Largest neighbour distance in A. Default None: five lattice parameters.
+        panel_size : tuple of float, optional
+            Width and height of each panel in inches. Default (8.0, 2.2).
+
+        Returns
+        -------
+        fig, axs
+            The figure and the array of panels, top to bottom.
+        """
+        import matplotlib.pyplot as plt
+
+        sc = self.shell_correlations(max_radius=self._default_shell_radius(max_radius))
+        K = len(self.species)
+        pairs = [(s, t) for s in range(K) for t in range(s, K)]
+        fig, axs = plt.subplots(
+            len(pairs),
+            1,
+            sharex=True,
+            sharey=True,
+            figsize=(panel_size[0], panel_size[1] * len(pairs)),
+        )
+        axs = np.atleast_1d(axs)
+        labelled = self._direction_shells(sc["radius"], sc["shell"])
+        for ax, (s, t) in zip(axs, pairs):
+            ax.axhline(1, color="0.6", lw=0.8)
+            for radius, _ in labelled:
+                ax.axvline(radius, color="0.9", lw=0.6, zorder=0)
+            ax.plot(sc["radius"], sc["ratio"][:, s, t], "o-", ms=3, lw=1.2, color="tab:blue")
+            ax.set_ylabel(f"{self.species[s]}-{self.species[t]}\n/ random")
+        axs[-1].set_xlabel("neighbour distance (A)")
+        axs[-1].set_xlim(0, sc["radius"][-1] * 1.02)
+        fig.tight_layout()
+        self._label_direction_shells(fig, axs[0], labelled, sc["radius"][-1] * 1.02)
+        return fig, axs
 
     def plot_diffuse_sections(self, extent: float = 2.0, normals=((0, 0, 1), (1, -1, 0))):
         """Symmetrized diffuse intensity of the supercell in Laue units (1 = random alloy) on
@@ -2243,14 +2430,24 @@ class ReverseMonteCarlo(AutoSerialize):
         fig.tight_layout()
         return fig, axs
 
-    def _shells(self, n_shells: int):
-        """Neighbour offsets of the BCC site lattice (site units, a / 2) grouped by distance."""
-        r = np.arange(-4, 5)
+    def _shells(self, n_shells: int, reach: int = 4):
+        """Neighbour offsets of the BCC site lattice (site units, a / 2) grouped by distance,
+        complete for every shell within `reach` site units."""
+        r = np.arange(-reach, reach + 1)
         v = np.stack(np.meshgrid(r, r, r, indexing="ij"), -1).reshape(-1, 3)
         bcc = np.all(v % 2 == 0, axis=1) | np.all(v % 2 == 1, axis=1)
         v = v[bcc & np.any(v != 0, axis=1)]
         d2 = (v**2).sum(1)
-        return [v[d2 == d] for d in np.unique(d2)[:n_shells]]
+        return [v[d2 == d] for d in np.unique(d2[d2 <= reach**2])[:n_shells]]
+
+    @staticmethod
+    def _shell_label(offset) -> str:
+        """Bond vector of a BCC neighbour shell in units of a, e.g. "1/2<111>" or "<100>", from
+        one offset in site units (a / 2)."""
+        v = np.sort(np.abs(np.asarray(offset)))[::-1]
+        if np.all(v % 2 == 0):
+            return "<" + "".join(str(int(x)) for x in v // 2) + ">"
+        return "1/2<" + "".join(str(int(x)) for x in v) + ">"
 
     def displacement_correlations(self, n_shells: int = 6) -> dict:
         """Displacement short-range order per neighbour shell.
@@ -2285,12 +2482,7 @@ class ReverseMonteCarlo(AutoSerialize):
         xc = self.site_x // self.refine
         out = dict(radius=[], shell=[], longitudinal=[], transverse=[])
         for offs in self._shells(n_shells):
-            v = np.sort(np.abs(offs[0]))[::-1]
-            out["shell"].append(
-                "<" + "".join(str(int(x)) for x in v // 2) + ">"
-                if np.all(v % 2 == 0)
-                else "1/2<" + "".join(str(int(x)) for x in v) + ">"
-            )
+            out["shell"].append(self._shell_label(offs[0]))
             rhat = offs / np.linalg.norm(offs, axis=1, keepdims=True)
             nb = np.stack([self._site_lookup[tuple(np.mod(xc + o, nc).T)] for o in offs], 1)
             ui = u[:, None, :]
