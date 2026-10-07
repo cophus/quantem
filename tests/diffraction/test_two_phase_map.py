@@ -88,9 +88,21 @@ def test_two_phase_map():
     err_a = misorientation_angle_deg(
         q_alpha, oms[0].quats[:, band[1] + 1 :, 0].reshape(-1, 4), ti_a.sym_quats
     ).numpy()
-    err_b = misorientation_angle_deg(
-        q_beta, oms[1].quats[:, : band[0], 0].reshape(-1, 4), ti_b.sym_quats
-    ).numpy()
+    # along [111], beta and its 60 degree twin about [111] give identical
+    # kinematical patterns, so either is a correct match; which one wins is
+    # decided by round-off and differs between platforms
+    q_beta_twin = qmult(
+        q_beta,
+        quat_from_axis_angle(
+            torch.tensor([1.0, 1.0, 1.0], dtype=torch.float64) / np.sqrt(3),
+            torch.tensor(np.pi / 3, dtype=torch.float64),
+        ),
+    )
+    q_found = oms[1].quats[:, : band[0], 0].reshape(-1, 4)
+    err_b = np.minimum(
+        misorientation_angle_deg(q_beta, q_found, ti_b.sym_quats).numpy(),
+        misorientation_angle_deg(q_beta_twin, q_found, ti_b.sym_quats).numpy(),
+    )
     assert np.median(err_a) < 1.0
     assert np.median(err_b) < 1.0
 
