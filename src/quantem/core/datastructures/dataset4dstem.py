@@ -291,7 +291,7 @@ class Dataset4dstem(Dataset4d):
 
     def fit_probe_circle(
         self,
-        array: NDArray | None = None,
+        array: NDArray | Dataset2d | None = None,
         threshold: float | None = None,
         show: bool = True,
     ) -> tuple[float, float, float]:
@@ -299,9 +299,9 @@ class Dataset4dstem(Dataset4d):
 
         Parameters
         ----------
-        array : NDArray | None, optional
-            2D diffraction pattern to fit. If None, uses this dataset's mean
-            diffraction pattern, computing it if needed.
+        array : NDArray | Dataset2d | None, optional
+            2D diffraction pattern to fit, either as an array or a Dataset2d. If
+            None, uses this dataset's mean diffraction pattern, computing it if needed.
         threshold : float | None, optional
             Threshold for binarizing the diffraction pattern. If None, Otsu's method
             is used.
@@ -319,9 +319,6 @@ class Dataset4dstem(Dataset4d):
                 self._dp_mean if hasattr(self, "_dp_mean") else self.get_dp_mean(attach=False)
             )
             array = dp_mean.array
-
-        if array.ndim != 2:
-            raise ValueError(f"Expected a 2D diffraction pattern, got shape {array.shape}.")
 
         return _fit_probe_circle(array, threshold=threshold, show=show)
 
