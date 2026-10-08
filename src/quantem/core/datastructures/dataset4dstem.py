@@ -10,6 +10,9 @@ from numpy.typing import NDArray
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4d import Dataset4d
 from quantem.core.datastructures.polar4dstem import dataset4dstem_polar_transform
+from quantem.core.utils.diffractive_imaging_utils import (
+    fit_probe_circle as _fit_probe_circle,
+)
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
@@ -285,6 +288,42 @@ class Dataset4dstem(Dataset4d):
             self._dp_mean = dp_mean_dataset
 
         return dp_mean_dataset
+
+    def fit_probe_circle(
+        self,
+        array: NDArray | None = None,
+        threshold: float | None = None,
+        show: bool = True,
+    ) -> tuple[float, float, float]:
+        """Fit a circle to the probe in a diffraction pattern.
+
+        Parameters
+        ----------
+        array : NDArray | None, optional
+            2D diffraction pattern to fit. If None, uses this dataset's mean
+            diffraction pattern, computing it if needed.
+        threshold : float | None, optional
+            Threshold for binarizing the diffraction pattern. If None, Otsu's method
+            is used.
+        show : bool, optional
+            Whether to display the fitted circle, by default True.
+
+        Returns
+        -------
+        tuple[float, float, float]
+            Probe center in diffraction-pattern row and column coordinates
+            (probe_qy0, probe_qx0), followed by the fitted radius.
+        """
+        if array is None:
+            dp_mean = (
+                self._dp_mean if hasattr(self, "_dp_mean") else self.get_dp_mean(attach=False)
+            )
+            array = dp_mean.array
+
+        if array.ndim != 2:
+            raise ValueError(f"Expected a 2D diffraction pattern, got shape {array.shape}.")
+
+        return _fit_probe_circle(array, threshold=threshold, show=show)
 
     @property
     def dp_max(self) -> Dataset2d:
