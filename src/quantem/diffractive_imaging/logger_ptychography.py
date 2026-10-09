@@ -36,13 +36,14 @@ class LoggerPtychography(LoggerBase):
     def object_image(self, volume_obj: ObjectModelType, iter: int, logger_cmap: str = "turbo"):
         """Log object images with object type-aware visualization (optimized)."""
         try:
-            obj = volume_obj.obj.cpu().detach().numpy()
             obj_type = volume_obj.obj_type
+            obj_tensor = volume_obj.phase if obj_type == "phase_amplitude" else volume_obj.obj
+            obj = obj_tensor.cpu().detach().numpy()
 
             # log z-sum only for speed
             obj_sum = np.sum(obj, axis=0)
 
-            if obj_type == "potential":
+            if obj_type in ("potential", "phase_amplitude"):
                 self.log_image(
                     tag="object/potential_zsum",
                     image=obj_sum,

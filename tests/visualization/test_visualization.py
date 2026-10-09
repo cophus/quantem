@@ -182,3 +182,43 @@ class TestShow2DMain:
     def test_show_2d_with_invalid_figax_shape(self, sample_arrays, mock_fig_ax):
         with pytest.raises(ValueError):
             show_2d(sample_arrays, figax=mock_fig_ax)
+
+
+class TestShow1D:
+    def test_single_array(self):
+        from quantem.core.visualization.visualization import show_1d
+
+        fig, ax = show_1d(np.arange(5.0), title="t", xlabel="x", ylabel="y")
+        assert isinstance(fig, Figure) and isinstance(ax, Axes)
+        assert len(ax.lines) == 1
+        assert ax.get_title() == "t" and ax.get_xlabel() == "x" and ax.get_ylabel() == "y"
+
+    def test_flat_sequence_overlays_with_legend(self):
+        from quantem.core.visualization.visualization import show_1d
+
+        x = np.linspace(0, 1, 4)
+        fig, ax = show_1d([x, 2 * x], x=x * 10, labels=["a", "b"], marker="o")
+        assert len(ax.lines) == 2
+        np.testing.assert_allclose(ax.lines[1].get_xdata(), x * 10)
+        assert [t.get_text() for t in ax.get_legend().get_texts()] == ["a", "b"]
+
+    def test_nested_sequence_makes_panels(self):
+        from quantem.core.visualization.visualization import show_1d
+
+        fig, axs = show_1d(
+            [[np.ones(3)], [np.ones(4), np.zeros(4)]],
+            x=[np.arange(3), np.arange(4)],
+            log_y=[False, True],
+            title=["p", "q"],
+        )
+        assert len(axs) == 2
+        assert len(axs[1].lines) == 2
+        assert axs[1].get_yscale() == "log"
+
+    def test_plain_list_and_length_mismatch(self):
+        from quantem.core.visualization.visualization import show_1d
+
+        fig, ax = show_1d([1.0, 2.0, 3.0])
+        assert len(ax.lines) == 1
+        with pytest.raises(ValueError):
+            show_1d(np.ones(3), x=np.arange(4))

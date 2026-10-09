@@ -656,3 +656,305 @@ def center_crop_arr(
 
     # Return the cropped array
     return arr[tuple(slices)]
+
+
+def split_counts(dset, fraction: float = 0.5, rng: np.random.Generator | int | None = None):
+    """
+    Split each recorded count between two datasets by binomial thinning.
+
+    Each detector count is assigned to the first dataset with probability ``fraction`` and to
+    the second otherwise. For Poisson-distributed counts the two datasets are independent
+    measurements of the same diffraction patterns at doses ``fraction`` and ``1 - fraction``,
+    so a reconstruction from one can be validated against the other at every probe position
+    and detector pixel. Thinning commutes with binning and cropping, and so it can be applied
+    before or after either. Detectors where one electron produces counts in neighboring pixels
+    give weakly correlated halves.
+
+    Parameters
+    ----------
+    dset : Dataset4dstem | np.ndarray
+        Integer counts.
+    fraction : float, optional
+        Probability that a count is assigned to the first dataset, by default 0.5.
+    rng : np.random.Generator | int | None, optional
+        Random generator or seed.
+
+    Returns
+    -------
+    tuple
+        ``(first, second)``, of the same type as ``dset``, with ``first + second == dset``.
+    """
+    if not 0 < fraction < 1:
+        raise ValueError(f"fraction must be between 0 and 1, got {fraction}")
+    rng = np.random.default_rng(rng)
+    array = np.asarray(dset.array if hasattr(dset, "array") else dset)
+    if not np.issubdtype(array.dtype, np.integer):
+        if not np.all(np.mod(array, 1) == 0):
+            raise ValueError("split_counts requires integer counts")
+        array = array.astype(np.int64)
+    first = np.empty_like(array)
+    for index in np.ndindex(array.shape[: max(array.ndim - 3, 1)]):
+        counts = np.maximum(array[index].astype(np.int64), 0)  # chunked for memory
+        first[index] = rng.binomial(counts, fraction)
+    second = array - first
+    if hasattr(dset, "array"):
+        return tuple(
+            type(dset).from_array(
+                array=half,
+                name=f"{dset.name} {label}",
+                origin=dset.origin,
+                sampling=dset.sampling,
+                units=dset.units,
+                signal_units=dset.signal_units,
+            )
+            for half, label in ((first, "split A"), (second, "split B"))
+        )
+    return first, second
+
+
+def refine_slices(
+    obj: np.ndarray, obj_type: Literal["potential", "pure_phase", "complex"]
+) -> np.ndarray:
+    """
+    Insert a slice midway between each pair of slices of a multislice object.
+
+    The new slices are linear interpolations of their neighbors along the beam direction,
+    giving ``2 * num_slices - 1`` slices at half the spacing. All slices are then rescaled so
+    that the sum over slices of every pixel, the projected potential or phase, is unchanged.
+    Complex transmission functions are interpolated as ``log(t)``, which assumes that the phase
+    of each slice is below pi.
+
+    Parameters
+    ----------
+    obj : np.ndarray
+        Object with shape ``(num_slices, H, W)``.
+    obj_type : {"potential", "pure_phase", "complex"}
+        Representation of ``obj``.
+
+    Returns
+    -------
+    np.ndarray
+        Object with shape ``(2 * num_slices - 1, H, W)``.
+    """
+
+    def _refine(field: np.ndarray) -> np.ndarray:
+        refined = np.empty((2 * field.shape[0] - 1, *field.shape[1:]), dtype=field.dtype)
+        refined[0::2] = field
+        refined[1::2] = 0.5 * (field[:-1] + field[1:])
+        total, total_refined = field.sum(0), refined.sum(0)
+        small = np.abs(total_refined) <= 1e-6 * max(np.abs(total_refined).max(), 1e-30)
+        ratio = np.where(small, 0.5, total / np.where(small, 1.0, total_refined))
+        return refined * ratio
+
+    if obj.shape[0] < 2:
+        raise ValueError("refine_slices requires at least two slices")
+    if obj_type == "complex":
+        log_amplitude = _refine(np.log(np.maximum(np.abs(obj), 1e-12)))
+        phase = _refine(np.angle(obj))
+        return np.exp(log_amplitude + 1j * phase).astype(obj.dtype)
+    return _refine(obj)
+
+
+def shear_slices(
+    obj: np.ndarray,
+    tilt_mrad: tuple[float, float],
+    slice_thicknesses: np.ndarray | float,
+    sampling: tuple[float, float],
+) -> np.ndarray:
+    """
+    Shift each slice of a multislice object laterally in proportion to its depth.
+
+    A crystal tilted by ``tilt_mrad`` relative to the reconstruction axis displaces its columns by
+    ``z * tan(tilt)`` at depth ``z``. Shifting each slice back by this amount, about the center of
+    the stack, aligns the columns so that the sum over slices is the projection along the
+    crystal axis. The correction is accurate when the slices are thin compared with the depth
+    over which a column moves by about one pixel.
+
+    Parameters
+    ----------
+    obj : np.ndarray
+        Real object with shape ``(num_slices, H, W)``, for example a potential or phase field.
+    tilt_mrad : tuple[float, float]
+        Tilt along rows and columns, in mrad.
+    slice_thicknesses : np.ndarray | float
+        Distances between consecutive slices in A.
+    sampling : tuple[float, float]
+        Real-space sampling in A.
+
+    Returns
+    -------
+    np.ndarray
+        Sheared object with the same shape as ``obj``.
+    """
+    num_slices = obj.shape[0]
+    thick = np.broadcast_to(np.asarray(slice_thicknesses, dtype=np.float64), (num_slices - 1,))
+    depth = np.concatenate([[0.0], np.cumsum(thick)])
+    depth -= depth.mean()
+    kr = np.fft.fftfreq(obj.shape[-2])[:, None]
+    kc = np.fft.fftfreq(obj.shape[-1])[None, :]
+    out = np.empty_like(obj)
+    for s in range(num_slices):
+        shift_r = depth[s] * np.tan(tilt_mrad[0] * 1e-3) / sampling[0]
+        shift_c = depth[s] * np.tan(tilt_mrad[1] * 1e-3) / sampling[1]
+        ramp = np.exp(2j * np.pi * (kr * shift_r + kc * shift_c))
+        out[s] = np.fft.ifft2(np.fft.fft2(obj[s]) * ramp).real
+    return out
+
+
+def estimate_tilt(
+    obj: np.ndarray,
+    slice_thicknesses: np.ndarray | float,
+    sampling: tuple[float, float],
+    max_tilt_mrad: float = 10.0,
+    num_steps: int = 21,
+) -> tuple[tuple[float, float], np.ndarray]:
+    """
+    Tilt that maximizes the variance of the projected object, from a grid search.
+
+    Columns that run through all slices give the sharpest projection when they are aligned, so
+    the projected variance peaks at the crystal tilt. The search uses ``shear_slices`` on a grid
+    of ``num_steps`` x ``num_steps`` tilts within ``max_tilt_mrad`` and refines on a grid twice
+    as fine around the best value.
+
+    Returns
+    -------
+    tilt_mrad : tuple[float, float]
+        Estimated tilt along rows and columns, in mrad.
+    scores : np.ndarray
+        Projected variance on the coarse grid.
+    """
+
+    thick = np.broadcast_to(np.asarray(slice_thicknesses, dtype=np.float64), (obj.shape[0] - 1,))
+    max_shift = thick.sum() / 2 * np.tan(max_tilt_mrad * 2e-3) / np.min(sampling)
+    m = int(np.ceil(max_shift)) + 2  # exclude the edges that the Fourier shifts wrap around
+
+    def score(tilt: tuple[float, float]) -> float:
+        projection = shear_slices(obj, tilt, slice_thicknesses, sampling).sum(0)
+        return float(projection[m:-m, m:-m].var())
+
+    grid = np.linspace(-max_tilt_mrad, max_tilt_mrad, num_steps)
+    scores = np.array([[score((tr, tc)) for tc in grid] for tr in grid])
+    ir, ic = np.unravel_index(np.argmax(scores), scores.shape)
+    step = grid[1] - grid[0]
+    fine = np.linspace(-step, step, 9)
+    best = max(
+        (
+            (score((grid[ir] + dr, grid[ic] + dc)), grid[ir] + dr, grid[ic] + dc)
+            for dr in fine
+            for dc in fine
+        )
+    )
+    return (float(best[1]), float(best[2])), scores
+
+
+def detector_noise_response(
+    dset,
+    bin_factor: int = 1,
+    inner_radius: float | None = None,
+    num_rows: int = 64,
+) -> dict:
+    """
+    Estimate the detector response to one electron from the shot noise in the counts.
+
+    Hybrid pixel detectors at high voltage register one electron as several counts spread over
+    neighboring pixels. Shot noise is then correlated between neighboring pixels, while the
+    diffraction signal hardly changes between neighboring scan positions. The covariance of
+    pixels within one pattern, minus the covariance between patterns at neighboring positions
+    along the fast scan axis, is the detector part alone. A symmetric 3x3 response is fitted to
+    it at nonzero lags in the dark field, where the counts are sparse. The summed covariance over the mean count
+    is the noise gain, the variance over the mean of counts summed over a large area. It equals
+    the counts per electron when every electron gives the same number of counts, and is larger
+    when that number varies.
+
+    Parameters
+    ----------
+    dset : Dataset4dstem | np.ndarray
+        Unbinned counts with shape ``(scan_rows, scan_cols, ky, kx)``.
+    bin_factor : int, optional
+        Detector binning used for the reconstruction, by default 1. The returned ``psf`` is on
+        the binned grid.
+    inner_radius : float | None, optional
+        Inner radius of the dark-field annulus in pixels. ``None`` uses 1.25 times the radius
+        of the bright-field disk.
+    num_rows : int, optional
+        Number of scan rows used, evenly spaced, by default 64.
+
+    Returns
+    -------
+    dict
+        ``psf``: detector point spread on the binned grid, summing to one, for
+        ``DetectorPixelated(psf=...)``. ``response``: the unbinned response with its center set
+        to one. ``noise_gain``: variance over mean of large-area count sums (1 for Poisson
+        counts).
+        ``correlation``: measured detector noise correlation (5x5 lags).
+    """
+    from scipy.optimize import least_squares
+    from scipy.signal import correlate2d
+
+    array = np.asarray(dset.array if hasattr(dset, "array") else dset)
+    rows = np.linspace(0, array.shape[0] - 1, min(num_rows, array.shape[0])).astype(int)
+    cols = np.arange(0, array.shape[1] - 1, 3)
+    first = array[rows][:, cols].reshape(-1, *array.shape[-2:]).astype(np.float64)
+    second = array[rows][:, cols + 1].reshape(-1, *array.shape[-2:]).astype(np.float64)
+    mean = 0.5 * (first.mean(0) + second.mean(0))
+
+    bright = mean > 0.5 * mean.max()
+    ky, kx = np.indices(mean.shape)
+    center = (ky[bright].mean(), kx[bright].mean())
+    if inner_radius is None:
+        inner_radius = 1.25 * np.sqrt(bright.sum() / np.pi)
+    radius = np.hypot(ky - center[0], kx - center[1])
+    region = radius > inner_radius
+    region[:3] = region[-3:] = False
+    region[:, :3] = region[:, -3:] = False
+    if region.sum() < 100:
+        raise ValueError("too few dark-field pixels; lower inner_radius")
+
+    d1, d2 = first - mean, second - mean
+    lags = np.zeros((5, 5))
+    for dy in range(-2, 3):
+        for dx in range(-2, 3):
+            both = region & np.roll(region, (-dy, -dx), (0, 1))
+
+            def shifted(x):
+                return np.roll(x, (-dy, -dx), (1, 2))
+
+            same = 0.5 * ((d1 * shifted(d1))[:, both].mean() + (d2 * shifted(d2))[:, both].mean())
+            cross = 0.5 * ((d1 * shifted(d2))[:, both].mean() + (d2 * shifted(d1))[:, both].mean())
+            lags[dy + 2, dx + 2] = same - cross
+    correlation = lags / lags[2, 2]
+
+    def kernel(p):
+        a, b = np.abs(p)  # nearest and diagonal neighbors
+        return np.array([[b, a, b], [a, 1, a], [b, a, b]])
+
+    off_center = np.ones((5, 5), dtype=bool)
+    off_center[2, 2] = False
+
+    def residual(p):
+        # the zero lag also holds the spread in counts per electron, so it is left out
+        h = kernel(p[1:])
+        auto = correlate2d(h, h, mode="full")
+        return (np.abs(p[0]) * auto - correlation)[off_center]
+
+    response = np.pad(kernel(least_squares(residual, [0.5, 0.1, 0.03]).x[1:]), 1)
+
+    # average the binned response over the landing positions of an electron inside one bin
+    b = int(bin_factor)
+    half = 2 // b + 1
+    size = 2 * half + 1
+    psf = np.zeros((size, size))
+    for oy in range(b):
+        for ox in range(b):
+            canvas = np.zeros((size * b, size * b))
+            y0, x0 = half * b + oy - 2, half * b + ox - 2
+            canvas[y0 : y0 + 5, x0 : x0 + 5] = response
+            psf += canvas.reshape(size, b, size, b).sum((1, 3))
+    psf /= psf.sum()
+
+    return {
+        "psf": psf,
+        "response": response,
+        "noise_gain": float(lags.sum() / mean[region].mean()),
+        "correlation": correlation,
+    }

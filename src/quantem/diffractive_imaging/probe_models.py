@@ -74,15 +74,21 @@ class PtychoProbeConstraintParams:
         Attributes
         ----------
         orthogonalize_probe : bool, default ``True``
-            Mixed-state probe (``num_probes > 1``) only. After each update applies
-            Gram-Schmidt orthogonalization across the probe stack and then sorts
-            the resulting probes by total intensity (descending). For
-            ``num_probes == 1`` this is effectively a renormalization no-op.
+            Mixed-state probe (``num_probes > 1``) only. Rotates the probe modes onto
+            the eigenvectors of their density matrix, sorted by occupation
+            (descending). The rotation leaves the predicted intensities unchanged,
+            and the mode intensities are then the occupations. No-op for
+            ``num_probes == 1``.
         center_probe : bool, default ``False``
             Shifts the probe's intensity center-of-mass back to the array center
             via a Fourier shift after each update. Useful when probe drift
             competes with scan-position refinement; if both move freely the
             reconstruction can wander while still fitting the diffraction data.
+        fourier_support_mrad : float | None, default ``None``
+            Limits every probe mode to scattering angles below this value (in mrad),
+            with a soft edge one pixel wide. The probe is formed by the condenser
+            aperture, so a support slightly larger than the semiangle keeps the modes
+            physical; ``None`` disables.
         tv_weight : float, default ``0.0``
             Soft penalty. Weight on the in-plane total-variation of the (complex)
             probe; encourages smooth probe magnitude / phase.
@@ -91,12 +97,13 @@ class PtychoProbeConstraintParams:
         # hard constraints
         orthogonalize_probe: bool = True
         center_probe: bool = False
+        fourier_support_mrad: float | None = None
         # soft constraints
         tv_weight: float = 0.0
         _name: str = "raster"
 
         soft_constraint_keys = ["tv_weight"]
-        hard_constraint_keys = ["orthogonalize_probe", "center_probe"]
+        hard_constraint_keys = ["orthogonalize_probe", "center_probe", "fourier_support_mrad"]
 
     @dataclass
     class Parametric(Constraints):
@@ -182,11 +189,31 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
             self.roi_shape = roi_shape
 
     def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
-        """Get the parameters that should be optimized for this model, keyed by group."""
+        """Get the parameters that should be optimized for this model, keyed by group. A learned
+        probe tilt (in mrad) is its own ``"tilt"`` group, so it can take its own learning rate."""
         params = self.params
         if params is None:
             return {}
-        return {self.DEFAULT_OPTIMIZER_KEY: list(params)}
+        groups = {
+            self.DEFAULT_OPTIMIZER_KEY: [p for p in params if p is not self._probe_tilt],
+        }
+        if self.learn_probe_tilt:
+            groups["tilt"] = [self._probe_tilt]
+        return {key: value for key, value in groups.items() if value}
+
+    def set_optimizer(self, opt_params: "OptimizerParamsType | dict | None" = None) -> None:
+        """Set the optimizer, adding or dropping the ``"tilt"`` group to match
+        ``learn_probe_tilt``. A missing group reuses the probe optimizer settings."""
+        if opt_params is not None:
+            self.optimizer_params = opt_params
+        specs = dict(self.optimizer_params)
+        if self.learn_probe_tilt and "tilt" not in specs:
+            if self.DEFAULT_OPTIMIZER_KEY in specs:
+                specs["tilt"] = deepcopy(specs[self.DEFAULT_OPTIMIZER_KEY])
+        elif not self.learn_probe_tilt:
+            specs.pop("tilt", None)
+        self._optimizer_params = specs
+        super().set_optimizer()
 
     @property
     def learn_probe_tilt(self) -> bool:
@@ -494,13 +521,16 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         wavelength = electron_wavelength_angstrom(probe_energy)
 
         theta_r, theta_c = self.probe_tilt
-        dz = torch.tensor(slice_thicknesses, device=self.device, dtype=k2.dtype)  # (T,)
+        if isinstance(slice_thicknesses, torch.Tensor):  # keeps the graph if thickness is learned
+            dz = slice_thicknesses.to(device=self.device, dtype=k2.dtype)  # (T,)
+        else:
+            dz = torch.tensor(slice_thicknesses, device=self.device, dtype=k2.dtype)  # (T,)
         phase_factor = -1.0j * torch.pi * wavelength * dz[:, None, None]  # (T,1,1)
         propagators = torch.exp(phase_factor * k2)  # (T, Sr, Sc)
-        if theta_r != 0:
+        if self.learn_probe_tilt or theta_r != 0:
             kr_term = 1.0j * (-2 * torch.pi * dz[:, None, None] * torch.tan(theta_r / 1e3))
             propagators = propagators * torch.exp(kr_term * kr[None, :, None])
-        if theta_c != 0:
+        if self.learn_probe_tilt or theta_c != 0:
             kc_term = 1.0j * (-2 * torch.pi * dz[:, None, None] * torch.tan(theta_c / 1e3))
             propagators = propagators * torch.exp(kc_term * kc[None, None, :])
 
@@ -509,6 +539,11 @@ class ProbeBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
 
 class ProbeConstraints(BaseConstraints[PtychoProbeConstraintParams.Raster], ProbeBase):
     DEFAULT_CONSTRAINTS: PtychoProbeConstraintParams.Raster = PtychoProbeConstraintParams.Raster()
+
+    @property
+    def has_soft_constraints(self) -> bool:
+        """True when a soft penalty is active, so the full probe must be evaluated each batch."""
+        return bool(self.constraints.tv_weight)
 
     def apply_soft_constraints(self, probe: torch.Tensor) -> torch.Tensor:
         self.reset_soft_constraint_losses()
@@ -522,11 +557,32 @@ class ProbeConstraints(BaseConstraints[PtychoProbeConstraintParams.Raster], Prob
         return loss
 
     def apply_hard_constraints(self, probe: torch.Tensor) -> torch.Tensor:
+        if self.constraints.fourier_support_mrad is not None:
+            probe = self._probe_fourier_support_constraint(
+                probe, self.constraints.fourier_support_mrad
+            )
         if self.constraints.orthogonalize_probe:
             probe = self._probe_orthogonalization_constraint(probe)
         if self.constraints.center_probe:
             probe = self._probe_center_of_mass_constraint(probe)
         return probe
+
+    def _probe_fourier_support_constraint(
+        self, probe: torch.Tensor, support_mrad: float
+    ) -> torch.Tensor:
+        """Multiply each mode in reciprocal space by a soft-edged disk of radius support_mrad."""
+        energy = self.probe_params["energy"]
+        if energy is None:
+            raise ValueError("fourier_support_mrad requires the probe energy")
+        wavelength = electron_wavelength_angstrom(energy)
+        shape = tuple(int(s) for s in probe.shape[-2:])
+        sampling = np.asarray(self.reciprocal_sampling, dtype=np.float64)
+        kr = torch.fft.fftfreq(shape[0], d=1 / (shape[0] * sampling[0]), device=probe.device)
+        kc = torch.fft.fftfreq(shape[1], d=1 / (shape[1] * sampling[1]), device=probe.device)
+        alpha = torch.sqrt(kr[:, None] ** 2 + kc[None, :] ** 2) * wavelength * 1e3  # mrad
+        pixel_mrad = float(sampling.min() * wavelength * 1e3)
+        mask = torch.clamp((support_mrad - alpha) / pixel_mrad + 0.5, 0.0, 1.0)
+        return torch.fft.ifft2(torch.fft.fft2(probe) * mask.to(probe.real.dtype))
 
     def _probe_tv_constraint(self, probe: torch.Tensor, weight: float) -> torch.Tensor:
         tv = self._get_zero_loss_tensor()
@@ -552,47 +608,36 @@ class ProbeConstraints(BaseConstraints[PtychoProbeConstraintParams.Raster], Prob
         return fourier_shift_expand(start_probe, -probe_int_com, expand_dim=False)
 
     def _probe_orthogonalization_constraint(self, start_probe: torch.Tensor) -> torch.Tensor:
-        ### this is not very efficient with Adam, should find a better way
-        n_probes = start_probe.shape[0]
-        orthogonal_probes = []
-        # Equivalent to torch.norm(..., dim=(-2,-1), keepdim=True)
-        # original_norms = torch.norm(start_probe, dim=(-2, -1), keepdim=True)
-        original_norms = torch.sqrt(
-            torch.sum(
-                start_probe.real.square() + start_probe.imag.square(), dim=(-2, -1), keepdim=True
-            )
-        )
+        """
+        Rotate the probe modes onto the eigenvectors of their density matrix.
 
-        # Apply Gram-Schmidt process
-        for i in range(n_probes):
-            probe_i = start_probe[i]
+        The mixed-state forward model depends on the modes only through the density matrix
+        ``sum_m |psi_m><psi_m|``, which any unitary mixing of the modes leaves unchanged. This
+        constraint applies the mixing that makes the modes orthogonal and sorts them by
+        occupation, so it changes neither the predicted intensities nor their gradients, and
+        the mode intensities returned by ``get_probe_intensities`` are the occupations of the
+        density matrix.
+        """
+        if start_probe.shape[0] < 2:
+            return start_probe
+        rotation = self._orthogonalization_rotation(start_probe)
+        flat = start_probe.reshape(start_probe.shape[0], -1)
+        orthogonal = rotation.conj().T @ flat
+        return orthogonal.reshape(start_probe.shape)
 
-            # Subtract projections onto previously computed orthogonal probes
-            for j in range(len(orthogonal_probes)):
-                projection = (
-                    torch.sum(orthogonal_probes[j].conj() * probe_i) * orthogonal_probes[j]
-                )
-                probe_i = probe_i - projection
-
-            # norm = torch.norm(probe_i)
-            norm = torch.sqrt(torch.sum(probe_i.real.square() + probe_i.imag.square())).clamp_min(
-                1e-12
-            )
-            orthogonal_probes.append(probe_i / norm)
-
-        orthogonal_probes = torch.stack(orthogonal_probes)
-        orthogonal_probes = orthogonal_probes * original_norms.view(-1, 1, 1)
-
-        # Sort probes by real-space intensity
-        intensities = torch.sum(torch.abs(orthogonal_probes).square(), dim=(-2, -1))
-        intensities_order = torch.argsort(intensities, descending=True)
-
-        # MPS-safe fancy indexing
-        real_sorted = orthogonal_probes.real[intensities_order]
-        imag_sorted = orthogonal_probes.imag[intensities_order]
-        orthogonal_probes_sorted = torch.complex(real_sorted, imag_sorted)
-
-        return orthogonal_probes_sorted
+    @staticmethod
+    def _orthogonalization_rotation(probe: torch.Tensor) -> torch.Tensor:
+        """
+        Unitary matrix U whose columns are the eigenvectors of the mode overlap matrix, sorted
+        by decreasing eigenvalue, so that ``U^H @ probe`` gives orthogonal modes. U is detached;
+        the small eigenproblem is solved on the CPU in double precision.
+        """
+        with torch.no_grad():
+            flat = probe.reshape(probe.shape[0], -1)
+            overlap = (flat @ flat.conj().T).cpu().to(torch.complex128)
+            _, eigenvectors = torch.linalg.eigh(overlap)
+            eigenvectors = eigenvectors.flip(-1)  # descending occupation
+        return eigenvectors.to(device=probe.device, dtype=probe.dtype)
 
 
 class ProbePixelated(ProbeConstraints):
@@ -800,6 +845,9 @@ class ProbePixelated(ProbeConstraints):
             probes = torch.cat([probes] * self.num_probes, dim=0)
 
         probes = self._apply_random_phase_shifts(probes)
+        if self.num_probes > 1 and self.constraints.orthogonalize_probe:
+            # the shifted copies become orthogonal modes, then the weights set their occupations
+            probes = self._probe_orthogonalization_constraint(self._to_torch(probes))
         probes = self._apply_weights(probes)
 
         self._initial_probe = self._to_torch(probes)
@@ -840,6 +888,12 @@ class ProbePixelated(ProbeConstraints):
             )  # (batch, *roi_shape), broadcast over the probe modes
             propagated_gradient = torch.fft.ifft2(torch.fft.fft2(propagated_gradient) * ramp)
         probe_grad = torch.sum(propagated_gradient, dim=1)
+        if self.constraints.orthogonalize_probe and self.num_probes > 1:
+            # the forward used U^H @ probe, so the gradient with respect to probe is U @ grad
+            rotation = self._orthogonalization_rotation(self._probe)
+            probe_grad = (rotation @ probe_grad.reshape(self.num_probes, -1)).reshape(
+                probe_grad.shape
+            )
         if step_scale is not None:
             normalization = torch.sum(torch.abs(obj_patches[0]) ** 2, dim=0).max()
             probe_grad = probe_grad * (step_scale / normalization)
@@ -1342,7 +1396,7 @@ class ProbeDIP(ProbeConstraints):
 
     def forward(self, fract_positions: torch.Tensor) -> torch.Tensor:
         """Get shifted probes at fractional positions"""
-        probe = self.model(self._noisy_model_input())[0]
+        probe = self.apply_hard_constraints(self.model(self._noisy_model_input())[0])
         shifted_probes = fourier_shift_expand(probe, fract_positions).swapaxes(0, 1)
         return shifted_probes
 

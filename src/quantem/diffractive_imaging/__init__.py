@@ -51,3 +51,11 @@ from quantem.diffractive_imaging.direct_ptycho_utils import (
 from quantem.diffractive_imaging.origin_models import (
     CenterOfMassOriginModel as CenterOfMassOriginModel,
 )
+
+from quantem.diffractive_imaging.ptycho_utils import (
+    detector_noise_response as detector_noise_response,
+    estimate_tilt as estimate_tilt,
+    refine_slices as refine_slices,
+    shear_slices as shear_slices,
+    split_counts as split_counts,
+)

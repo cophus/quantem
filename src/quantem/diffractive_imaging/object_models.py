@@ -34,7 +34,7 @@ from quantem.core.visualization import show_2d
 from quantem.core.visualization.custom_normalizations import CustomNormalization
 from quantem.diffractive_imaging.ptycho_utils import add_input_noise, sum_patches
 
-object_type = Literal["potential", "pure_phase", "complex"]
+object_type = Literal["potential", "pure_phase", "complex", "phase_amplitude"]
 
 
 class PtychoObjConstraintParams:
@@ -254,6 +254,16 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         self.device = device
         self._obj_type = obj_type
         self._sampling = None
+        # log of a common scale factor on all slice thicknesses, learned when
+        # learn_slice_thickness is True
+        self._log_slice_thickness_scale = nn.Parameter(
+            torch.zeros((), dtype=getattr(torch, config.get("dtype_real"))), requires_grad=False
+        )
+        # ratio of the absorptive to the real potential of a real-valued object
+        self._absorption = nn.Parameter(
+            torch.zeros((), dtype=getattr(torch, config.get("dtype_real"))), requires_grad=False
+        )
+        self._initial_absorption = 0.0
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -327,21 +337,32 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
             return "pure_phase"
         elif t_str in ["complex"]:
             return "complex"
+        elif t_str in ["phase_amplitude", "phase amplitude", "phase_amp"]:
+            return "phase_amplitude"
         else:
             raise ValueError(
-                f"Object type should be 'potential', 'complex', or 'pure_phase', got {obj_type}"
+                "Object type should be 'potential', 'complex', 'pure_phase', or 'phase_amplitude', "
+                f"got {obj_type}"
             )
 
     @property
     def slice_thicknesses(self) -> torch.Tensor | None:
-        return self._slice_thicknesses
+        """Distances between consecutive slices in A, including the learned scale factor."""
+        scale = getattr(self, "_log_slice_thickness_scale", None)
+        if scale is None or self._slice_thicknesses.numel() == 0:
+            return self._slice_thicknesses
+        if not self.learn_slice_thickness and scale.item() == 0.0:
+            return self._slice_thicknesses
+        return self._slice_thicknesses * torch.exp(scale.to(self._slice_thicknesses.device))
 
     @slice_thicknesses.setter
     def slice_thicknesses(self, val: float | Sequence | torch.Tensor | np.ndarray | None) -> None:
         if val is None:
             thicknesses = []
-        elif isinstance(val, (float, int)):
-            thicknesses = [val]
+        elif isinstance(val, (float, int, np.floating, np.integer)):
+            thicknesses = [float(val)]
+        elif isinstance(val, torch.Tensor):
+            thicknesses = val.detach().reshape(-1)
         else:
             thicknesses = val
 
@@ -368,6 +389,120 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
 
         dt = getattr(torch, config.get("dtype_real"))
         self._slice_thicknesses = thicknesses.type(dt).to(self.device)
+        if hasattr(self, "_log_slice_thickness_scale"):
+            self._log_slice_thickness_scale.data.zero_()
+
+    @property
+    def learn_slice_thickness(self) -> bool:
+        """
+        Learn a common scale factor on all slice thicknesses.
+
+        The propagators are differentiable with respect to the slice spacing, so the total
+        specimen thickness is fitted together with the object and probe. The factor is stored as
+        a log, which keeps the thicknesses positive, and is optimized as the ``"slice_thickness"``
+        parameter group.
+        """
+        return getattr(self, "_learn_slice_thickness", False)
+
+    @learn_slice_thickness.setter
+    def learn_slice_thickness(self, learn: bool) -> None:
+        learn = bool(learn)
+        if learn and self.is_implicit:
+            raise NotImplementedError(
+                "learn_slice_thickness is not supported for implicit objects"
+            )
+        if learn and self.num_slices < 2:
+            raise ValueError("learn_slice_thickness requires num_slices > 1")
+        self._learn_slice_thickness = learn
+        self._log_slice_thickness_scale.requires_grad_(learn)
+
+    def _reset_slice_thickness_scale(self) -> None:
+        if hasattr(self, "_log_slice_thickness_scale"):
+            self._log_slice_thickness_scale.data.zero_()
+        if hasattr(self, "_absorption"):
+            self._absorption.data.fill_(getattr(self, "_initial_absorption", 0.0))
+
+    @property
+    def absorption(self) -> float:
+        """
+        Ratio of the absorptive to the real potential, for ``potential`` and ``pure_phase``
+        objects.
+
+        Each slice transmits ``exp(1j * V - absorption * (V - <V>))``, so the amplitude drops
+        where the phase rises. This is the proportional absorptive potential commonly used for
+        thermal diffuse scattering, which removes electrons from the coherent wave mostly near
+        the atomic cores. The slice mean ``<V>`` is subtracted because a uniform attenuation
+        cannot be separated from the probe intensity. Values of 0.05 to 0.2 give amplitudes of
+        about 0.8 on heavy columns of a thick crystal. Zero (default) gives a pure phase object.
+        """
+        return float(self._absorption.detach().cpu())
+
+    @absorption.setter
+    def absorption(self, value: float) -> None:
+        value = float(value)
+        if value < 0:
+            raise ValueError(f"absorption must be non-negative, got {value}")
+        if value > 0 and self.obj_type not in ("potential", "pure_phase"):
+            raise ValueError(
+                f"absorption requires a potential or pure_phase object, got {self.obj_type}"
+            )
+        self._initial_absorption = value
+        self._absorption.data.fill_(value)
+
+    @property
+    def learn_absorption(self) -> bool:
+        """
+        Learn ``absorption``, a single ratio of the absorptive to the real potential, as the
+        ``"absorption"`` parameter group.
+        """
+        return getattr(self, "_learn_absorption", False)
+
+    @learn_absorption.setter
+    def learn_absorption(self, learn: bool) -> None:
+        learn = bool(learn)
+        if learn and self.obj_type not in ("potential", "pure_phase"):
+            raise ValueError(
+                f"learn_absorption requires a potential or pure_phase object, got {self.obj_type}"
+            )
+        self._learn_absorption = learn
+        self._absorption.requires_grad_(learn)
+
+    @property
+    def relative_absorption(self) -> bool:
+        """
+        Measure the absorptive potential from the slice mean (True, default) or from zero.
+
+        With True, each slice transmits ``exp(-absorption * (V - <V>))`` in amplitude, which
+        keeps the total intensity but raises the amplitude where ``V`` is below the mean. With
+        False it transmits ``exp(-absorption * max(V, 0))``, which only removes electrons; use it
+        with ``dset.background_from_absorption`` so the removed electrons are still counted.
+        """
+        return getattr(self, "_relative_absorption", True)
+
+    @relative_absorption.setter
+    def relative_absorption(self, value: bool) -> None:
+        self._relative_absorption = bool(value)
+
+    @property
+    def _has_absorption(self) -> bool:
+        return self.learn_absorption or self._absorption.item() != 0.0
+
+    def _log_amplitude(self, potential: torch.Tensor) -> torch.Tensor:
+        """Log transmission amplitude of each slice, see ``absorption`` and ``relative_absorption``.
+
+        In the relative form the mean ``<V>`` of each slice is detached, so a uniform
+        attenuation, which only rescales the probe intensity, is removed in the same way as the
+        arbitrary phase offset.
+        """
+        kappa = self._absorption.clamp(min=0).to(potential.dtype)
+        if not self.relative_absorption:
+            return -kappa * potential.clamp(min=0)
+        reference = potential.detach().mean(dim=(-2, -1), keepdim=True)
+        return -kappa * (potential - reference)
+
+    def soft_constraint_obj(self) -> torch.Tensor:
+        """Object on which the soft constraints are evaluated, see ``ObjectDIP``."""
+        return self.obj
 
     @property
     def mask(self) -> torch.Tensor:
@@ -442,9 +577,31 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
     def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
         """Get the parameters that should be optimized for this model, keyed by group."""
         params = self.params
-        if params is None:
-            return {}
-        return {self.DEFAULT_OPTIMIZER_KEY: list(params)}
+        groups = {} if params is None else {self.DEFAULT_OPTIMIZER_KEY: list(params)}
+        if self.learn_slice_thickness:
+            groups["slice_thickness"] = [self._log_slice_thickness_scale]
+        if self.learn_absorption:
+            groups["absorption"] = [self._absorption]
+        return groups
+
+    def set_optimizer(self, opt_params: "OptimizerParamsType | dict | None" = None) -> None:
+        """Set the optimizer, adding or dropping the ``"slice_thickness"`` and ``"absorption"``
+        groups to match ``learn_slice_thickness`` and ``learn_absorption``. A missing group
+        reuses the object optimizer settings."""
+        if opt_params is not None:
+            self.optimizer_params = opt_params
+        specs = dict(self.optimizer_params)
+        for key, learn in (
+            ("slice_thickness", self.learn_slice_thickness),
+            ("absorption", self.learn_absorption),
+        ):
+            if learn and key not in specs:
+                if self.DEFAULT_OPTIMIZER_KEY in specs:
+                    specs[key] = deepcopy(specs[self.DEFAULT_OPTIMIZER_KEY])
+            elif not learn:
+                specs.pop(key, None)
+        self._optimizer_params = specs
+        super().set_optimizer()
 
     def _propagate_array(
         self, array: "torch.Tensor", propagator_array: "torch.Tensor"
@@ -463,7 +620,10 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
         2D padded object.
         """
         if not obj_array.is_complex():  # potential or pure_phase DIP -> float
-            obj_array2 = torch.exp(1.0j * obj_array)
+            if self._has_absorption:
+                obj_array2 = torch.exp(torch.complex(self._log_amplitude(obj_array), obj_array))
+            else:
+                obj_array2 = torch.exp(1.0j * obj_array)
         else:
             obj_array2 = obj_array
         obj_flat = obj_array2.reshape(obj_array.shape[0], -1)
@@ -486,6 +646,12 @@ class ObjectBase(nn.Module, RNGMixin, OptimizerMixin, AutoSerialize):
 class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], ObjectBase):
     DEFAULT_CONSTRAINTS: PtychoObjConstraintParams.Raster = PtychoObjConstraintParams.Raster()
 
+    @property
+    def has_soft_constraints(self) -> bool:
+        """True when a soft penalty is active, so the full object must be evaluated each batch."""
+        c = self.constraints
+        return bool(c.tv_weight_z or c.tv_weight_xy or c.surface_zero_weight)
+
     def apply_hard_constraints(
         self, raw: torch.Tensor, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
@@ -499,6 +665,8 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         the rotated object and turn every update by the gauge angle.
         """
         c = self.constraints
+        if self.obj_type == "phase_amplitude":
+            return self._apply_hard_phase_amplitude(raw, c, mask)
         if self.obj_type == "complex":
             raw = raw * self.gauge_phasor(raw).conj()
         with torch.no_grad():
@@ -510,6 +678,57 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
                 constrained = self._apply_hard_potential(raw, c, mask)
             constrained = self._apply_shared_hard(constrained, c, mask)
         return raw + (constrained - raw).detach()
+
+    def _apply_hard_phase_amplitude(
+        self,
+        raw: torch.Tensor,
+        c: PtychoObjConstraintParams.Raster,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Constraints on the stacked ``(2 * num_slices, H, W)`` phase and amplitude fields.
+
+        The phase follows the ``potential`` constraints (positivity, baseline), the amplitude is
+        clamped to ``[0, 1]``, and the shared constraints (FOV mask, filters, identical slices)
+        act on the phase and on ``1 - amplitude``, so both relax toward vacuum.
+        """
+        with torch.no_grad():
+            phase, amplitude = self.split_fields(raw)
+            phase = self._apply_shared_hard(self._apply_hard_potential(phase, c, mask), c, mask)
+            absorption = self._apply_shared_hard(1 - torch.clamp(amplitude, 0.0, 1.0), c, mask)
+            constrained = torch.cat([phase, 1 - torch.clamp(absorption, 0.0, 1.0)])
+        return raw + (constrained - raw).detach()
+
+    @staticmethod
+    def split_fields(fields: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Split stacked ``(2 * num_slices, H, W)`` fields into phase and amplitude."""
+        num = fields.shape[0] // 2
+        return fields[:num], fields[num:]
+
+    def combine_fields(
+        self, fields: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Complex transmission ``amplitude * exp(i * phase)`` from stacked phase and amplitude
+        fields. Outside a FOV mask the transmission relaxes to vacuum."""
+        phase, amplitude = self.split_fields(fields)
+        if mask is not None and mask.numel() > 0:
+            phase = phase * mask
+            amplitude = 1 + (amplitude - 1) * mask
+        return amplitude * torch.exp(1.0j * phase)
+
+    @property
+    def phase(self) -> torch.Tensor:
+        """Phase field ``(num_slices, H, W)`` of a ``phase_amplitude`` object, constrained."""
+        return self.split_fields(self.fields)[0]
+
+    @property
+    def amplitude(self) -> torch.Tensor:
+        """Amplitude field ``(num_slices, H, W)`` of a ``phase_amplitude`` object, constrained."""
+        return self.split_fields(self.fields)[1]
+
+    @property
+    def fields(self) -> torch.Tensor:
+        """Stacked, constrained ``(2 * num_slices, H, W)`` phase and amplitude fields."""
+        raise NotImplementedError(f"{type(self).__name__} has no phase and amplitude fields")
 
     @staticmethod
     def gauge_phasor(obj: torch.Tensor) -> torch.Tensor:
@@ -608,6 +827,26 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
         """
         # reset recorded losses each call
         self.reset_soft_constraint_losses()
+
+        if self.obj_type == "phase_amplitude":
+            c = self.constraints
+            if not (c.tv_weight_z or c.tv_weight_xy or c.surface_zero_weight):
+                return self._get_zero_loss_tensor()
+            phase, amplitude = self.split_fields(self.fields)
+            w = self._resolve_tv_weights(None)
+            tv_loss = self._calc_tv_loss(phase, w) + self._calc_tv_loss(amplitude, w)
+            surface_zero_loss = self._get_zero_loss_tensor()
+            if c.surface_zero_weight and phase.shape[0] >= 3:
+                surface_zero_loss = c.surface_zero_weight * (
+                    phase[0].abs().mean()
+                    + phase[-1].abs().mean()
+                    + (1 - amplitude[0]).mean()
+                    + (1 - amplitude[-1]).mean()
+                )
+            self.add_soft_constraint_loss("tv_loss", tv_loss)
+            self.add_soft_constraint_loss("surface_zero_loss", surface_zero_loss)
+            self.accumulate_constraint_losses()
+            return tv_loss + surface_zero_loss
 
         tv_loss = self.get_tv_loss(obj)
         self.add_soft_constraint_loss("tv_loss", tv_loss)
@@ -858,6 +1097,9 @@ class ObjectPixelated(ObjectConstraints):
         )
         self._initialize_mode = initialize_mode
         self._obj = nn.Parameter(torch.ones(num_slices, 1, 1), requires_grad=True)
+        if self.obj_type == "phase_amplitude":
+            # amplitude field stored next to the phase field in _obj
+            self._amplitude = nn.Parameter(torch.ones(num_slices, 1, 1), requires_grad=True)
         self.slice_thicknesses = slice_thicknesses
 
     @classmethod
@@ -933,7 +1175,13 @@ class ObjectPixelated(ObjectConstraints):
             _token=cls._token,
         )
         initial = torch.as_tensor(initial_obj)
-        if initial.is_complex() and obj_type != "complex":
+        if obj_type == "phase_amplitude":
+            if initial.is_complex():
+                obj_model._initial_amplitude = initial.abs().to(torch.float32)
+                initial = initial.angle()
+            else:
+                obj_model._initial_amplitude = torch.ones_like(initial, dtype=torch.float32)
+        elif initial.is_complex() and obj_type != "complex":
             if obj_type == "pure_phase":
                 # Convert legacy complex initial_obj (amp*exp(1j*phase)) to bare phase
                 initial = initial.angle()
@@ -947,7 +1195,15 @@ class ObjectPixelated(ObjectConstraints):
 
     @property
     def obj(self):
+        if self.obj_type == "phase_amplitude":
+            return self.combine_fields(self.fields)
         return self.apply_hard_constraints(self._obj, mask=self.mask)
+
+    @property
+    def fields(self) -> torch.Tensor:
+        if self.obj_type != "phase_amplitude":
+            return super().fields
+        return self.apply_hard_constraints(torch.cat([self._obj, self._amplitude]), mask=self.mask)
 
     @property
     def num_slices(self) -> int:
@@ -956,6 +1212,8 @@ class ObjectPixelated(ObjectConstraints):
     @property
     def params(self) -> list[nn.Parameter]:
         """optimization parameters"""
+        if self.obj_type == "phase_amplitude":
+            return [self._obj, self._amplitude]
         return [self._obj]
 
     def project_parameters(self) -> None:
@@ -970,7 +1228,11 @@ class ObjectPixelated(ObjectConstraints):
         multislice), and the offset shrinks with the background so it self-limits at zero.
         """
         c = self.constraints
-        if not (self.obj_type == "potential" and c.positivity and c.positivity_mode == "shrink"):
+        if not (
+            self.obj_type in ("potential", "phase_amplitude")
+            and c.positivity
+            and c.positivity_mode == "shrink"
+        ):
             return
         with torch.no_grad():
             bg = self._per_slice_background(self._obj, self.mask)
@@ -997,9 +1259,11 @@ class ObjectPixelated(ObjectConstraints):
         sampling: tuple[float, float] | np.ndarray | None = None,
     ) -> None:
         super()._initialize_obj(shape, sampling)
-        if self.obj.numel() > self.num_slices and np.array_equal(self.shape, shape):
+        if self._obj.numel() > self.num_slices and np.array_equal(self._obj.shape, shape):
             return
         init_shape = tuple(int(x) for x in shape)
+        if self.obj_type == "phase_amplitude" and self._initialize_mode != "array":
+            self._initial_amplitude = torch.ones(init_shape)
         if self._initialize_mode == "uniform":
             if self.obj_type == "complex":
                 # amp=1, phase=0 -> complex ones
@@ -1027,6 +1291,12 @@ class ObjectPixelated(ObjectConstraints):
     def reset(self):
         """Reset the object model to its initial or pre-trained state"""
         self._obj = nn.Parameter(self.initial_obj.clone().to(self.device), requires_grad=True)
+        if self.obj_type == "phase_amplitude":
+            self._amplitude = nn.Parameter(
+                self._initial_amplitude.clone().to(device=self.device, dtype=self._obj.dtype),
+                requires_grad=True,
+            )
+        self._reset_slice_thickness_scale()
 
     def forward(self, patch_indices: torch.Tensor):
         """Get patch indices of the object"""
@@ -1056,6 +1326,10 @@ class ObjectPixelated(ObjectConstraints):
 
         Returns the gradient with respect to the wave incident on the first slice.
         """
+        if self.obj_type == "phase_amplitude":
+            raise NotImplementedError("analytic gradients are not implemented for phase_amplitude")
+        if self._has_absorption:
+            raise NotImplementedError("analytic gradients are not implemented with absorption")
         obj_shape = tuple(self._obj.shape[-2:])
         obj_gradient = torch.zeros_like(self._obj)
         for s in reversed(range(self.num_slices)):
@@ -1125,6 +1399,7 @@ class ObjectDIP(ObjectConstraints):
         self._pretrain_losses = []
         self._pretrain_lrs = []
         self._model_input_noise_std = input_noise_std
+        self.forward_hard_constraints = False
 
     @classmethod
     def from_model(
@@ -1161,14 +1436,40 @@ class ObjectDIP(ObjectConstraints):
         pixelated: "ObjectModelType",  # ObjectPixelated upsets linter when ptycho.obj_model is used
         input_noise_std: float = 0.025,
         device: str = "cpu",
+        obj_type: object_type | None = None,
     ) -> "ObjectDIP":
         """
         Create ObjectDIP from a pixelated object model.
+
+        ``obj_type="phase_amplitude"`` builds the DIP on separate phase and amplitude fields
+        (``model`` then needs ``2 * num_slices`` real channels). It can start from a pixelated
+        ``potential`` (amplitude set to 1), ``complex``, or ``phase_amplitude`` object.
         """
         if not (
             isinstance(pixelated, ObjectPixelated) or "ObjectPixelated" in str(type(pixelated))
         ):
             raise ValueError(f"Pixelated must be an ObjectPixelated, got {type(pixelated)}")
+        obj_type = pixelated.obj_type if obj_type is None else obj_type
+        if obj_type == "phase_amplitude":
+            if pixelated.obj_type == "phase_amplitude":
+                fields = pixelated.fields
+            elif pixelated.obj_type == "complex":
+                fields = torch.cat([pixelated.obj.angle(), pixelated.obj.abs()])
+            else:
+                fields = torch.cat([pixelated.obj, torch.ones_like(pixelated.obj)])
+            fields = fields.clone().detach().to(torch.float32)
+            obj_model = cls.from_model(
+                model=model,
+                model_input=fields,
+                num_slices=pixelated.num_slices,
+                slice_thicknesses=pixelated.slice_thicknesses,
+                input_noise_std=input_noise_std,
+                device=device,
+                obj_type="phase_amplitude",
+                rng=pixelated._rng_seed,
+            )
+            obj_model.pretrain_target = fields
+            return obj_model
 
         model_dtype = "complex" if pixelated.obj_type == "complex" else "real"
         if hasattr(model, "dtype"):  # allow overwriting of dtype based on model
@@ -1193,12 +1494,19 @@ class ObjectDIP(ObjectConstraints):
             rng=pixelated._rng_seed,
         )
         obj_model.pretrain_target = obj
+        if pixelated.obj_type in ("potential", "pure_phase"):
+            obj_model.absorption = pixelated.absorption
 
         return obj_model
 
     @property
     def num_slices(self) -> int:
         return self._num_slices
+
+    @property
+    def num_channels(self) -> int:
+        """CNN channels: one per slice, or two (phase, amplitude) for ``phase_amplitude``."""
+        return 2 * self.num_slices if self.obj_type == "phase_amplitude" else self.num_slices
 
     @property
     def name(self) -> str:
@@ -1254,9 +1562,10 @@ class ObjectDIP(ObjectConstraints):
             input_tensor = torch.tensor(input_tensor)
         else:
             input_tensor = input_tensor.clone().detach()
-        if input_tensor.shape[-3] != self.num_slices:
+        if input_tensor.shape[-3] != self.num_channels:
             raise ValueError(
-                f"model_input.shape[-3] {input_tensor.shape[-3]} does not match num_slices {self.num_slices}"
+                f"model_input.shape[-3] {input_tensor.shape[-3]} does not match the number of "
+                f"channels {self.num_channels}"
             )
         if input_tensor.ndim == 3:
             input_tensor = input_tensor[None]
@@ -1315,9 +1624,17 @@ class ObjectDIP(ObjectConstraints):
     @property
     def obj(self):
         """get the full object"""
+        if self.obj_type == "phase_amplitude":
+            return self.combine_fields(self.fields)
         raw = self.model(self._model_input)[0]
         # TODO -- single channel 2D with identical slices, view as 3D num_slices
         return self.apply_hard_constraints(raw, mask=self.mask)
+
+    @property
+    def fields(self) -> torch.Tensor:
+        if self.obj_type != "phase_amplitude":
+            return super().fields
+        return self.apply_hard_constraints(self.model(self._model_input)[0], mask=self.mask)
 
     @property
     def _obj(self):
@@ -1329,9 +1646,39 @@ class ObjectDIP(ObjectConstraints):
             self.model_input, self._input_noise_std, self.dtype, self.device, self._rng_torch
         )
         obj_array = self.model(model_input)[0]
-        if self.mask.numel() > 0:
+        if self.obj_type == "phase_amplitude":
+            return self._get_obj_patches(self.combine_fields(obj_array, self._mask), patch_indices)
+        if self.forward_hard_constraints:
+            obj_array = self.apply_hard_constraints(obj_array, mask=self.mask)
+        elif self.mask.numel() > 0:
             obj_array = obj_array * self._mask
+        self._forward_obj = obj_array
         return self._get_obj_patches(obj_array, patch_indices)
+
+    @property
+    def forward_hard_constraints(self) -> bool:
+        """
+        Apply the hard constraints (positivity, identical slices, filters) to the network output
+        in the forward model, with straight-through gradients.
+
+        By default (False) the forward model uses the raw network output and the hard
+        constraints only change ``obj``, so the displayed object differs from the fitted one.
+        With True, the fitted and displayed objects are the same.
+        """
+        return getattr(self, "_forward_hard_constraints", False)
+
+    @forward_hard_constraints.setter
+    def forward_hard_constraints(self, value: bool) -> None:
+        self._forward_hard_constraints = bool(value)
+
+    def soft_constraint_obj(self) -> torch.Tensor:
+        """The network output of the last ``forward`` call, so the soft constraints reuse it
+        instead of evaluating the network a second time. Falls back to ``obj``."""
+        cached = getattr(self, "_forward_obj", None)
+        self._forward_obj = None
+        if cached is None or not torch.is_grad_enabled():
+            return self.obj
+        return self.apply_hard_constraints(cached, mask=self.mask)
 
     def to(self, *args, **kwargs):
         """Move all relevant tensors to a different device."""
@@ -1357,6 +1704,7 @@ class ObjectDIP(ObjectConstraints):
     def reset(self):
         """Reset the object model to its initial or pre-trained state"""
         self.model.load_state_dict(self.pretrained_weights.copy())
+        self._reset_slice_thickness_scale()
 
     def _initialize_obj(
         self,
@@ -1364,7 +1712,8 @@ class ObjectDIP(ObjectConstraints):
         sampling: tuple[float, float] | np.ndarray | None = None,
     ) -> None:
         super()._initialize_obj(shape, sampling)
-        if not np.array_equal(shape, self.model_input.shape[1:]):
+        expected = np.array([self.num_slices, *self.model_input.shape[-2:]])
+        if not np.array_equal(shape, expected):
             raise ValueError(
                 f"shape {shape} does not match model_input.shape {self.model_input.shape}"
             )
@@ -1512,6 +1861,8 @@ class ObjectDIP(ObjectConstraints):
         target = self.pretrain_target
         if target is None:
             raise ValueError("Model has not been pre-trained")
+        if self.obj_type == "phase_amplitude":  # show the phase fields
+            pred_obj, target = pred_obj[: self.num_slices], target[: self.num_slices]
         if n_bot == 4:
             norm_angle = None
             norm_abs = None

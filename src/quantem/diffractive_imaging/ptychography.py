@@ -20,16 +20,19 @@ from quantem.core.ml.dist_utils import (
     maybe_configure_fabric_env,
     spawn_distributed_workers,
 )
+from quantem.core.utils.utils import generate_batches
 from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
-from quantem.diffractive_imaging.object_models import ObjectINR, ObjectModelType
-from quantem.diffractive_imaging.probe_models import ProbeModelType
+from quantem.diffractive_imaging.object_models import ObjectINR, ObjectModelType, ObjectPixelated
+from quantem.diffractive_imaging.probe_models import ProbeModelType, ProbePixelated
 from quantem.diffractive_imaging.ptycho_losses import L2, DataCriterion
 from quantem.diffractive_imaging.ptycho_utils import (
+    center_crop_arr,
     compute_train_val_split,
     fourier_translation_operator,
 )
+from quantem.diffractive_imaging.ptycho_utils import refine_slices as _refine_slices
 from quantem.diffractive_imaging.ptychography_base import PtychographyBase
 from quantem.diffractive_imaging.ptychography_opt import PtychographyOpt
 from quantem.diffractive_imaging.ptychography_visualizations import PtychographyVisualizations
@@ -107,6 +110,8 @@ def _ddp_ptycho_worker(
                     # the refinement.
                     "dset_scan_positions_px": ptycho.dset._scan_positions_px.detach().cpu(),
                     "dset_descan_shifts": ptycho.dset._descan_shifts.detach().cpu(),
+                    "dset_scan_affine": ptycho.dset._scan_affine.detach().cpu(),
+                    "dset_log_background": ptycho.dset._log_background.detach().cpu(),
                     "obj_optimizer_params": ptycho.obj_model._optimizer_params,
                     "probe_optimizer_params": ptycho.probe_model._optimizer_params,
                     "dset_optimizer_params": ptycho.dset._optimizer_params,
@@ -215,6 +220,172 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.probe_model.reset_optimizer()
         self.dset.reset_optimizer()
 
+    def initialize_from(
+        self,
+        ptycho: "Ptychography",
+        refine_slices: bool = False,
+        pad_slices: tuple[int, int] = (0, 0),
+    ) -> Self:
+        """
+        Initialize this reconstruction from another reconstruction of the same scan.
+
+        The object, probe, scan positions, and slice thicknesses of ``ptycho`` are resampled
+        onto the grids of this reconstruction, which can use a different real-space sampling
+        (for example after cropping the diffraction patterns), a different forward-model box,
+        and twice the number of slices. Starting from a reconstruction with cropped diffraction
+        patterns and few slices gives a coarse-to-fine schedule in both the lateral and the
+        beam directions. Learned scan positions and the scan affine transform are combined into
+        the initial scan positions, so ``reconstruct(reset=True)`` keeps them. Call this after
+        ``preprocess``, which recomputes the scan positions.
+
+        Parameters
+        ----------
+        ptycho : Ptychography
+            Reconstruction of the same scan with a pixelated object and probe, the same object
+            type, and the same scan rotation and transpose (set ``force_com_rotation`` and
+            ``force_com_transpose`` when preprocessing this dataset).
+        refine_slices : bool, optional
+            Insert a slice midway between each pair of slices of ``ptycho`` (see
+            ``ptycho_utils.refine_slices``), so this reconstruction needs
+            ``2 * ptycho.num_slices - 1`` slices.
+        pad_slices : tuple[int, int], optional
+            Number of vacuum slices added above and below the slices of ``ptycho``, at the
+            spacing of its first and last slices. The probe is propagated back through the
+            vacuum above, so it reaches the specimen unchanged. A stack thicker than the
+            specimen lets the reconstruction place both surfaces inside it.
+
+        Returns
+        -------
+        Self
+        """
+        from scipy.ndimage import map_coordinates
+
+        if not isinstance(self.obj_model, ObjectPixelated) or not isinstance(
+            ptycho.obj_model, ObjectPixelated
+        ):
+            raise TypeError("initialize_from requires pixelated object models")
+        if not isinstance(self.probe_model, ProbePixelated) or not isinstance(
+            ptycho.probe_model, ProbePixelated
+        ):
+            raise TypeError("initialize_from requires pixelated probe models")
+        promotes = ptycho.obj_type == "potential" and self.obj_type == "phase_amplitude"
+        if ptycho.obj_type != self.obj_type and not promotes:
+            raise ValueError(f"object types differ: {ptycho.obj_type} and {self.obj_type}")
+        if ptycho.dset.num_positions != self.dset.num_positions:
+            raise ValueError("the two reconstructions must use the same probe positions")
+        if (
+            not np.isclose(ptycho.dset.com_rotation_rad, self.dset.com_rotation_rad)
+            or ptycho.dset.com_transpose != self.dset.com_transpose
+        ):
+            raise ValueError(
+                "scan rotation and transpose differ; preprocess this dataset with "
+                f"force_com_rotation={np.rad2deg(ptycho.dset.com_rotation_rad):.4f} and "
+                f"force_com_transpose={ptycho.dset.com_transpose}"
+            )
+        pad_top, pad_bottom = (int(v) for v in pad_slices)
+        if pad_top < 0 or pad_bottom < 0:
+            raise ValueError(f"pad_slices must be non-negative, got {pad_slices}")
+        num_slices = 2 * ptycho.num_slices - 1 if refine_slices else ptycho.num_slices
+        num_slices += pad_top + pad_bottom
+        if self.num_slices != num_slices:
+            raise ValueError(f"this reconstruction needs {num_slices} slices")
+
+        # pixel coordinates in this reconstruction per pixel coordinate in ptycho
+        scale = ptycho.sampling / self.sampling
+        pad_source = ptycho.obj_padding_px
+        pad = self.obj_padding_px
+
+        # scan positions, including any learned affine transform
+        positions = ptycho.dset.positions_px.detach().cpu().numpy()
+        positions = (positions - pad_source) * scale + pad
+        self.dset.initial_scan_positions_px = positions
+        self.dset.scan_positions_px = positions
+        self.dset.scan_affine = torch.eye(2)
+        self.dset._set_patch_indices(self.obj_padding_px)
+
+        # object, interpolated onto this grid; outside the source object is vacuum
+        shape = self.obj_shape_full
+        rows = (np.arange(shape[1]) - pad[0]) / scale[0] + pad_source[0]
+        cols = (np.arange(shape[2]) - pad[1]) / scale[1] + pad_source[1]
+        coords = np.stack(np.meshgrid(rows, cols, indexing="ij"))
+
+        def resample(field: np.ndarray, vacuum: float) -> np.ndarray:
+            return np.stack([map_coordinates(s, coords, order=3, cval=vacuum) for s in field])
+
+        thicknesses = self._to_numpy(ptycho.obj_model.slice_thicknesses)
+        if refine_slices:
+            thicknesses = np.repeat(thicknesses / 2, 2)
+        if self.obj_type == "phase_amplitude":
+            phase = ptycho.obj if promotes else self._to_numpy(ptycho.obj_model.phase)
+            amplitude = np.ones_like(phase) if promotes else ptycho.obj_amplitude
+            phase = resample(phase, 0.0)
+            log_amplitude = resample(np.log(np.clip(amplitude, 1e-6, None)), 0.0)
+            if refine_slices:
+                phase = _refine_slices(phase, "potential")
+                log_amplitude = _refine_slices(log_amplitude, "potential")
+            obj = phase
+            self.obj_model._initial_amplitude = torch.as_tensor(
+                np.exp(np.minimum(log_amplitude, 0.0)), dtype=torch.float32
+            )
+        else:
+            obj = ptycho.obj_model.obj.detach().cpu().numpy()
+            if self.obj_type == "complex":
+                obj = resample(obj.real, 1.0) + 1j * resample(obj.imag, 0.0)
+            else:
+                obj = resample(obj, 0.0)
+            if refine_slices:
+                obj = _refine_slices(obj, self.obj_type)
+        if pad_top or pad_bottom:
+            vacuum = 1.0 if self.obj_type == "complex" else 0.0
+            obj = np.pad(obj, ((pad_top, pad_bottom), (0, 0), (0, 0)), constant_values=vacuum)
+            if self.obj_type == "phase_amplitude":
+                self.obj_model._initial_amplitude = torch.nn.functional.pad(
+                    self.obj_model._initial_amplitude, (0, 0, 0, 0, pad_top, pad_bottom), value=1.0
+                )
+            thicknesses = np.atleast_1d(thicknesses).astype(np.float64)
+            if thicknesses.size == 0:
+                thicknesses = np.atleast_1d(self._to_numpy(self.obj_model.slice_thicknesses))[:1]
+            thicknesses = np.r_[
+                np.repeat(thicknesses[0], pad_top),
+                thicknesses,
+                np.repeat(thicknesses[-1], pad_bottom),
+            ]
+        self.obj_model._initial_obj = torch.as_tensor(
+            obj, dtype=self.obj_model.dtype, device=self.obj_model.device
+        )
+        self.obj_model.reset()
+        self.obj_model.slice_thicknesses = thicknesses
+        self.compute_propagator_arrays()
+
+        # probe: Fourier interpolation to this pixel size, then pad or crop to this box
+        probe = ptycho.probe
+        num_px = np.round(ptycho.roi_shape * scale).astype("int")
+        if np.any(np.abs(num_px - ptycho.roi_shape * scale) > 1e-3 * num_px):
+            warn("probe box is not an integer number of pixels at the new sampling; rounding")
+        fourier = np.fft.fftshift(np.fft.fft2(probe), axes=(-2, -1))
+        fourier = center_crop_arr(fourier, (probe.shape[0], *num_px), pad_if_needed=True)
+        probe = np.fft.ifft2(np.fft.ifftshift(fourier, axes=(-2, -1)))
+        probe = np.fft.fftshift(probe, axes=(-2, -1))
+        probe = center_crop_arr(probe, (probe.shape[0], *self.roi_shape), pad_if_needed=True)
+        probe = np.fft.ifftshift(probe, axes=(-2, -1))
+        if pad_top:
+            # propagate back through the vacuum above the specimen
+            back = self.probe_model._compute_propagator_arrays(
+                self.sampling, 2, np.atleast_1d(np.sum(thicknesses[:pad_top]))
+            )[0]
+            back = self._to_numpy(back).conj()
+            probe = np.fft.ifft2(np.fft.fft2(probe) * back)
+        initial = self._to_numpy(self.probe_model.initial_probe).copy()
+        num_modes = min(len(probe), len(initial))
+        initial[:num_modes] = probe[:num_modes]
+        initial *= np.sqrt(self.dset.mean_diffraction_intensity / np.sum(np.abs(initial) ** 2))
+        self.probe_model._initial_probe = self._to_torch(initial, dtype="probe")
+        self.probe_model._initial_probe_tilt = ptycho.probe_model.probe_tilt.detach().cpu()
+        self.probe_model.reset()
+
+        self._set_obj_fov_mask()
+        return self
+
     def _record_iter(self, iter_loss: float, autograd: bool) -> None:
         self._iter_losses.append(iter_loss)
         self._iter_recon_types.append("AD" if autograd else "GD")
@@ -248,12 +419,18 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             # need the materialized grid (which would force full-grid inference each iter).
             obj_loss = self.obj_model.apply_soft_constraints(mask=self.obj_model.mask)
         else:
+            # Evaluating the full object reruns a DIP network, so skip it without penalties.
+            needs_obj = getattr(self.obj_model, "has_soft_constraints", True)
             obj_loss = self.obj_model.apply_soft_constraints(
-                self.obj_model.obj, mask=self.obj_model.mask
+                self.obj_model.soft_constraint_obj() if needs_obj else None,
+                mask=self.obj_model.mask,
             )
         total_loss += obj_loss
 
-        probe_loss = self.probe_model.apply_soft_constraints(self.probe_model.probe)
+        needs_probe = getattr(self.probe_model, "has_soft_constraints", True)
+        probe_loss = self.probe_model.apply_soft_constraints(
+            self.probe_model.probe if needs_probe else None
+        )
         total_loss += probe_loss
 
         dataset_loss = self.dset.apply_soft_constraints(self.dset.descan_shifts)
@@ -311,6 +488,12 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         ``"poisson"``, ``"smooth_l1_amplitude"``, ``"s3im_amplitude"``) or a ``DataCriterion``
         instance for custom parameters (e.g. ``AmplitudeS3IM(lambda_s3im=0.5)``). See
         ``ptycho_losses``.
+
+        When the dataset holds held-out validation counts (``validation_dset``, see
+        ``split_counts``), every probe position is used for training, the validation loss
+        compares the model with the held-out counts at the ``val_ratio`` subset of positions (all
+        positions when ``val_ratio`` is 0), and ``val_noise_floor`` estimates the loss of the
+        true model for the L2 criteria.
 
         ``autograd=False`` computes the gradient of the ``l2_amplitude`` loss analytically; it is
         the same gradient autograd returns. With ``analytic_step_normalization`` (the default)
@@ -456,6 +639,14 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             self.val_mode,
             self.rng,
         )
+        has_validation_counts = self.dset.has_validation_counts
+        if has_validation_counts:
+            # held-out counts exist at every position, so train on all positions
+            all_indices = np.arange(self.dset.num_positions)
+            if len(val_indices) == 0:
+                val_indices = all_indices
+            train_indices = all_indices
+            self._val_noise_floor = self._validation_noise_floor(global_n)
         train_loader, train_sampler, val_loader = self._build_dataloaders(
             train_indices,
             val_indices,
@@ -485,7 +676,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 propagated_probes, overlap = self.forward_operator(
                     obj_patches, shifted_probes, descan_shifts
                 )
-                pred_intensities = self.detector_model.forward(overlap)
+                pred_intensities = self.predict_intensities(overlap, shifted_probes)
 
                 batch_consistency_loss = self.error_estimate(
                     pred_intensities,
@@ -537,7 +728,13 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 with torch.no_grad():
                     for batch in val_loader:
                         batch_indices = batch["index"].to(self._single_device)
-                        targets = batch["target"].to(self._single_device, non_blocking=True)
+                        if has_validation_counts:
+                            validation_targets = self.dset.validation_targets
+                            targets = validation_targets[
+                                batch_indices.to(validation_targets.device)
+                            ].to(self._single_device)
+                        else:
+                            targets = batch["target"].to(self._single_device, non_blocking=True)
                         patch_data, _positions_px, positions_px_fractional, descan_shifts = (
                             self.dset.forward(batch_indices, self.obj_padding_px)
                         )
@@ -546,7 +743,7 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                         _propagated_probes, overlap = self.forward_operator(
                             obj_patches, shifted_probes, descan_shifts
                         )
-                        pred_intensities = self.detector_model.forward(overlap)
+                        pred_intensities = self.predict_intensities(overlap, shifted_probes)
                         batch_val_loss = self.error_estimate(
                             pred_intensities,
                             targets=targets,
@@ -594,6 +791,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 else:
                     pbar.set_description(f"Iter {a0 + 1}/{num_iters}, Loss: {total_loss:.3e}")
 
+        if self.obj_model.learn_slice_thickness:
+            # drop the autograd graph held by the last propagators
+            with torch.no_grad():
+                self.compute_propagator_arrays()
+
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -602,6 +804,31 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         gc.collect()
 
         return self
+
+    @property
+    def val_noise_floor(self) -> float | None:
+        """Estimated loss of the true model on the held-out validation counts, or None.
+
+        Half of the loss between the two count halves, since their noise is independent and
+        identically distributed. A training loss below this value indicates fitting of noise.
+        """
+        return getattr(self, "_val_noise_floor", None)
+
+    def _validation_noise_floor(self, global_n: int) -> float | None:
+        if not isinstance(self.criterion, L2):
+            return None
+        targets = self.dset.targets
+        validation_targets = self.dset.validation_targets
+        mask = self.dset.detector_mask
+        total, num_batches = 0.0, 0
+        with torch.no_grad():
+            for start, end in generate_batches(self.dset.num_positions, max_batch=self.batch_size):
+                train = targets[start:end].to(self._single_device)
+                held_out = validation_targets[start:end].to(self._single_device)
+                error = self.criterion(train * mask, held_out * mask, global_n)
+                total += (error / self.dset.mean_diffraction_intensity).item()
+                num_batches += 1
+        return 0.5 * total / max(num_batches, 1)
 
     def _spawn_reconstruct(self, devices: list[int], **recon_kwargs) -> Self:
         """Notebook multi-GPU: spawn one worker process per device via forkserver.
@@ -657,6 +884,12 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         dset_descan = result.get("dset_descan_shifts")
         if dset_descan is not None:
             self.dset._descan_shifts.data = dset_descan.to(restore_device)
+        dset_affine = result.get("dset_scan_affine")
+        if dset_affine is not None:
+            self.dset._scan_affine.data = dset_affine.to(restore_device)
+        dset_background = result.get("dset_log_background")
+        if dset_background is not None:
+            self.dset._log_background.data = dset_background.to(restore_device)
 
         # --- restore optimizer params (worker may have set/changed them) so that future
         #     spawns (e.g. reset=True without optimizer_params) can re-init the optimizer ---
@@ -792,6 +1025,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         the modelled amplitude and the detector mask match ``error_estimate``, and the descan
         ramp that ``forward_operator`` applies is undone by its conjugate.
         """
+        if not np.array_equal(self.roi_shape, self.detector_shape) or self.dset.learn_background:
+            raise NotImplementedError(
+                "autograd=False requires the detector roi_shape to equal the detector shape "
+                "and no learned background"
+            )
         n = self.dset.num_positions if global_n is None else global_n
         scale = (n / overlap.shape[1]) / self.dset.mean_diffraction_intensity
         measured = torch.fft.ifftshift(amplitudes, dim=(-2, -1))
@@ -887,9 +1125,13 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             self._dataset_metadata = {
                 "file_path": str(self.dset.dset.file_path) if self.dset.dset.file_path else None,
                 "preprocessing_params": self.dset._preprocessing_params,
-                "learned_scan_positions_px": self.dset.scan_positions_px.data.cpu(),
+                "learned_scan_positions_px": self.dset.positions_px.detach().cpu(),
                 "learned_descan_shifts": self.dset.descan_shifts.data.cpu(),
             }
+            if self.dset.learn_background:
+                self._dataset_metadata["learned_log_background"] = (
+                    self.dset._log_background.detach().cpu()
+                )
 
         # Add other common skips for ptychography objects
         skips = skip
@@ -1003,6 +1245,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                     dset.scan_positions_px.data = metadata["learned_scan_positions_px"]  # type: ignore[assignment]
                 if "learned_descan_shifts" in metadata:
                     dset.descan_shifts.data = metadata["learned_descan_shifts"]  # type: ignore[assignment]
+                if "learned_log_background" in metadata:
+                    log_background = metadata["learned_log_background"]
+                    dset._log_background.data = log_background.to(dset._log_background.device)
+                    dset._initial_log_background = log_background.clone()
+                    dset.learn_background = True
 
         # check if dset was attached to ptycho object
         if dset is not None:

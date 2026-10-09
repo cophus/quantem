@@ -79,7 +79,7 @@ class PtychographyVisualizations(PtychographyBase):
         #   potential  -> real values to plot directly
         #   pure_phase -> real phase to plot directly (no np.angle wrap)
         #   complex    -> complex; extract amp & phase via np.abs / np.angle
-        if self.obj_type == "potential":
+        if self.obj_type in ("potential", "phase_amplitude"):
             ims.append(np.abs(obj_np).sum(0))
             titles.append(t + "Potential")
             cmaps.append(ph_cmap)
@@ -158,7 +158,7 @@ class PtychographyVisualizations(PtychographyBase):
         #   potential  -> real values, plotted in real space
         #   pure_phase -> real phase; transmission = exp(1j*phase)
         #   complex    -> already complex transmission
-        if self.obj_type == "potential":
+        if self.obj_type in ("potential", "phase_amplitude"):
             windowed_obj = obj_np.sum(0) * window_2d
         elif self.obj_type == "pure_phase":
             windowed_obj = np.exp(1j * obj_np.sum(0)) * window_2d
@@ -179,7 +179,7 @@ class PtychographyVisualizations(PtychographyBase):
 
         if show_obj:
             obj_scalebar = self._scalebar_real()
-            if self.obj_type == "potential":
+            if self.obj_type in ("potential", "phase_amplitude"):
                 obj_show = obj_pad
             else:  # complex or pure phase just show the phase
                 obj_show = np.angle(obj_pad)
@@ -515,8 +515,9 @@ class PtychographyVisualizations(PtychographyBase):
                 t_part += f" | {thicknesses[i]:.1f} Å"
             t_parts.append(t_part)
 
-        if self.obj_type == "potential":
-            objs_flat = [np.abs(obj[i]) for i in range(len(obj))]
+        if self.obj_type in ("potential", "phase_amplitude"):
+            # signed: free slices can be negative, and a modulus would turn zero crossings into rings
+            objs_flat = [obj[i] for i in range(len(obj))]
             titles_flat = [f"Potential {t_parts[i]}" for i in range(len(obj))]
         elif self.obj_type == "pure_phase":
             objs_flat = [obj[i] for i in range(len(obj))]
@@ -533,12 +534,22 @@ class PtychographyVisualizations(PtychographyBase):
         scalebars[0][0] = self._scalebar_real()
 
         if interval_type == "quantile":
-            norm = {"interval_type": "quantile"}
-            # TODO -- make this work with interval_scaling
+            lower = kwargs.pop("lower_quantile", 0.02)
+            upper = kwargs.pop("upper_quantile", 0.98)
             if interval_scaling == "all":
-                warnings.warn(
-                    "interval_scaling='all' is not yet supported for quantile normalization"
-                )
+                # one color scale for every slice, from the quantiles of all slices together
+                values = np.concatenate([np.ravel(o) for o in objs_flat])
+                norm = {
+                    "interval_type": "manual",
+                    "vmin": float(np.quantile(values, lower)),
+                    "vmax": float(np.quantile(values, upper)),
+                }
+            else:
+                norm = {
+                    "interval_type": "quantile",
+                    "lower_quantile": lower,
+                    "upper_quantile": upper,
+                }
         elif interval_type in ["manual", "minmax", "abs"]:
             norm: dict[str, Any] = {"interval_type": "manual"}
             if interval_scaling == "all":
@@ -601,6 +612,12 @@ class PtychographyVisualizations(PtychographyBase):
             )
         else:
             lines.extend(ax.semilogy(iters, self.iter_losses, c="k", label="loss", lw=lw))
+
+        noise_floor = getattr(self, "val_noise_floor", None)
+        if noise_floor is not None and len(self.val_iter_losses) > 0:
+            lines.append(
+                ax.axhline(noise_floor, c=colors[6], ls="--", lw=1, label="val noise floor")
+            )
 
         ax.set_ylabel("Loss", color="k")
         ax.tick_params(axis="y", which="both", colors="k")
@@ -825,7 +842,7 @@ class PtychographyVisualizations(PtychographyBase):
             iteration = snapshot["iteration"]
             title_prefix = f"Iter {iteration} "
 
-            if self.obj_type == "potential":
+            if self.obj_type in ("potential", "phase_amplitude"):
                 all_images.append(np.abs(obj).sum(0))
                 all_titles.append(title_prefix + "Potential")
                 all_cmaps.append(ph_cmap)
@@ -937,7 +954,7 @@ class PtychographyVisualizations(PtychographyBase):
                 probe = snapshot["probe"]
                 iteration = snapshot["iteration"]
 
-                if self.obj_type == "potential":
+                if self.obj_type in ("potential", "phase_amplitude"):
                     row_images.append(np.abs(obj).sum(0))
                     row_titles.append(f"Iter {iteration} Potential")
                     row_cmaps.append(ph_cmap)
@@ -1032,7 +1049,7 @@ class PtychographyVisualizations(PtychographyBase):
         >>> ptycho.show_scan_positions(num_probes=10, edgecolors="b", linewidths=0.5)
         """
         # for each scan position, sum the intensity of self.probe at that position
-        scan_positions = self.dset.scan_positions_px.cpu().detach().numpy()
+        scan_positions = self.dset.positions_px.cpu().detach().numpy()
         probe_params = self.probe_model.probe_params
         probe_radius_px = None
         conv_angle = probe_params.get("semiangle_cutoff")
@@ -1125,7 +1142,7 @@ class PtychographyVisualizations(PtychographyBase):
         """
 
         if scan_positions_px is None:
-            scan_positions_px = self.dset.scan_positions_px
+            scan_positions_px = self.dset.positions_px
         if initial_scan_positions_px is None:
             initial_scan_positions_px = self.dset.initial_scan_positions_px
 

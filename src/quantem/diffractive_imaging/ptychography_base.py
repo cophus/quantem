@@ -130,21 +130,19 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         self._val_ratio = 0.0
         self._val_mode: Literal["grid", "random"] = "grid"
 
+        # the detector model sets the real-space box (roi_shape) that the probe is built on
+        self.detector_model = detector_model
+
         if (
             isinstance(probe_model, ProbePixelated)
             and (probe_model.vacuum_probe_intensity is not None)
-            # ``centered_amplitudes`` shares amplitudes' shape but is always resident (amplitudes is
-            # recomputed lazily), so use it here to avoid materializing the full raw array.
-            and (dset.centered_amplitudes.shape[1:] != probe_model.vacuum_probe_intensity.shape)
+            and (tuple(self.roi_shape) != tuple(probe_model.vacuum_probe_intensity.shape))
         ):
-            probe_model.rescale_vacuum_probe(
-                (dset.centered_amplitudes.shape[1], dset.centered_amplitudes.shape[2])
-            )
+            probe_model.rescale_vacuum_probe((int(self.roi_shape[0]), int(self.roi_shape[1])))
 
         # Remove centralized optimizer storage - now managed by individual models
         self.probe_model = probe_model
         self.obj_model = obj_model
-        self.detector_model = detector_model
         self.compute_propagator_arrays()
         self.logger = logger
         self.to(self._single_device)
@@ -276,6 +274,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         ):
             raise TypeError(f"detector_model should be a Detector, got {type(new_detector_model)}")
         self._detector_model = new_detector_model
+        # keep the dataset patches and the detector binning in sync with the model ROI
+        new_detector_model.detector_shape = tuple(self.dset.roi_shape)
+        roi = new_detector_model.model_roi_shape(self.dset.roi_shape)
+        if not np.array_equal(roi, self.dset.model_roi_shape):
+            self.dset.model_roi_shape = roi
+            if self.dset.preprocessed and hasattr(self, "_obj_padding_px"):
+                self.dset._set_patch_indices(self.obj_padding_px)
 
     @property
     def obj_type(self) -> str:
@@ -351,11 +356,33 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         - ``"complex"`` → complex ndarray (amp * exp(1j*phase)); phase recentered.
         - ``"pure_phase"`` → real ndarray of phase values.
         - ``"potential"`` → real ndarray of potential values.
+        - ``"phase_amplitude"`` → real ndarray of the phase field (``obj_amplitude`` holds the
+          amplitude field).
         """
+        if self.obj_type == "phase_amplitude":
+            return self._to_numpy(self.obj_model.phase)
         obj = self._to_numpy(self.obj_model.obj)
         if self.obj_type == "complex":
             obj = remove_global_phase(obj)
         return obj
+
+    @property
+    def obj_amplitude(self) -> np.ndarray:
+        """Amplitude field of the object: the amplitude field of a ``phase_amplitude`` object,
+        ``exp(-absorption * (V - <V>))`` for a ``potential`` or ``pure_phase`` object (see
+        ``ObjectBase.absorption``), and the modulus of a ``complex`` object."""
+        if self.obj_type in ("potential", "pure_phase"):
+            with torch.no_grad():
+                obj = self.obj_model.obj
+                return self._to_numpy(torch.exp(self.obj_model._log_amplitude(obj)))
+        if self.obj_type != "phase_amplitude":
+            return np.abs(self._to_numpy(self.obj_model.obj))
+        return self._to_numpy(self.obj_model.amplitude)
+
+    @property
+    def obj_amplitude_cropped(self) -> np.ndarray:
+        """Cropped and FOV-rotated amplitude field, see ``obj_amplitude``."""
+        return self._crop_rotate_obj_fov(self.obj_amplitude, padding=self.obj_padding_px)
 
     @property
     def obj_padding_px(self) -> np.ndarray:
@@ -704,6 +731,12 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
     @property  # FIXME depend on ptychodataset
     def roi_shape(self) -> np.ndarray:
+        """Real-space box of the forward model in pixels, set by the detector model."""
+        return self.dset.model_roi_shape
+
+    @property
+    def detector_shape(self) -> np.ndarray:
+        """Shape of the measured diffraction patterns in pixels."""
         return self.dset.roi_shape
 
     @property  # FIXME depend on ptychodataset
@@ -732,7 +765,8 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             raise ValueError("dset Q units given in pixels, needs calibration")
         else:
             raise NotImplementedError(f"Unknown dset Q units: {units}")
-        return sampling
+        # the model samples the same reciprocal-space extent with roi_shape pixels
+        return sampling * self.detector_shape / self.roi_shape
 
     @property
     def reciprocal_units(self) -> list[str]:
@@ -761,7 +795,7 @@ class PtychographyBase(RNGMixin, AutoSerialize):
             raise ValueError("dset Q units given in pixels, needs calibration")
         else:
             raise NotImplementedError(f"Unknown dset Q units: {units}")
-        return sampling
+        return sampling * self.detector_shape / self.roi_shape
 
     @property
     def angular_units(self) -> list[str]:
@@ -1065,13 +1099,17 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         shifted_input_probes: torch.Tensor,
         descan: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.probe_model.learn_probe_tilt:
+        if self.probe_model.learn_probe_tilt or self.obj_model.learn_slice_thickness:
             self.compute_propagator_arrays()
         propagated_probes, overlap = self.overlap_projection(obj_patches, shifted_input_probes)
         ## prop_probes shape: (nslices, nprobes, batch_size, roi_shape[0], roi_shape[1])
         ## overlap shape: (nprobes, batch_size, roi_shape[0], roi_shape[1])
         if descan is not None:
-            shifts = fourier_translation_operator(descan, tuple(self.roi_shape))
+            # descan shifts are in detector pixels
+            scale = torch.as_tensor(
+                self.roi_shape / self.detector_shape, dtype=descan.dtype, device=descan.device
+            )
+            shifts = fourier_translation_operator(descan * scale, tuple(self.roi_shape))
             overlap *= shifts[None]
         return propagated_probes, overlap
 
@@ -1114,6 +1152,29 @@ class PtychographyBase(RNGMixin, AutoSerialize):
 
         propagated_probes = torch.stack(propagated_probes, dim=0).to(overlap.device)
         return propagated_probes, overlap  # type:ignore
+
+    def predict_intensities(
+        self, overlap: torch.Tensor, incident: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Detector intensities from the exit waves, plus the incoherent background if learned.
+
+        With ``dset.background_from_absorption``, the background at each probe position carries
+        the intensity the object absorbed, the incident minus the exit intensity, spread over the
+        learned radial profile. Absorbed electrons then still reach the detector, as thermal
+        diffuse scattering does.
+        """
+        intensities = self.detector_model.forward(overlap)
+        if self.dset.learn_background:
+            background = self.dset.background_intensity()
+            if self.dset.background_from_absorption and incident is not None:
+                lost = (incident.abs() ** 2).sum(dim=(0, -2, -1)) - (overlap.abs() ** 2).sum(
+                    dim=(0, -2, -1)
+                )
+                profile = background / background.sum()
+                intensities = intensities + lost.clamp(min=0)[:, None, None] * profile
+            else:
+                intensities = intensities + background
+        return intensities
 
     def estimate_amplitudes(
         self, overlap_array: "torch.Tensor", corner_centered: bool = False
@@ -1158,8 +1219,11 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         return propagated
 
     def compute_propagator_arrays(self):
+        thicknesses = self.obj_model.slice_thicknesses  # torch, differentiable when learned
+        if thicknesses is None:
+            thicknesses = torch.tensor([])
         self.propagators = self.probe_model._compute_propagator_arrays(
-            self.sampling, self.num_slices, self.slice_thicknesses
+            self.sampling, self.num_slices, thicknesses
         )
 
     # endregion
