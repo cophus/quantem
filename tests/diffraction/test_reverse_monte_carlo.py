@@ -345,3 +345,29 @@ def test_plot_shell_correlations(rmc):
     K = len(rmc.species)
     assert len(axs) == K * (K + 1) // 2
     plt.close(fig)
+
+
+def test_to_atoms_and_cif_round_trip(rmc, tmp_path):
+    from ase.io import read
+
+    atoms = rmc.to_atoms()
+    n = len(rmc.site_x)
+    assert len(atoms) == n
+    assert np.allclose(atoms.cell.lengths(), rmc._a_crystal * rmc.cells)
+    counts = {s: int((np.array(atoms.get_chemical_symbols()) == s).sum()) for s in rmc.species}
+    expected = np.bincount(rmc.species_index, minlength=len(rmc.species))
+    assert [counts[s] for s in rmc.species] == expected.tolist()
+    # displacements move the atoms off the ideal sites by the fitted amount
+    first = int(
+        np.argsort(np.array([rmc.species[k] for k in rmc.species_index]), kind="stable")[0]
+    )
+    rmc.displacement[first] = [1, 0, 0]
+    step = rmc._a_crystal * rmc.cells / rmc.grid_size
+    shifted = rmc.to_atoms().get_positions()[0] - atoms.get_positions()[0]
+    assert np.allclose(shifted, [step, 0, 0])
+    rmc.displacement[first] = 0
+    path = rmc.to_cif(tmp_path / "rmc.cif")
+    back = read(path)
+    assert len(back) == n
+    assert np.allclose(back.cell.lengths(), atoms.cell.lengths())
+    assert np.allclose(back.get_scaled_positions(), atoms.get_scaled_positions(), atol=1e-5)

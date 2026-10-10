@@ -1850,6 +1850,88 @@ class ReverseMonteCarlo(AutoSerialize):
 
     # ---------------------------------------------------------------- analysis
 
+    def to_atoms(self, lattice_parameter: float | None = None):
+        """The fitted supercell as an ``ase.Atoms`` object, one atom per site.
+
+        The mixed sites carry the species and static displacements of the fit; any ordered
+        sites of the average crystal are repeated over the supercell without displacements.
+        Atoms are grouped by species.
+        Species are labelled as fitted, so with ``set_crystal(merge={"Zr": "Nb"})`` the Nb
+        sites stand for both Nb and Zr.
+
+        Parameters
+        ----------
+        lattice_parameter : float, optional
+            Edge of the cubic unit cell in A. Default None: the lattice parameter of the
+            crystal passed to :meth:`set_crystal`. The fractional coordinates do not depend
+            on it; the lattice parameter fitted by :meth:`fit_geometry` also absorbs any error
+            in the detector pixel size.
+
+        Returns
+        -------
+        ase.Atoms
+            Periodic cubic supercell of ``cells`` unit cells along each axis.
+        """
+        from ase import Atoms
+        from ase.data import chemical_symbols
+
+        if getattr(self, "site_x", None) is None:
+            raise RuntimeError("build_supercell first")
+        a = self._a_crystal if lattice_parameter is None else float(lattice_parameter)
+        if not np.isfinite(a) or a <= 0:
+            raise ValueError("lattice_parameter must be positive")
+        frac = [self._positions(np.arange(len(self.site_x))) / self.grid_size]
+        symbols = [self.species[k] for k in self.species_index]
+
+        # ordered sites of the average crystal (any site that is not a fitted mixed site)
+        mixed = self.site_grid / self.grid_divisor
+        pos0 = np.mod(self.crystal.positions_frac.numpy(), 1.0)
+        numbers = self.crystal.numbers.numpy()
+        ordered = {}
+        for f, z in zip(pos0, numbers):
+            if np.any(np.all(np.abs(np.mod(f - mixed + 0.5, 1.0) - 0.5) < 1e-4, axis=1)):
+                continue
+            key = tuple(np.round(f, 6))
+            ordered.setdefault(key, chemical_symbols[int(z)])
+        if ordered:
+            idx = np.stack(np.meshgrid(*(np.arange(self.cells),) * 3, indexing="ij"), -1).reshape(
+                -1, 3
+            )
+            f0 = np.array(list(ordered))
+            frac.append(((idx[:, None, :] + f0[None]) / self.cells).reshape(-1, 3))
+            symbols += list(ordered.values()) * len(idx)
+        # atoms grouped by species (stable within each), so the formula reads e.g. Nb12480V3520
+        order = np.argsort(np.array(symbols), kind="stable")
+        return Atoms(
+            [symbols[i] for i in order],
+            scaled_positions=np.mod(np.concatenate(frac), 1.0)[order],
+            cell=np.eye(3) * a * self.cells,
+            pbc=True,
+        )
+
+    def to_cif(self, path, lattice_parameter: float | None = None):
+        """Write the fitted supercell (see :meth:`to_atoms`) to a CIF file with ASE.
+
+        Parameters
+        ----------
+        path : str or Path
+            Output file.
+        lattice_parameter : float, optional
+            Edge of the cubic unit cell in A. Default None: the crystal's lattice parameter.
+
+        Returns
+        -------
+        pathlib.Path
+            The file written.
+        """
+        from pathlib import Path
+
+        from ase.io import write
+
+        path = Path(path)
+        write(path, self.to_atoms(lattice_parameter), format="cif")
+        return path
+
     def model_images(self, diffuse_only: bool = False) -> list[np.ndarray]:
         """Model on the binned grid of every pattern (data units): scaled diffuse + background,
         or the scaled diffuse term alone. The diffuse term is zero beyond ``q_max``."""
