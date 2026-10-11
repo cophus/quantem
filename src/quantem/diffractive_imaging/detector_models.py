@@ -108,7 +108,10 @@ class DetectorPixelated(DetectorBase):
         exit_fft = torch.fft.fft2(exit_waves, norm="ortho")
         intensities = torch.sum(torch.abs(exit_fft) ** 2, dim=0)
         intensities = torch.fft.fftshift(intensities, dim=(-2, -1))  # detector centering
-        if self.detector_shape is not None and tuple(intensities.shape[-2:]) != self.detector_shape:
+        if (
+            self.detector_shape is not None
+            and tuple(intensities.shape[-2:]) != self.detector_shape
+        ):
             bin_r, bin_c = self._get_binning(tuple(intensities.shape[-2:]), intensities)
             intensities = bin_r @ intensities @ bin_c.T
         if self.psf is not None:
@@ -118,7 +121,11 @@ class DetectorPixelated(DetectorBase):
     def _apply_psf(self, intensities: torch.Tensor) -> torch.Tensor:
         """Convolve the detector intensities with the psf, zero beyond the detector edge."""
         kernel = getattr(self, "_psf_tensor", None)
-        if kernel is None or kernel.device != intensities.device or kernel.dtype != intensities.dtype:
+        if (
+            kernel is None
+            or kernel.device != intensities.device
+            or kernel.dtype != intensities.dtype
+        ):
             kernel = torch.as_tensor(self.psf, dtype=intensities.dtype, device=intensities.device)
             kernel = torch.flip(kernel, dims=(0, 1))[None, None]  # conv2d correlates
             self._psf_tensor = kernel

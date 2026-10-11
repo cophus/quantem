@@ -36,6 +36,8 @@ from quantem.core.visualization import show_2d
 from quantem.diffractive_imaging.complex_probe import (
     POLAR_ALIASES,
     POLAR_SYMBOLS,
+    aperture,
+    polar_spatial_frequencies,
     real_space_probe,
 )
 from quantem.diffractive_imaging.ptycho_utils import (
@@ -89,6 +91,11 @@ class PtychoProbeConstraintParams:
             with a soft edge one pixel wide. The probe is formed by the condenser
             aperture, so a support slightly larger than the semiangle keeps the modes
             physical; ``None`` disables.
+        real_space_window : float | None, default ``None``
+            Multiplies every probe mode by a radial real-space window that is one out to this
+            fraction of the half box and falls to zero at the box edge with a cosine taper. A
+            focused probe is localized, so this keeps the modes from wrapping around the
+            periodic box; ``None`` disables.
         tv_weight : float, default ``0.0``
             Soft penalty. Weight on the in-plane total-variation of the (complex)
             probe; encourages smooth probe magnitude / phase.
@@ -98,12 +105,18 @@ class PtychoProbeConstraintParams:
         orthogonalize_probe: bool = True
         center_probe: bool = False
         fourier_support_mrad: float | None = None
+        real_space_window: float | None = None
         # soft constraints
         tv_weight: float = 0.0
         _name: str = "raster"
 
         soft_constraint_keys = ["tv_weight"]
-        hard_constraint_keys = ["orthogonalize_probe", "center_probe", "fourier_support_mrad"]
+        hard_constraint_keys = [
+            "orthogonalize_probe",
+            "center_probe",
+            "fourier_support_mrad",
+            "real_space_window",
+        ]
 
     @dataclass
     class Parametric(Constraints):
@@ -561,6 +574,8 @@ class ProbeConstraints(BaseConstraints[PtychoProbeConstraintParams.Raster], Prob
             probe = self._probe_fourier_support_constraint(
                 probe, self.constraints.fourier_support_mrad
             )
+        if getattr(self.constraints, "real_space_window", None) is not None:
+            probe = probe * self._real_space_window(probe, self.constraints.real_space_window)
         if self.constraints.orthogonalize_probe:
             probe = self._probe_orthogonalization_constraint(probe)
         if self.constraints.center_probe:
@@ -583,6 +598,17 @@ class ProbeConstraints(BaseConstraints[PtychoProbeConstraintParams.Raster], Prob
         pixel_mrad = float(sampling.min() * wavelength * 1e3)
         mask = torch.clamp((support_mrad - alpha) / pixel_mrad + 0.5, 0.0, 1.0)
         return torch.fft.ifft2(torch.fft.fft2(probe) * mask.to(probe.real.dtype))
+
+    @staticmethod
+    def _real_space_window(probe: torch.Tensor, fraction: float) -> torch.Tensor:
+        """Radial window about the array origin (the probe center): one inside ``fraction`` of
+        the half box, cosine taper to zero at the box edge."""
+        shape = tuple(int(s) for s in probe.shape[-2:])
+        r_rows = torch.fft.fftfreq(shape[0], device=probe.device) * 2
+        r_cols = torch.fft.fftfreq(shape[1], device=probe.device) * 2
+        r = torch.sqrt(r_rows[:, None] ** 2 + r_cols[None, :] ** 2)  # 1 at the box edge
+        t = torch.clamp((r - fraction) / max(1.0 - fraction, 1e-6), 0.0, 1.0)
+        return (0.5 * (1 + torch.cos(torch.pi * t))).to(probe.real.dtype)
 
     def _probe_tv_constraint(self, probe: torch.Tensor, weight: float) -> torch.Tensor:
         tv = self._get_zero_loss_tensor()
@@ -988,6 +1014,473 @@ class ProbePixelated(ProbeConstraints):
         # self._initial_probe = self._to_torch(probes)
         # self._probe = self._initial_probe.clone()
         return probes
+
+
+class ProbeFourier(ProbeConstraints):
+    """
+    Probe stored in reciprocal space as real scalar fields, so its phase is never wrapped.
+
+    Mode ``m`` of the Fourier-space probe is ``a_m(k) * exp(-1j * (chi(k) + delta_m(k)))``. The
+    amplitude ``a_m`` is a real field that may change sign, ``chi`` is the aberration surface
+    from a few learnable coefficients, and ``delta_m`` is a real residual phase field. Because
+    the phase is a real field rather than the angle of a complex array, an aberration model can
+    be fitted to it by linear least squares (``fit_aberrations``) without phase unwrapping.
+
+    The coefficients are learned in the ``"aberrations"`` optimizer group, in units of the
+    phase they add at the aperture edge (rad), so one learning rate suits all orders. The
+    amplitude and residual phase fields are in the default group. Additional modes start as
+    smooth variations of the first: its two gradients (source size) and its defocus derivative
+    (focal spread), all sharing the same phase.
+
+    Parameters
+    ----------
+    num_probes : int, optional
+        Number of mixed-state modes, by default 1.
+    probe_params : dict, optional
+        ``energy``, ``semiangle_cutoff``, ``defocus`` and any aberration coefficients, as for
+        ``ProbePixelated.from_params``.
+    aberration_keys : tuple[str, ...], optional
+        Aberrations with learnable coefficients, up to fifth order (``C10`` to ``C56``). The
+        angle of each non-round term (``phi12``, ``phi21``, ...) comes with its magnitude.
+    learn_aberrations : bool, optional
+        Learn the coefficients, by default True.
+    learn_fields : bool, optional
+        Learn the amplitude and residual phase fields pixel by pixel, by default True. With
+        False the probe stays physical: a soft-edged aperture, the aberration surface, and
+        smooth extra modes whose occupations are learned in the ``"modes"`` group.
+    learn_amplitude : bool | None, optional
+        Learn the amplitude fields even when ``learn_fields`` is False, so the aperture can take
+        the measured shape while the phase stays the aberration surface. ``None`` (default)
+        follows ``learn_fields``. Combine with ``tv_weight`` to keep the amplitude smooth.
+    initial_probe_weights : list[float] | None, optional
+        Starting occupation of each mode.
+    """
+
+    ABERRATION_ORDERS = {
+        "C10": (2, 0),
+        "C12": (2, 2),
+        "C21": (3, 1),
+        "C23": (3, 3),
+        "C30": (4, 0),
+        "C32": (4, 2),
+        "C34": (4, 4),
+        "C41": (5, 1),
+        "C43": (5, 3),
+        "C45": (5, 5),
+        "C50": (6, 0),
+        "C52": (6, 2),
+        "C54": (6, 4),
+        "C56": (6, 6),
+    }
+
+    def __init__(
+        self,
+        num_probes: int = 1,
+        probe_params: dict = {},
+        probe_tilt: tuple[float, float] | torch.Tensor = (0, 0),
+        learn_probe_tilt: bool = False,
+        roi_shape: tuple[int, int] | np.ndarray | None = None,
+        dtype: torch.dtype = torch.complex64,
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+        initial_probe_weights: list[float] | np.ndarray | None = None,
+        aberration_keys: tuple[str, ...] = ("C10", "C12", "C21", "C23", "C30"),
+        learn_aberrations: bool = True,
+        learn_fields: bool = True,
+        learn_amplitude: bool | None = None,
+        _token: object | None = None,
+    ):
+        super().__init__(
+            num_probes=num_probes,
+            probe_params=deepcopy(probe_params),
+            probe_tilt=probe_tilt,
+            learn_probe_tilt=learn_probe_tilt,
+            roi_shape=roi_shape,
+            dtype=dtype,
+            device=device,
+            rng=rng,
+            _token=_token,
+        )
+        unknown = set(aberration_keys) - set(self.ABERRATION_ORDERS)
+        if unknown:
+            raise ValueError(f"unknown aberration keys {sorted(unknown)}")
+        if initial_probe_weights is None:
+            weights = np.array([1 - 0.02 * (num_probes - 1)] + [0.02] * (num_probes - 1))
+        else:
+            weights = np.asarray(initial_probe_weights, dtype=np.float64)
+            if weights.size != num_probes:
+                raise ValueError(f"initial_probe_weights needs {num_probes} values")
+        self._initial_weights = torch.tensor(weights / weights.sum(), dtype=torch.float32)
+        self.aberration_keys = tuple(aberration_keys)
+        self._coefficient_names = [
+            key + suffix
+            for key in self.aberration_keys
+            for suffix in ([""] if self.ABERRATION_ORDERS[key][1] == 0 else ["a", "b"])
+        ]
+        self._learn_aberrations = bool(learn_aberrations)
+        self._learn_fields = bool(learn_fields)
+        self._learn_amplitude = (
+            self._learn_fields if learn_amplitude is None else bool(learn_amplitude)
+        )
+        self._mode_log_weights = nn.Parameter(torch.zeros(num_probes))
+        self._initial_mode_log_weights = torch.zeros(num_probes)
+        self._amplitude = nn.Parameter(torch.zeros(0))
+        self._phase = nn.Parameter(torch.zeros(0))
+        self._aberrations = nn.Parameter(
+            torch.zeros(len(self._coefficient_names)), requires_grad=self._learn_aberrations
+        )
+        self._amplitude_scale = 1.0
+
+    @classmethod
+    def from_params(
+        cls,
+        probe_params: dict,
+        num_probes: int = 1,
+        roi_shape: tuple[int, int] | None = None,
+        probe_tilt: tuple[float, float] | torch.Tensor = (0, 0),
+        learn_probe_tilt: bool = False,
+        dtype: torch.dtype = torch.complex64,
+        device: str = "cpu",
+        rng: np.random.Generator | int | None = None,
+        initial_probe_weights: list[float] | np.ndarray | None = None,
+        aberration_keys: tuple[str, ...] = ("C10", "C12", "C21", "C23", "C30"),
+        learn_aberrations: bool = True,
+        learn_fields: bool = True,
+        learn_amplitude: bool | None = None,
+    ) -> "ProbeFourier":
+        return cls(
+            num_probes=num_probes,
+            probe_params=probe_params,
+            probe_tilt=probe_tilt,
+            learn_probe_tilt=learn_probe_tilt,
+            roi_shape=roi_shape,
+            dtype=dtype,
+            device=device,
+            rng=rng,
+            initial_probe_weights=initial_probe_weights,
+            aberration_keys=aberration_keys,
+            learn_aberrations=learn_aberrations,
+            learn_fields=learn_fields,
+            learn_amplitude=learn_amplitude,
+            _token=cls._token,
+        )
+
+    @property
+    def name(self) -> str:
+        return "ProbeFourier"
+
+    def _order(self, name: str) -> tuple[int, int]:
+        return self.ABERRATION_ORDERS[name.rstrip("ab")]
+
+    def _build_grids(self) -> None:
+        """Aperture and aberration basis on the corner-centered reciprocal grid of the box."""
+        shape = tuple(int(s) for s in self.roi_shape)
+        sampling = tuple(float(v) for v in 1 / (self.roi_shape * self.reciprocal_sampling))
+        wavelength = electron_wavelength_angstrom(self.probe_params["energy"])
+        k, phi = polar_spatial_frequencies(shape, sampling, device=self.device)
+        alpha = k * wavelength
+        semiangle = float(self.probe_params["semiangle_cutoff"])
+        angular = (float(alpha[1, 0]) * 1e3, float(alpha[0, 1]) * 1e3)
+        self._aperture = aperture(alpha, phi, semiangle, angular, soft_edges=True).to(self.device)
+        columns = []
+        for name in self._coefficient_names:
+            n, m = self._order(name)
+            radial = 2 * np.pi / wavelength * alpha**n / n
+            if m == 0:
+                columns.append(radial)
+            else:
+                trig = torch.cos if name.endswith("a") else torch.sin
+                columns.append(radial * trig(m * phi))
+        # each coefficient is stored as the phase it adds at the aperture edge
+        self._edge = torch.tensor(
+            [
+                2
+                * np.pi
+                / wavelength
+                * (semiangle * 1e-3) ** self._order(n)[0]
+                / self._order(n)[0]
+                for n in self._coefficient_names
+            ],
+            dtype=torch.float32,
+        )
+        basis = torch.stack(columns).to(torch.float32)
+        self._basis = basis / self._edge.to(basis.device)[:, None, None]
+        self._k_rows = torch.fft.fftfreq(shape[0], sampling[0], device=self.device)[:, None]
+        self._k_cols = torch.fft.fftfreq(shape[1], sampling[1], device=self.device)[None, :]
+
+    def set_initial_probe(
+        self,
+        roi_shape: np.ndarray | tuple,
+        reciprocal_sampling: np.ndarray,
+        mean_diffraction_intensity: float,
+        device: str | None = None,
+    ):
+        keep = self._initialized_on(roi_shape, reciprocal_sampling)
+        super().set_initial_probe(
+            roi_shape, reciprocal_sampling, mean_diffraction_intensity, device
+        )
+        self.check_probe_params()
+        self._build_grids()
+        if keep:
+            # already set up on this grid, for example by initialize_from: keep the fields
+            return
+        self._initialized_grid = (
+            tuple(int(v) for v in np.asarray(roi_shape)),
+            tuple(float(v) for v in np.asarray(reciprocal_sampling)),
+        )
+        coefs = dict(self.probe_params.get("aberration_coefs", {}))
+        if self.probe_params.get("defocus") is not None:
+            coefs["C10"] = -float(self.probe_params["defocus"])
+        self.aberration_coefs = coefs
+
+        A = self._aperture
+        k_rows = self._k_rows.expand(A.shape)
+        k_cols = self._k_cols.expand(A.shape)
+        k2 = k_rows**2 + k_cols**2
+        k2 = k2 - (k2 * A**2).sum() / (A**2).sum()
+        variations = [
+            torch.ones_like(A),
+            k_rows,
+            k_cols,
+            k2,
+            k_rows * k_cols,
+            k_rows**2 - k_cols**2,
+        ]
+        amplitudes = []
+        for mode in range(self.num_probes):
+            field = A * variations[mode % len(variations)]
+            field = field / field.square().sum().sqrt()
+            amplitudes.append(field * self._initial_weights[mode].sqrt())
+        amplitudes = torch.stack(amplitudes)
+        self._amplitude_scale = 1.0
+        with torch.no_grad():
+            probe = self._compose(amplitudes, torch.zeros_like(amplitudes), self._aberrations)
+            total = torch.fft.fft2(probe, norm="ortho").abs().square().sum()
+        self._amplitude_scale = float(np.sqrt(self.mean_diffraction_intensity / float(total)))
+        self._initial_amplitude = amplitudes.clone()
+        self._initial_phase = torch.zeros_like(amplitudes)
+        self._initial_aberrations = self._aberrations.detach().clone()
+        self._amplitude = nn.Parameter(
+            amplitudes.clone().to(self.device), requires_grad=self._learn_amplitude
+        )
+        self._phase = nn.Parameter(
+            torch.zeros_like(amplitudes).to(self.device), requires_grad=self._learn_fields
+        )
+        with torch.no_grad():
+            self._mode_log_weights.data = torch.zeros(self.num_probes).to(self.device)
+        self._initial_mode_log_weights = torch.zeros(self.num_probes)
+
+    def _initialized_on(self, roi_shape, reciprocal_sampling) -> bool:
+        grid = getattr(self, "_initialized_grid", None)
+        if grid is None or self._amplitude.numel() == 0:
+            return False
+        same_shape = grid[0] == tuple(int(v) for v in np.asarray(roi_shape))
+        return same_shape and np.allclose(grid[1], np.asarray(reciprocal_sampling, dtype=float))
+
+    @property
+    def aberration_coefs(self) -> dict[str, float]:
+        """Aberration coefficients in quantEM's polar convention (A and rad)."""
+        values = (self._aberrations.detach().cpu() / self._edge).tolist()
+        cartesian = dict(zip(self._coefficient_names, values))
+        coefs = {}
+        for key in self.aberration_keys:
+            n, m = self.ABERRATION_ORDERS[key]
+            if m == 0:
+                coefs[key] = cartesian[key]
+            else:
+                a, b = cartesian[key + "a"], cartesian[key + "b"]
+                coefs[key] = float(np.hypot(a, b))
+                coefs["phi" + key[1:]] = float(np.arctan2(b, a) / m)
+        return coefs
+
+    @aberration_coefs.setter
+    def aberration_coefs(self, coefs: dict) -> None:
+        values = []
+        for name in self._coefficient_names:
+            key = name.rstrip("ab")
+            n, m = self.ABERRATION_ORDERS[key]
+            size = float(coefs.get(key, 0.0))
+            angle = float(coefs.get("phi" + key[1:], 0.0))
+            if m == 0:
+                values.append(size)
+            else:
+                trig = np.cos if name.endswith("a") else np.sin
+                values.append(size * trig(m * angle))
+        with torch.no_grad():
+            scaled = torch.tensor(values, dtype=torch.float32) * self._edge
+            self._aberrations.data = scaled.to(self._aberrations.device)
+
+    def chi(self, coefficients: torch.Tensor | None = None) -> torch.Tensor:
+        """Aberration surface (rad) on the corner-centered reciprocal grid."""
+        coefficients = self._aberrations if coefficients is None else coefficients
+        return (coefficients.to(self._basis)[:, None, None] * self._basis).sum(0)
+
+    def shift_defocus(self, distance: float) -> None:
+        """Move the plane where the probe is defined by ``distance`` (A) along the beam.
+
+        Free-space propagation only changes ``C10``, so a positive distance (further along the
+        beam) adds ``distance`` to ``C10``.
+        """
+        coefs = self.aberration_coefs
+        coefs["C10"] = coefs.get("C10", 0.0) + float(distance)
+        self.aberration_coefs = coefs
+        self._initial_aberrations = self._aberrations.detach().clone()
+
+    def fit_aberrations(self, mode: int = 0) -> dict[str, float]:
+        """
+        Move the aberration part of the residual phase of ``mode`` into the coefficients.
+
+        Weighted linear least squares of the residual phase on the aberration basis and a
+        constant, weighted by the mode intensity inside the aperture. The fitted surface is
+        removed from the residual of every mode, so the probe itself does not change.
+        """
+        with torch.no_grad():
+            weight = self._amplitude[mode].square() * (self._aperture > 0.5)
+            mask = weight > 0
+            columns = torch.cat([self._basis, torch.ones_like(self._basis[:1])])
+            root = weight[mask].sqrt()
+            design = (columns[:, mask] * root).T.cpu().double()
+            target = (self._phase[mode][mask] * root).cpu().double()[:, None]
+            solution = torch.linalg.lstsq(design, target).solution[:, 0]
+            delta = solution[:-1].to(self._basis)
+            surface = (delta[:, None, None] * self._basis).sum(0)
+            self._aberrations.data = self._aberrations.data + delta.to(self._aberrations.device)
+            self._phase.data = self._phase.data - surface[None]
+        return self.aberration_coefs
+
+    def apply_soft_constraints(self, probe: torch.Tensor) -> torch.Tensor:
+        """
+        With ``tv_weight``, total variation of the reciprocal-space fields inside the Fourier
+        support (or the aperture): the amplitude relative to its mean, plus the residual phase
+        in rad. Smooth fields keep
+        the real-space probe compact, where free reciprocal-space pixels would spread noise over
+        the whole box.
+        """
+        self.reset_soft_constraint_losses()
+        loss = self._get_zero_loss_tensor()
+        weight = self.constraints.tv_weight
+        if weight:
+            support = self._amplitude_support()
+            region = self._aperture > 0.5 if support is None else support > 0
+            inside = torch.fft.fftshift(region)
+            pairs = [inside[1:, :] & inside[:-1, :], inside[:, 1:] & inside[:, :-1]]
+            amplitude = torch.fft.fftshift(self._amplitude, dim=(-2, -1))
+            phase = torch.fft.fftshift(self._phase, dim=(-2, -1))
+            scale = amplitude.detach().abs()[:, inside].mean(-1).clamp(min=1e-12)[:, None, None]
+            tv = self._get_zero_loss_tensor()
+            for dim, valid in zip((-2, -1), pairs):
+                tv = tv + (amplitude / scale).diff(dim=dim).abs()[:, valid].mean()
+                tv = tv + phase.diff(dim=dim).abs()[:, valid].mean()
+            loss = weight * tv
+            self.add_soft_constraint_loss("tv_loss", loss)
+        self.accumulate_constraint_losses()
+        return loss
+
+    def _amplitude_support(self) -> torch.Tensor | None:
+        """Soft disk of radius ``fourier_support_mrad`` on the reciprocal grid, or None."""
+        support = self.constraints.fourier_support_mrad
+        if support is None or not hasattr(self, "_aperture"):
+            return None
+        wavelength = electron_wavelength_angstrom(self.probe_params["energy"])
+        alpha = torch.sqrt(self._k_rows**2 + self._k_cols**2) * wavelength * 1e3  # mrad
+        pixel = float(np.min(self.reciprocal_sampling)) * wavelength * 1e3
+        return torch.clamp((float(support) - alpha) / pixel + 0.5, 0.0, 1.0).to(self._aperture)
+
+    def _compose(self, amplitude, phase, coefficients, log_weights=None) -> torch.Tensor:
+        # masking the field itself, not only the composed probe, gives exactly zero gradient
+        # outside the support; otherwise round-off gradients there are amplified by Adam
+        support = self._amplitude_support()
+        if support is not None:
+            amplitude = amplitude * support
+        if log_weights is not None:
+            amplitude = amplitude * torch.exp(log_weights.to(amplitude))[:, None, None]
+        fourier = amplitude * torch.exp(-1j * (self.chi(coefficients)[None] + phase))
+        return torch.fft.ifft2(self._amplitude_scale * fourier).to(self.dtype)
+
+    @property
+    def fourier_amplitude(self) -> torch.Tensor:
+        """Signed amplitude of each mode on the corner-centered reciprocal grid."""
+        return self._amplitude_scale * self._amplitude
+
+    @property
+    def fourier_phase(self) -> torch.Tensor:
+        """Unwrapped phase ``chi + delta_m`` of each mode (rad)."""
+        return self.chi()[None] + self._phase
+
+    @property
+    def probe(self) -> torch.Tensor:
+        """Real-space probe modes, with the hard constraints applied."""
+        return self.apply_hard_constraints(
+            self._compose(self._amplitude, self._phase, self._aberrations, self._mode_log_weights)
+        )
+
+    @property
+    def initial_probe(self) -> torch.Tensor:
+        with torch.no_grad():
+            return self._compose(
+                self._initial_amplitude,
+                self._initial_phase,
+                self._initial_aberrations,
+                self._initial_mode_log_weights,
+            )
+
+    def forward(self, fract_positions: torch.Tensor) -> torch.Tensor:
+        shifted_probes = fourier_shift_expand(self.probe, fract_positions).swapaxes(0, 1)
+        return shifted_probes
+
+    @property
+    def _learn_mode_weights(self) -> bool:
+        return not self._learn_amplitude and self.num_probes > 1
+
+    @property
+    def params(self) -> list[nn.Parameter]:
+        params = super().params
+        if self._learn_amplitude:
+            params.append(self._amplitude)
+        if self._learn_fields:
+            params.append(self._phase)
+        if self._learn_mode_weights:
+            params.append(self._mode_log_weights)
+        if self._learn_aberrations:
+            params.append(self._aberrations)
+        return params
+
+    def get_optimization_parameters(self) -> "dict[str, list[torch.Tensor]]":
+        groups = super().get_optimization_parameters()
+        special = {id(self._aberrations), id(self._mode_log_weights)}
+        default = groups.get(self.DEFAULT_OPTIMIZER_KEY, [])
+        groups[self.DEFAULT_OPTIMIZER_KEY] = [p for p in default if id(p) not in special]
+        if self._learn_aberrations:
+            groups["aberrations"] = [self._aberrations]
+        if self._learn_mode_weights:
+            groups["modes"] = [self._mode_log_weights]
+        return {key: value for key, value in groups.items() if value}
+
+    def set_optimizer(self, opt_params: "OptimizerParamsType | dict | None" = None) -> None:
+        """Set the optimizer with one entry per parameter group. A missing group reuses the
+        default probe settings, or the aberration settings when the fields are not learned."""
+        if opt_params is not None:
+            self.optimizer_params = opt_params
+        given = dict(self.optimizer_params)
+        fallback = given.get(self.DEFAULT_OPTIMIZER_KEY, given.get("aberrations"))
+        specs = {}
+        for key in self.get_optimization_parameters():
+            if key in given:
+                specs[key] = given[key]
+            elif fallback is not None:
+                specs[key] = deepcopy(fallback)
+        self._optimizer_params = specs
+        super().set_optimizer()
+
+    def reset(self):
+        super().reset()
+        with torch.no_grad():
+            self._amplitude.data = self._initial_amplitude.clone().to(self.device)
+            self._phase.data = self._initial_phase.clone().to(self.device)
+            self._aberrations.data = self._initial_aberrations.clone().to(self._aberrations.device)
+            self._mode_log_weights.data = self._initial_mode_log_weights.clone().to(
+                self._mode_log_weights.device
+            )
 
 
 class ProbeParametric(ProbeConstraints):
@@ -1618,4 +2111,4 @@ class ProbeDIP(ProbeConstraints):
             )
 
 
-ProbeModelType = ProbePixelated | ProbeDIP
+ProbeModelType = ProbePixelated | ProbeDIP | ProbeFourier

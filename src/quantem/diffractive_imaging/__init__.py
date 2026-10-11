@@ -14,6 +14,7 @@ from quantem.diffractive_imaging.object_models import (
 )
 from quantem.diffractive_imaging.probe_models import (
     ProbeDIP as ProbeDIP,
+    ProbeFourier as ProbeFourier,
     ProbeParametric as ProbeParametric,
     ProbePixelated as ProbePixelated,
     PtychoProbeConstraintParams as PtychoProbeConstraintParams,

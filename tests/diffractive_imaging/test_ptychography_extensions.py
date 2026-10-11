@@ -16,6 +16,7 @@ from quantem.diffractive_imaging import (
     ProbePixelated,
     Ptychography,
     PtychographyDatasetRaster,
+    PtychoProbeConstraintParams,
     refine_slices,
     split_counts,
 )
@@ -570,7 +571,6 @@ class TestDetectorNoiseResponse:
         rng = np.random.default_rng(0)
         ky, kx = np.indices((40, 40))
         rate = np.where(np.hypot(ky - 20, kx - 20) < 6, 20.0, 0.3)  # electrons per pixel
-        response = np.array([[0.0, 0.2, 0.0], [0.2, 1.0, 0.2], [0.0, 0.2, 0.0]])
         electrons = rng.poisson(rate, size=(16, 48, 40, 40))
         counts = np.empty_like(electrons)
         for index in np.ndindex(electrons.shape[:2]):
@@ -590,3 +590,320 @@ class TestDetectorNoiseResponse:
         binned = detector_noise_response(counts, bin_factor=2, num_rows=16)["psf"]
         # an electron keeps itself and two of its four neighbor counts inside a 2x2 bin
         assert np.isclose(binned[binned.shape[0] // 2, binned.shape[1] // 2], 1.4 / 1.8, atol=0.02)
+
+
+class TestProbeFourier:
+    def _ptycho(self, counts, probe_model, num_slices=1):
+        from quantem.diffractive_imaging import ProbeFourier  # noqa: F401
+
+        pdset = PtychographyDatasetRaster.from_dataset4dstem(
+            make_dset(counts), verbose=0, learn_descan=False, learn_scan_positions=False
+        )
+        pdset.preprocess(
+            com_fit_function="constant",
+            plot_rotation=False,
+            plot_com=False,
+            probe_energy=PROBE_ENERGY,
+            force_com_rotation=0,
+            force_com_transpose=False,
+        )
+        ptycho = Ptychography.from_models(
+            dset=pdset,
+            obj_model=ObjectPixelated.from_uniform(
+                num_slices=num_slices, slice_thicknesses=10, obj_type="potential"
+            ),
+            probe_model=probe_model,
+            detector_model=DetectorPixelated(),
+            device="cpu",
+            verbose=0,
+            rng=0,
+        )
+        ptycho.preprocess(obj_padding_px=(8, 8), plot_rotation=False, plot_com=False)
+        return ptycho
+
+    def test_matches_pixelated_probe(self, counts):
+        from quantem.diffractive_imaging import ProbeFourier
+
+        params = {
+            "energy": PROBE_ENERGY,
+            "defocus": 120.0,
+            "semiangle_cutoff": SEMIANGLE,
+            "C12": 30.0,
+            "phi12": 0.4,
+            "C21": 400.0,
+            "phi21": -1.0,
+        }
+        probes = []
+        for cls in (ProbePixelated, ProbeFourier):
+            ptycho = self._ptycho(counts, cls.from_params(dict(params), num_probes=1))
+            probes.append(ptycho.probe_model.probe.detach()[0])
+        a, b = probes
+        overlap = (a.conj() * b).sum().abs() / (
+            a.abs().square().sum() * b.abs().square().sum()
+        ).sqrt()
+        assert overlap > 0.99999
+        coefs = ptycho.probe_model.aberration_coefs
+        assert coefs["C10"] == pytest.approx(-120.0, abs=1e-3)
+        assert coefs["C12"] == pytest.approx(30.0, abs=1e-3)
+        assert coefs["phi12"] == pytest.approx(0.4, abs=1e-4)
+
+    def test_learns_defocus_and_fits_phase(self):
+        from quantem.diffractive_imaging import ProbeFourier
+
+        probe_model = ProbeFourier.from_params(
+            {"energy": PROBE_ENERGY, "defocus": 0.0, "semiangle_cutoff": SEMIANGLE},
+            num_probes=2,
+            aberration_keys=("C10", "C12"),
+        )
+        ptycho = self._ptycho(make_counts(0, dose=5e4), probe_model)
+        assert float(probe_model.probe.detach().abs().square().sum()) == pytest.approx(
+            ptycho.dset.mean_diffraction_intensity, rel=1e-3
+        )
+        ptycho.reconstruct(
+            num_iters=30,
+            batch_size=36,
+            optimizer_params={
+                "object": OptimizerParams.Adam(lr=3e-2),
+                "probe": {
+                    "default": OptimizerParams.Adam(lr=1e-3),
+                    "aberrations": OptimizerParams.Adam(lr=2e-2),
+                },
+            },
+        )
+        # the data were simulated with C10 = +50 A (a phase of pi * wavelength * 50 * q^2)
+        assert probe_model.aberration_coefs["C10"] == pytest.approx(50.0, abs=8.0)
+        before = probe_model.probe.detach().clone()
+        coefs = probe_model.fit_aberrations()
+        assert coefs["C10"] == pytest.approx(50.0, abs=5.0)
+        torch.testing.assert_close(probe_model.probe.detach(), before, rtol=1e-4, atol=1e-3)
+
+    def test_initialize_from_shifts_defocus(self, counts):
+        from quantem.diffractive_imaging import ProbeFourier
+
+        params = {"energy": PROBE_ENERGY, "defocus": 50.0, "semiangle_cutoff": SEMIANGLE}
+        source = self._ptycho(counts, ProbeFourier.from_params(dict(params), num_probes=2), 2)
+        target = self._ptycho(counts, ProbeFourier.from_params(dict(params), num_probes=2), 5)
+        target.initialize_from(source, pad_slices=(2, 1))
+        assert target.probe_model.aberration_coefs["C10"] == pytest.approx(-50.0 - 20.0, abs=1e-3)
+        target.probe_model.reset()  # the transferred probe is the new starting point
+        assert target.probe_model.aberration_coefs["C10"] == pytest.approx(-70.0, abs=1e-3)
+
+
+class TestLowpassDepthTV:
+    def test_tilted_columns_cost_less_after_lowpass(self, counts):
+        from quantem.diffractive_imaging import PtychoObjConstraintParams
+
+        ptycho = make_ptycho(make_dset(counts), num_slices=4, num_probes=1)
+        obj_model = ptycho.obj_model
+        rows, cols = obj_model.obj.shape[-2:]
+        dy, dx = obj_model.sampling
+        yy, xx = np.meshgrid(np.arange(rows) * dy, np.arange(cols) * dx, indexing="ij")
+        # a lattice of sharp columns that moves 0.3 A sideways per slice, as for a tilted crystal
+        tilted = np.stack(
+            [
+                np.cos(2 * np.pi * (xx - 0.3 * s) / 2.0) * np.cos(2 * np.pi * yy / 2.0)
+                for s in range(4)
+            ]
+        )
+        array = torch.as_tensor(tilted, dtype=torch.float32)
+        costs = {}
+        for sigma in (0.0, 1.0):
+            obj_model.constraints = PtychoObjConstraintParams.Raster(
+                tv_weight_z=1.0, tv_z_sigma=sigma, positivity=False
+            )
+            costs[sigma] = float(obj_model.get_tv_loss(array))
+        assert costs[1.0] < 0.2 * costs[0.0]
+        # a depth change of the slowly varying part is still penalized
+        ramp = torch.as_tensor(np.stack([np.full((rows, cols), float(s)) for s in range(4)]))
+        assert float(obj_model.get_tv_loss(ramp.float())) == pytest.approx(1.0, rel=1e-4)
+
+
+class TestProbeFourierReuse:
+    def test_new_reconstruction_keeps_the_learned_probe(self, counts):
+        from quantem.diffractive_imaging import ProbeFourier
+
+        params = {"energy": PROBE_ENERGY, "defocus": 50.0, "semiangle_cutoff": SEMIANGLE}
+        probe_model = ProbeFourier.from_params(params, num_probes=2)
+        first = TestProbeFourier()._ptycho(counts, probe_model)
+        probe_model.shift_defocus(25.0)
+        probe_model._initial_aberrations = probe_model._aberrations.detach().clone()
+        before = probe_model.probe.detach().clone()
+        TestProbeFourier()._ptycho(counts, probe_model)  # preprocess runs set_initial_probe again
+        torch.testing.assert_close(probe_model.probe.detach(), before)
+        assert first.probe_model is probe_model
+
+    def test_save_and_reload(self, counts, tmp_path):
+        from quantem.diffractive_imaging import ProbeFourier
+
+        params = {"energy": PROBE_ENERGY, "defocus": 50.0, "semiangle_cutoff": SEMIANGLE}
+        probe_model = ProbeFourier.from_params(params, num_probes=2)
+        ptycho = TestProbeFourier()._ptycho(counts, probe_model)
+        probe_model.shift_defocus(13.0)
+        before = probe_model.probe.detach().clone()
+        path = tmp_path / "probe_fourier.zip"
+        ptycho.save(path, mode="o", verbose=False)
+        pdset = PtychographyDatasetRaster.from_dataset4dstem(
+            make_dset(counts), verbose=0, learn_descan=False, learn_scan_positions=False
+        )
+        pdset.preprocess(
+            com_fit_function="constant",
+            plot_rotation=False,
+            plot_com=False,
+            probe_energy=PROBE_ENERGY,
+            force_com_rotation=0,
+            force_com_transpose=False,
+        )
+        loaded = Ptychography.from_file(path, dset=pdset)
+        assert loaded.probe_model.aberration_coefs["C10"] == pytest.approx(-37.0, abs=1e-3)
+        torch.testing.assert_close(loaded.probe_model.probe.detach(), before)
+
+    def test_field_tv_penalizes_noisy_fields(self, counts):
+        from quantem.diffractive_imaging import ProbeFourier, PtychoProbeConstraintParams
+
+        params = {"energy": PROBE_ENERGY, "defocus": 50.0, "semiangle_cutoff": SEMIANGLE}
+        probe_model = ProbeFourier.from_params(params, num_probes=1)
+        TestProbeFourier()._ptycho(counts, probe_model)
+        probe_model.constraints = PtychoProbeConstraintParams.Raster(tv_weight=1.0)
+        smooth = float(probe_model.apply_soft_constraints(probe_model.probe))
+        with torch.no_grad():
+            probe_model._phase.data = 0.5 * torch.randn_like(probe_model._phase)
+        noisy = float(probe_model.apply_soft_constraints(probe_model.probe))
+        assert noisy > smooth + 0.3
+
+    def test_physical_probe_learns_only_coefficients(self):
+        from quantem.diffractive_imaging import ProbeFourier, PtychoProbeConstraintParams
+
+        probe_model = ProbeFourier.from_params(
+            {"energy": PROBE_ENERGY, "defocus": 0.0, "semiangle_cutoff": SEMIANGLE},
+            num_probes=2,
+            aberration_keys=("C10", "C12"),
+            learn_fields=False,
+            learn_amplitude=True,
+            learn_probe_tilt=True,
+        )
+        ptycho = TestProbeFourier()._ptycho(make_counts(0, dose=5e4), probe_model)
+        assert set(probe_model.get_optimization_parameters()) == {"default", "aberrations", "tilt"}
+        ptycho.reconstruct(
+            num_iters=30,
+            batch_size=36,
+            optimizer_params={
+                "object": OptimizerParams.Adam(lr=3e-2),
+                "probe": {
+                    "default": OptimizerParams.Adam(lr=1e-3),
+                    "aberrations": OptimizerParams.Adam(lr=2e-2),
+                },
+            },
+            constraints={"probe": PtychoProbeConstraintParams.Raster(tv_weight=1.0)},
+        )
+        assert probe_model.aberration_coefs["C10"] == pytest.approx(50.0, abs=8.0)
+        # the phase stays the aberration surface
+        assert float(probe_model._phase.detach().abs().max()) == 0.0
+
+    def test_frozen_fields_learn_mode_weights(self, counts):
+        from quantem.diffractive_imaging import ProbeFourier
+
+        params = {"energy": PROBE_ENERGY, "defocus": 50.0, "semiangle_cutoff": SEMIANGLE}
+        probe_model = ProbeFourier.from_params(params, num_probes=3, learn_fields=False)
+        TestProbeFourier()._ptycho(counts, probe_model)
+        assert set(probe_model.get_optimization_parameters()) == {"aberrations", "modes"}
+
+    def test_higher_order_basis_matches_aberration_surface(self, counts):
+        from quantem.diffractive_imaging import ProbeFourier
+        from quantem.diffractive_imaging.complex_probe import (
+            aberration_surface,
+            polar_spatial_frequencies,
+        )
+
+        coefs = {"C10": 40.0, "C32": 3e4, "phi32": 0.3, "C34": 2e4, "phi34": -0.2, "C41": 4e5}
+        coefs.update({"phi41": 0.7, "C50": 2e7})
+        probe_model = ProbeFourier.from_params(
+            {"energy": PROBE_ENERGY, "semiangle_cutoff": SEMIANGLE, **coefs},
+            num_probes=1,
+            aberration_keys=("C10", "C32", "C34", "C41", "C50"),
+        )
+        TestProbeFourier()._ptycho(counts, probe_model)
+        shape = tuple(int(v) for v in probe_model.roi_shape)
+        sampling = tuple(
+            float(v) for v in 1 / (probe_model.roi_shape * probe_model.reciprocal_sampling)
+        )
+        k, phi = polar_spatial_frequencies(shape, sampling)
+        wavelength = 0.019687
+        reference = aberration_surface(
+            k * wavelength, phi, wavelength, {key: torch.tensor(v) for key, v in coefs.items()}
+        )
+        inside = probe_model._aperture > 0.5
+        difference = (probe_model.chi().detach() - reference)[inside].abs().max()
+        assert float(difference) < 1e-4
+        for key, value in coefs.items():
+            assert probe_model.aberration_coefs[key] == pytest.approx(value, rel=1e-4)
+
+
+class TestProbeRealSpaceWindow:
+    def test_modes_vanish_at_the_box_edge(self, counts):
+        params = {"energy": PROBE_ENERGY, "defocus": 400.0, "semiangle_cutoff": SEMIANGLE}
+        probe_model = ProbePixelated.from_params(params, num_probes=2)
+        TestProbeFourier()._ptycho(counts, probe_model)
+        probe_model.constraints = PtychoProbeConstraintParams.Raster(real_space_window=0.5)
+        raw_probe = probe_model._probe.detach()
+        raw = raw_probe.abs().square().sum(0).numpy()
+        probe = probe_model._probe_orthogonalization_constraint(raw_probe)
+        probe = probe_model.apply_hard_constraints(probe)
+        intensity = probe.abs().square().sum(0).numpy()
+        rows, cols = intensity.shape
+        r = np.hypot(np.fft.fftfreq(rows)[:, None] * 2, np.fft.fftfreq(cols)[None, :] * 2)
+        assert raw[r >= 1].sum() > 0
+        assert np.all(intensity[r >= 1] < 1e-12)
+        np.testing.assert_allclose(intensity[r < 0.45], raw[r < 0.45], rtol=1e-4, atol=1e-8)
+
+
+class TestScanCalibration:
+    def test_correct_ellipticity_makes_the_disk_round(self):
+        from quantem.core.utils.diffractive_imaging_utils import (
+            correct_ellipticity,
+            fit_probe_ellipse,
+        )
+
+        rows, cols = np.indices((96, 96)).astype(float)
+        theta = 0.4
+        u = np.cos(theta) * (cols - 47.3) + np.sin(theta) * (rows - 48.6)
+        v = -np.sin(theta) * (cols - 47.3) + np.cos(theta) * (rows - 48.6)
+        disk = ((u / 30) ** 2 + (v / 26) ** 2 < 1).astype(float) * 100
+        corrected = correct_ellipticity(disk[None], fit_probe_ellipse(disk, show=False))[0]
+        _, _, a_axis, b_axis, _ = fit_probe_ellipse(corrected, show=False)
+        assert abs(a_axis / b_axis - 1) < 0.01
+        assert corrected.sum() == pytest.approx(disk.sum(), rel=1e-5)
+
+    def test_scan_transform_stretches_the_raster(self, counts):
+        def positions(transform):
+            pdset = PtychographyDatasetRaster.from_dataset4dstem(
+                make_dset(counts), verbose=0, learn_descan=False, learn_scan_positions=False
+            )
+            pdset.scan_transform = transform
+            pdset.preprocess(
+                com_fit_function="constant",
+                plot_rotation=False,
+                plot_com=False,
+                probe_energy=PROBE_ENERGY,
+                force_com_rotation=0,
+                force_com_transpose=False,
+            )
+            ptycho = Ptychography.from_models(
+                dset=pdset,
+                obj_model=ObjectPixelated.from_uniform(num_slices=1, obj_type="potential"),
+                probe_model=ProbePixelated.from_params(
+                    {"energy": PROBE_ENERGY, "defocus": 50.0, "semiangle_cutoff": SEMIANGLE}
+                ),
+                detector_model=DetectorPixelated(),
+                device="cpu",
+                verbose=0,
+                rng=0,
+            )
+            ptycho.preprocess(obj_padding_px=(8, 8), plot_rotation=False, plot_com=False)
+            ptycho.dset.reset()
+            p = ptycho.dset.positions_px.detach().numpy().astype(np.float64)
+            return p - p.mean(0)
+
+        plain = positions(None)
+        transform = np.array([[1.02, 0.01], [0.01, 0.99]])
+        stretched = positions(transform)
+        np.testing.assert_allclose(stretched, plain @ transform.T, atol=1e-3)

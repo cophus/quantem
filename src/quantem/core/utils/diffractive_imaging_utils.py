@@ -135,3 +135,62 @@ def fit_probe_ellipse(
         plt.show()
 
     return yc, xc, a_axis, b_axis, theta
+
+
+def correct_ellipticity(
+    array: np.ndarray,
+    ellipse: Tuple[float, float, float, float, float],
+    batch_size: int = 512,
+) -> np.ndarray:
+    """
+    Resample diffraction patterns so that an elliptical bright-field disk becomes circular.
+
+    Projector-lens distortion makes the image of the round condenser aperture elliptical, so the
+    detector pixels do not sample scattering angles uniformly. Each pattern is resampled
+    (bilinear) onto a grid on which the fitted ellipse is a circle with the same area, about the
+    same center, and rescaled to keep its total counts.
+
+    Parameters
+    ----------
+    array : np.ndarray
+        Diffraction patterns with shape ``(..., H, W)``.
+    ellipse : tuple
+        ``(row_center, col_center, a_axis, b_axis, theta)`` as returned by ``fit_probe_ellipse``
+        for the mean pattern.
+    batch_size : int, optional
+        Number of patterns resampled at a time.
+
+    Returns
+    -------
+    np.ndarray
+        Resampled patterns, float32, same shape as ``array``.
+    """
+    import torch
+
+    yc, xc, a_axis, b_axis, theta = (float(v) for v in ellipse)
+    H, W = array.shape[-2:]
+    radius = np.sqrt(a_axis * b_axis)
+    rows, cols = np.meshgrid(
+        np.arange(H, dtype=np.float64) - yc, np.arange(W, dtype=np.float64) - xc, indexing="ij"
+    )
+    cos, sin = np.cos(theta), np.sin(theta)
+    u = (cos * cols + sin * rows) * a_axis / radius  # along the a axis
+    v = (-sin * cols + cos * rows) * b_axis / radius
+    col_in = cos * u - sin * v + xc
+    row_in = sin * u + cos * v + yc
+    grid = torch.as_tensor(
+        np.stack([2 * col_in / (W - 1) - 1, 2 * row_in / (H - 1) - 1], -1), dtype=torch.float32
+    )[None]
+
+    frames = array.reshape(-1, H, W)
+    out = np.empty(frames.shape, dtype=np.float32)
+    for start in range(0, len(frames), batch_size):
+        x = torch.as_tensor(np.asarray(frames[start : start + batch_size], dtype=np.float32))[
+            :, None
+        ]
+        y = torch.nn.functional.grid_sample(
+            x, grid.expand(len(x), -1, -1, -1), mode="bilinear", align_corners=True
+        )[:, 0]
+        y = y * (x.sum((-1, -2, -3)) / y.sum((-1, -2)).clamp(min=1e-6))[:, None, None]
+        out[start : start + batch_size] = y.numpy()
+    return out.reshape(array.shape)

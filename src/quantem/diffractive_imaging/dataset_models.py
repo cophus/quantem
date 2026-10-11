@@ -1390,6 +1390,27 @@ class PtychographyDatasetRaster(DatasetConstraints):
 
     # endregion --- properties ---
 
+    @property
+    def scan_transform(self) -> np.ndarray | None:
+        """
+        Fixed linear correction of the raster scan, a 2x2 matrix acting on (row, column) scan
+        coordinates about the center of the scan, applied before the scan rotation. Use it for
+        a calibrated scan distortion (unequal fast and slow steps, non-orthogonal axes), which
+        ``scan_affine`` would otherwise have to learn. ``None`` (the default) leaves the raster
+        unchanged. Takes effect the next time the scan positions are computed (``preprocess``).
+        """
+        return getattr(self, "_scan_transform", None)
+
+    @scan_transform.setter
+    def scan_transform(self, transform: np.ndarray | None) -> None:
+        if transform is None:
+            self._scan_transform = None
+            return
+        transform = np.asarray(transform, dtype=np.float64)
+        if transform.shape != (2, 2):
+            raise ValueError(f"scan_transform must be a 2x2 matrix, got shape {transform.shape}")
+        self._scan_transform = transform
+
     def _set_initial_scan_positions_px(
         self,
         obj_padding_px: np.ndarray | tuple | None,
@@ -1430,6 +1451,12 @@ class PtychographyDatasetRaster(DatasetConstraints):
         c = c[pos_mask_2d]
 
         positions = np.stack((r.ravel(), c.ravel()), axis=-1).astype(config.get("dtype_real"))
+
+        if self.scan_transform is not None:
+            center = positions.mean(0)
+            positions = (center + (positions - center) @ self.scan_transform.T).astype(
+                config.get("dtype_real")
+            )
 
         if self.com_rotation_rad != 0:
             tf = AffineTransform(angle=self.com_rotation_rad)

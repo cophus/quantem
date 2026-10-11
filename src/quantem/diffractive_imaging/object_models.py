@@ -113,6 +113,11 @@ class PtychoObjConstraintParams:
         tv_weight_z : float, default ``0.0``
             Soft penalty. Weight on the depth-axis total-variation term in the
             loss. Multislice (``num_slices > 1``) only.
+        tv_z_sigma : float, default ``0.0``
+            Gaussian blur (A) of each slice before the depth-axis total variation. A locally
+            tilted lattice shifts the columns sideways from slice to slice, which the plain
+            depth TV penalizes; after a blur wider than those shifts, only the slowly varying
+            part of the object is pulled toward uniformity along the beam. ``0`` disables.
         tv_weight_xy : float, default ``0.0``
             Soft penalty. Weight on the in-plane total-variation term;
             encourages piecewise-smooth regions while preserving edges.
@@ -136,11 +141,12 @@ class PtychoObjConstraintParams:
         q_highpass: float | None = None  # A^-1
         # soft constraints
         tv_weight_z: float = 0.0
+        tv_z_sigma: float = 0.0  # A
         tv_weight_xy: float = 0.0
         surface_zero_weight: float = 0.0
         _name: str = "raster"
 
-        soft_constraint_keys = ["tv_weight_z", "tv_weight_xy", "surface_zero_weight"]
+        soft_constraint_keys = ["tv_weight_z", "tv_z_sigma", "tv_weight_xy", "surface_zero_weight"]
         hard_constraint_keys = [
             "positivity",
             "positivity_mode",
@@ -931,10 +937,24 @@ class ObjectConstraints(BaseConstraints[PtychoObjConstraintParams.Raster], Objec
                 w = weight[1]
             if w > 0:
                 calc_dim += 1
-                loss = loss + w * torch.mean(torch.abs(array.diff(dim=dim)))
+                values = array
+                if dim == 0 and array.ndim == 3:
+                    values = self._depth_tv_lowpass(array)
+                loss = loss + w * torch.mean(torch.abs(values.diff(dim=dim)))
         if calc_dim > 0:
             loss = loss / calc_dim
         return loss
+
+    def _depth_tv_lowpass(self, array: torch.Tensor) -> torch.Tensor:
+        """Gaussian blur of each slice by ``tv_z_sigma`` (A) for the depth TV, else unchanged."""
+        sigma = float(getattr(self.constraints, "tv_z_sigma", 0.0) or 0.0)
+        if sigma <= 0 or self._sampling is None:
+            return array
+        q_rows = torch.fft.fftfreq(array.shape[-2], self.sampling[0], device=array.device)
+        q_cols = torch.fft.fftfreq(array.shape[-1], self.sampling[1], device=array.device)
+        q2 = q_rows[:, None] ** 2 + q_cols[None, :] ** 2
+        kernel = torch.exp(-2 * np.pi**2 * sigma**2 * q2).to(array.dtype)
+        return torch.fft.ifft2(torch.fft.fft2(array) * kernel).real
 
     def get_surface_zero_loss(
         self, array: torch.Tensor, weight: float | int = 0.0

@@ -25,7 +25,7 @@ from quantem.diffractive_imaging.dataset_models import DatasetModelType
 from quantem.diffractive_imaging.detector_models import DetectorModelType
 from quantem.diffractive_imaging.logger_ptychography import LoggerPtychography
 from quantem.diffractive_imaging.object_models import ObjectINR, ObjectModelType, ObjectPixelated
-from quantem.diffractive_imaging.probe_models import ProbeModelType, ProbePixelated
+from quantem.diffractive_imaging.probe_models import ProbeFourier, ProbeModelType, ProbePixelated
 from quantem.diffractive_imaging.ptycho_losses import L2, DataCriterion
 from quantem.diffractive_imaging.ptycho_utils import (
     center_crop_arr,
@@ -264,10 +264,16 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
             ptycho.obj_model, ObjectPixelated
         ):
             raise TypeError("initialize_from requires pixelated object models")
-        if not isinstance(self.probe_model, ProbePixelated) or not isinstance(
-            ptycho.probe_model, ProbePixelated
+        fourier_probes = isinstance(self.probe_model, ProbeFourier) and isinstance(
+            ptycho.probe_model, ProbeFourier
+        )
+        if not fourier_probes and (
+            not isinstance(self.probe_model, ProbePixelated)
+            or not isinstance(ptycho.probe_model, ProbePixelated)
         ):
-            raise TypeError("initialize_from requires pixelated probe models")
+            raise TypeError(
+                "initialize_from requires two ProbePixelated or two ProbeFourier models"
+            )
         promotes = ptycho.obj_type == "potential" and self.obj_type == "phase_amplitude"
         if ptycho.obj_type != self.obj_type and not promotes:
             raise ValueError(f"object types differ: {ptycho.obj_type} and {self.obj_type}")
@@ -357,6 +363,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
         self.obj_model.slice_thicknesses = thicknesses
         self.compute_propagator_arrays()
 
+        if fourier_probes:
+            self._initialize_fourier_probe(ptycho, float(np.sum(thicknesses[:pad_top])))
+            self._set_obj_fov_mask()
+            return self
+
         # probe: Fourier interpolation to this pixel size, then pad or crop to this box
         probe = ptycho.probe
         num_px = np.round(ptycho.roi_shape * scale).astype("int")
@@ -385,6 +396,33 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
 
         self._set_obj_fov_mask()
         return self
+
+    def _initialize_fourier_probe(self, ptycho: "Ptychography", vacuum_above: float) -> None:
+        """Copy a ProbeFourier from ``ptycho`` and move it up through ``vacuum_above`` (A)."""
+        source, target = ptycho.probe_model, self.probe_model
+        if not np.array_equal(source.roi_shape, target.roi_shape) or not np.allclose(
+            source.reciprocal_sampling, target.reciprocal_sampling
+        ):
+            raise ValueError("ProbeFourier transfer needs the same box and reciprocal sampling")
+        if source.aberration_keys != target.aberration_keys:
+            raise ValueError("ProbeFourier transfer needs the same aberration_keys")
+        num_modes = min(source.num_probes, target.num_probes)
+        with torch.no_grad():
+            amplitude = target._initial_amplitude.clone()
+            phase = torch.zeros_like(amplitude)
+            amplitude[:num_modes] = source._amplitude.detach()[:num_modes].to(amplitude)
+            phase[:num_modes] = source._phase.detach()[:num_modes].to(phase)
+            target._amplitude_scale = source._amplitude_scale
+            target._initial_amplitude = amplitude
+            target._initial_phase = phase
+            target._initial_aberrations = source._aberrations.detach().clone()
+            weights = target._initial_mode_log_weights.clone()
+            weights[:num_modes] = source._mode_log_weights.detach().cpu()[:num_modes]
+            target._initial_mode_log_weights = weights
+            target.reset()
+        target.shift_defocus(-vacuum_above)  # the probe is now defined above the vacuum
+        target._initial_probe_tilt = source.probe_tilt.detach().cpu()
+        target.probe_tilt = target._initial_probe_tilt.clone().to(target.device)
 
     def _record_iter(self, iter_loss: float, autograd: bool) -> None:
         self._iter_losses.append(iter_loss)
