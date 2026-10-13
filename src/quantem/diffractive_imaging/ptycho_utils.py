@@ -847,6 +847,104 @@ def estimate_tilt(
     return (float(best[1]), float(best[2])), scores
 
 
+def estimate_tilt_map(
+    array: np.ndarray,
+    semiangle_mrad: float,
+    block_shape: tuple[int, int] = (20, 64),
+    radii: tuple[float, float] = (1.12, 1.68),
+    search_px: float = 7.0,
+    step_px: float = 0.5,
+    smooth_blocks: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Local crystal tilt across a scan from the Kikuchi pattern of the mean diffraction pattern.
+
+    For each block of scan positions, the mean pattern is divided by its radial profile about
+    the bright-field disk center, which removes the radial fall-off and keeps the Kikuchi
+    texture, and the dark-field annulus ``radii`` (in units of the disk radius) is searched for
+    its center of inversion symmetry. The offset of that center
+    from the disk center is the beam direction relative to the zone axis, in the detector
+    frame, which is also the frame of the multislice propagation. The block tilts are smoothed
+    along the scan rows and interpolated to every scan position, ready for
+    ``dset.position_tilts``.
+
+    Parameters
+    ----------
+    array : np.ndarray
+        4D-STEM data with shape ``(scan_rows, scan_cols, det_rows, det_cols)``.
+    semiangle_mrad : float
+        Convergence semiangle, which sets the detector scale with the fitted disk radius.
+    block_shape : tuple[int, int], optional
+        Scan positions averaged per block (rows, cols).
+    radii : tuple[float, float], optional
+        Inner and outer radius of the dark-field annulus, in disk radii.
+    search_px : float, optional
+        Largest offset searched, in detector pixels.
+    step_px : float, optional
+        Search step, in detector pixels.
+    smooth_blocks : float, optional
+        Gaussian smoothing of the block tilts along the scan rows, in blocks.
+    Returns
+    -------
+    tilts : np.ndarray
+        Tilt at every scan position, ``(scan_rows, scan_cols, 2)`` in mrad (rows, cols).
+    block_tilts : np.ndarray
+        Unsmoothed block tilts ``(n_row_blocks, n_col_blocks, 2)`` in mrad.
+    """
+    from scipy.interpolate import RegularGridInterpolator
+    from scipy.ndimage import gaussian_filter, gaussian_filter1d, map_coordinates
+
+    from quantem.core.utils.diffractive_imaging_utils import fit_probe_circle
+
+    rows, cols = array.shape[:2]
+    br, bc = block_shape
+    r_starts, c_starts = range(0, rows, br), range(0, cols, bc)
+    block_tilts = np.zeros((len(r_starts), len(c_starts), 2))
+    offsets = np.arange(-search_px, search_px + 1e-9, step_px)
+    for i, r0 in enumerate(r_starts):
+        for j, c0 in enumerate(c_starts):
+            dp = np.asarray(array[r0 : r0 + br, c0 : c0 + bc], dtype=np.float64).mean((0, 1))
+            cy, cx, radius = fit_probe_circle(dp, show=False)
+            yy, xx = np.indices(dp.shape).astype(np.float64)
+            # divide by the radial profile about the disk center, which removes everything that
+            # is radially symmetric about it (the fall-off) and keeps the Kikuchi texture
+            rb = np.round(np.hypot(yy - cy, xx - cx)).astype(int)
+            profile = np.bincount(rb.ravel(), dp.ravel()) / np.maximum(np.bincount(rb.ravel()), 1)
+            rel = gaussian_filter(dp / np.maximum(profile[rb], 1e-12 * profile.max()) - 1, 1.5)
+            best = (-np.inf, 0.0, 0.0)
+            for dy in offsets:
+                for dx in offsets:
+                    # compare the annulus about the candidate center with its mirror image
+                    r = np.hypot(yy - cy - dy, xx - cx - dx)
+                    m = (r > radii[0] * radius) & (r < radii[1] * radius)
+                    my, mx = 2 * (cy + dy) - yy[m], 2 * (cx + dx) - xx[m]
+                    v = map_coordinates(rel, [my, mx], order=1)
+                    score = np.corrcoef(rel[m], v)[0, 1]
+                    if score > best[0]:
+                        best = (score, dy, dx)
+            block_tilts[i, j] = np.array(best[1:]) * semiangle_mrad / radius
+    smoothed = (
+        gaussian_filter1d(block_tilts, smooth_blocks, axis=0, mode="nearest")
+        if smooth_blocks > 0
+        else block_tilts
+    )
+    rc = np.array([min(r0 + br / 2, (r0 + rows) / 2) for r0 in r_starts]) - 0.5
+    cc = np.array([min(c0 + bc / 2, (c0 + cols) / 2) for c0 in c_starts]) - 0.5
+    grid_r, grid_c = np.meshgrid(np.arange(rows), np.arange(cols), indexing="ij")
+    points = np.stack([np.clip(grid_r, rc[0], rc[-1]), np.clip(grid_c, cc[0], cc[-1])], -1)
+    tilts = np.zeros((rows, cols, 2))
+    for k in range(2):
+        values = smoothed[..., k]
+        if len(rc) == 1 or len(cc) == 1:  # interpolate along the axis that has blocks
+            axis_points = rc if len(cc) == 1 else cc
+            line = values[:, 0] if len(cc) == 1 else values[0]
+            coord = points[..., 0] if len(cc) == 1 else points[..., 1]
+            tilts[..., k] = np.interp(coord, axis_points, line)
+        else:
+            tilts[..., k] = RegularGridInterpolator((rc, cc), values)(points)
+    return tilts, block_tilts
+
+
 def detector_noise_response(
     dset,
     bin_factor: int = 1,

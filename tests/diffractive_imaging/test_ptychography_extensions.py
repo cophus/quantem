@@ -907,3 +907,113 @@ class TestScanCalibration:
         transform = np.array([[1.02, 0.01], [0.01, 0.99]])
         stretched = positions(transform)
         np.testing.assert_allclose(stretched, plain @ transform.T, atol=1e-3)
+
+
+class TestPositionTilts:
+    def _ptycho(self, counts, probe_tilt=(0.0, 0.0)):
+        pdset = PtychographyDatasetRaster.from_dataset4dstem(
+            make_dset(counts), verbose=0, learn_descan=False, learn_scan_positions=False
+        )
+        pdset.preprocess(
+            com_fit_function="constant",
+            plot_rotation=False,
+            plot_com=False,
+            probe_energy=PROBE_ENERGY,
+            force_com_rotation=0,
+            force_com_transpose=False,
+        )
+        ptycho = Ptychography.from_models(
+            dset=pdset,
+            obj_model=ObjectPixelated.from_uniform(
+                num_slices=4, slice_thicknesses=20, obj_type="potential"
+            ),
+            probe_model=ProbePixelated.from_params(
+                {"energy": PROBE_ENERGY, "defocus": 50.0, "semiangle_cutoff": SEMIANGLE},
+                probe_tilt=probe_tilt,
+            ),
+            detector_model=DetectorPixelated(),
+            device="cpu",
+            verbose=0,
+            rng=0,
+        )
+        ptycho.preprocess(obj_padding_px=(8, 8), plot_rotation=False, plot_com=False)
+        with torch.no_grad():
+            gen = torch.Generator().manual_seed(0)
+            obj = ptycho.obj_model._obj
+            obj.data = 0.3 * torch.rand(obj.shape, generator=gen, dtype=obj.dtype)
+        return ptycho
+
+    def _intensities(self, ptycho, indices):
+        patch_data, _, fractional, descan = ptycho.dset.forward(indices, ptycho.obj_padding_px)
+        probes = ptycho.probe_model.forward(fractional)
+        patches = ptycho.obj_model.forward(patch_data)
+        ptycho.compute_propagator_arrays()
+        _, overlap = ptycho.forward_operator(
+            patches, probes, descan, ptycho.dset.batch_tilts(indices)
+        )
+        return ptycho.predict_intensities(overlap, probes).detach()
+
+    def test_uniform_position_tilts_match_probe_tilt(self, counts):
+        indices = torch.arange(6)
+        global_tilt = self._ptycho(counts, probe_tilt=(3.0, -2.0))
+        local_tilt = self._ptycho(counts)
+        local_tilt.dset.position_tilts = np.tile([3.0, -2.0], (local_tilt.dset.num_positions, 1))
+        np.testing.assert_allclose(
+            self._intensities(local_tilt, indices).numpy(),
+            self._intensities(global_tilt, indices).numpy(),
+            rtol=1e-4,
+            atol=1e-6,
+        )
+        plain = self._intensities(self._ptycho(counts), indices).numpy()
+        assert np.abs(plain - self._intensities(global_tilt, indices).numpy()).max() > 1e-4
+
+    def test_raster_shaped_tilts_and_analytic_path(self, counts):
+        ptycho = self._ptycho(counts)
+        rows, cols = (int(n) for n in ptycho.dset.gpts)
+        ptycho.dset.position_tilts = np.zeros((rows, cols, 2))
+        assert tuple(ptycho.dset.position_tilts.shape) == (ptycho.dset.num_positions, 2)
+        ptycho.reconstruct(
+            num_iters=1,
+            reset=True,
+            optimizer_params={"object": OptimizerParams.Adam(lr=1e-3)},
+            batch_size=8,
+        )
+        with pytest.raises(ValueError, match="per-position tilts"):
+            ptycho.reconstruct(num_iters=1, autograd=False, batch_size=8)
+
+
+class TestEstimateTiltMap:
+    def test_recovers_kikuchi_center_offsets(self):
+        from quantem.core.utils.diffractive_imaging_utils import fit_probe_circle
+        from quantem.diffractive_imaging import estimate_tilt_map
+
+        size, center, radius = 128, 64.0, 20.0
+        rows, cols = np.indices((size, size)).astype(float)
+
+        def pattern(dy, dx):
+            # bright-field disk plus Kikuchi-like bands through the zone axis (the disk center
+            # shifted by dy, dx), under a radial fall-off about the disk center
+            bands = np.zeros((size, size))
+            for angle, width in (
+                (0.0, 3.0),
+                (np.pi / 4, 2.0),
+                (np.pi / 2, 3.0),
+                (3 * np.pi / 4, 2.0),
+            ):
+                dist = (rows - center - dy) * np.cos(angle) - (cols - center - dx) * np.sin(angle)
+                bands += np.exp(-((dist / width) ** 2))
+            r = np.hypot(rows - center, cols - center)
+            return 100.0 * (r < radius) + (r >= radius) * np.exp(-r / 30) * (1 + bands)
+
+        data = np.zeros((8, 4, size, size))
+        data[:4] = pattern(2.0, 1.0)
+        data[4:] = pattern(-3.0, 2.0)
+        fitted_radius = fit_probe_circle(data[0, 0], show=False)[2]
+        # with the semiangle set to the fitted disk radius, tilts come out in detector pixels
+        tilts, blocks = estimate_tilt_map(
+            data, semiangle_mrad=fitted_radius, block_shape=(4, 4), search_px=4, smooth_blocks=0
+        )
+        assert tilts.shape == (8, 4, 2)
+        np.testing.assert_allclose(blocks[0, 0], [2.0, 1.0], atol=0.26)
+        np.testing.assert_allclose(blocks[1, 0], [-3.0, 2.0], atol=0.26)
+        np.testing.assert_allclose(tilts[0, 0], blocks[0, 0])

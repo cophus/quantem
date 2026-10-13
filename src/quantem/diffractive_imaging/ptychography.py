@@ -665,6 +665,11 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 f"got {type(self._criterion).__name__} with target_space="
                 f"{self._criterion.target_space!r}. Use autograd=True for other losses."
             )
+        if not autograd and self.dset.position_tilts is not None:
+            raise ValueError(
+                "autograd=False does not support per-position tilts (dset.position_tilts); "
+                "use autograd=True."
+            )
         self.dset._set_targets(self._criterion.target_space)
         self.compute_propagator_arrays()  # required to avoid issue if stopped learning probe tilt
 
@@ -712,7 +717,10 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                 shifted_probes = self.probe_model.forward(positions_px_fractional)
                 obj_patches = self.obj_model.forward(patch_data)
                 propagated_probes, overlap = self.forward_operator(
-                    obj_patches, shifted_probes, descan_shifts
+                    obj_patches,
+                    shifted_probes,
+                    descan_shifts,
+                    self.dset.batch_tilts(batch_indices),
                 )
                 pred_intensities = self.predict_intensities(overlap, shifted_probes)
 
@@ -779,7 +787,10 @@ class Ptychography(PtychographyOpt, PtychographyVisualizations, PtychographyBase
                         shifted_probes = self.probe_model.forward(positions_px_fractional)
                         obj_patches = self.obj_model.forward(patch_data)
                         _propagated_probes, overlap = self.forward_operator(
-                            obj_patches, shifted_probes, descan_shifts
+                            obj_patches,
+                            shifted_probes,
+                            descan_shifts,
+                            self.dset.batch_tilts(batch_indices),
                         )
                         pred_intensities = self.predict_intensities(overlap, shifted_probes)
                         batch_val_loss = self.error_estimate(

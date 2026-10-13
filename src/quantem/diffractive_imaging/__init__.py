@@ -56,6 +56,7 @@ from quantem.diffractive_imaging.origin_models import (
 from quantem.diffractive_imaging.ptycho_utils import (
     detector_noise_response as detector_noise_response,
     estimate_tilt as estimate_tilt,
+    estimate_tilt_map as estimate_tilt_map,
     refine_slices as refine_slices,
     shear_slices as shear_slices,
     split_counts as split_counts,

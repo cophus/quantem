@@ -943,6 +943,41 @@ class PtychographyDatasetBase(
 
     # endregion --- abstract class methods ---
 
+    @property
+    def position_tilts(self) -> torch.Tensor | None:
+        """
+        Local tilt at each probe position, ``(num_positions, 2)`` in mrad (rows, columns), added
+        to the probe model's ``probe_tilt`` in the propagation between slices. Use it when the
+        crystal tilt varies across the field of view (for example a relaxed film on a
+        substrate), so one reconstruction can follow both. ``None`` (the default) uses only the
+        global ``probe_tilt``. Set it with an array of shape ``(num_positions, 2)`` or, for a
+        raster scan, ``(rows, cols, 2)``.
+        """
+        return getattr(self, "_position_tilts", None)
+
+    @position_tilts.setter
+    def position_tilts(self, tilts: np.ndarray | torch.Tensor | None) -> None:
+        if tilts is None:
+            self._position_tilts = None
+            return
+        tilts = torch.as_tensor(np.asarray(tilts, dtype=np.float32))
+        if tilts.ndim == 3:
+            mask = self.positions_mask.reshape(-1).cpu()
+            tilts = tilts.reshape(-1, 2)[mask]
+        if tuple(tilts.shape) != (self.num_positions, 2):
+            raise ValueError(
+                f"position_tilts must have shape ({self.num_positions}, 2) or (rows, cols, 2), "
+                f"got {tuple(tilts.shape)}"
+            )
+        self._position_tilts = tilts.to(self.device)
+
+    def batch_tilts(self, batch_indices: torch.Tensor) -> torch.Tensor | None:
+        """Per-position tilts (mrad) for a batch, or None without ``position_tilts``."""
+        tilts = self.position_tilts
+        if tilts is None:
+            return None
+        return tilts.to(batch_indices.device)[batch_indices]
+
     # region --- class methods ---
     def vprint(self, m: Any, level: int = 1, *args, **kwargs) -> None:
         """Print messages if verbose is enabled."""

@@ -1098,10 +1098,13 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         obj_patches: torch.Tensor,
         shifted_input_probes: torch.Tensor,
         descan: torch.Tensor | None = None,
+        tilts: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.probe_model.learn_probe_tilt or self.obj_model.learn_slice_thickness:
             self.compute_propagator_arrays()
-        propagated_probes, overlap = self.overlap_projection(obj_patches, shifted_input_probes)
+        propagated_probes, overlap = self.overlap_projection(
+            obj_patches, shifted_input_probes, tilts
+        )
         ## prop_probes shape: (nslices, nprobes, batch_size, roi_shape[0], roi_shape[1])
         ## overlap shape: (nprobes, batch_size, roi_shape[0], roi_shape[1])
         if descan is not None:
@@ -1138,15 +1141,25 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         loss = error / self.dset.mean_diffraction_intensity
         return loss
 
-    def overlap_projection(self, obj_patches, input_probe):
+    def overlap_projection(self, obj_patches, input_probe, tilts=None):
         """Multiplies `input_probes` with roi-shaped patches from `obj_array`.
         This version is for GD only -- AD does not require all the propagated probe
         slices and trying to store them causes in-place issues
+
+        ``tilts`` (batch, 2), in mrad, adds a tilt per probe position to the propagation between
+        slices, on top of the probe model's ``probe_tilt``: the wave is shifted laterally by
+        ``dz * tan(tilt)`` per slice, as for a crystal locally tilted by ``-tilt``.
         """
+        tilt_phase = self._tilt_phase(tilts) if tilts is not None else None
+        thicknesses = self.obj_model.slice_thicknesses if tilt_phase is not None else None
         propagated_probes = [input_probe]
         overlap = obj_patches[0] * input_probe
         for s in range(1, self.num_slices):
-            propagated_probe = self._propagate_array(overlap, self._propagators[s - 1])
+            propagator = self._propagators[s - 1]
+            if tilt_phase is not None:
+                dz = thicknesses[s - 1].to(device=tilt_phase.device, dtype=tilt_phase.dtype)
+                propagator = propagator * torch.polar(torch.ones_like(tilt_phase), dz * tilt_phase)
+            propagated_probe = self._propagate_array(overlap, propagator)
             overlap = obj_patches[s] * propagated_probe
             propagated_probes.append(propagated_probe)
 
@@ -1196,6 +1209,24 @@ class PtychographyBase(RNGMixin, AutoSerialize):
         # incoherent sum of all probe components
         overlap_fft = torch.fft.fft2(overlap_array, norm="ortho")
         return torch.sum(torch.abs(overlap_fft) ** 2, dim=0)
+
+    def _tilt_phase(self, tilts: torch.Tensor) -> torch.Tensor:
+        """Phase per angstrom of propagation for per-position tilts (batch, 2) in mrad, on the
+        reciprocal grid of the forward-model box: ``-2 pi (tan(t_r) k_r + tan(t_c) k_c)``."""
+        shape = tuple(int(n) for n in self.roi_shape)
+        kr, kc = (
+            torch.fft.fftfreq(n, float(d), device=tilts.device)
+            for n, d in zip(shape, self.sampling)
+        )
+        tan = torch.tan(tilts.to(kr.dtype) * 1e-3)
+        return (
+            -2
+            * np.pi
+            * (
+                tan[:, 0, None, None] * kr[None, :, None]
+                + tan[:, 1, None, None] * kc[None, None, :]
+            )
+        )
 
     def _propagate_array(
         self, array: "torch.Tensor", propagator_array: "torch.Tensor"
