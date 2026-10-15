@@ -6,10 +6,11 @@ lives on the FFT grid of the (displaced) atom positions, with the Bragg
 nodes of the average lattice removed; the diffuse intensity of each pattern
 is ``|F|^2`` read where the pattern's Ewald sphere (with its fitted tilt)
 cuts the grid, averaged over the cubic rotations so the model is as
-symmetric as the (statistically cubic) foil. Moves are swaps of unlike atoms
-and omega embryos (three consecutive atoms of a <111> row, the last two
-collapsed toward each other by a/12); each changes ``F`` by a few phase
-factors, so every move is scored exactly without recomputing the supercell.
+symmetric as the (statistically cubic) foil. Each Monte Carlo move changes
+``F`` by a few phase factors, so every move is scored exactly without
+recomputing the supercell. The move types are species swaps, single-atom
+displacements on the fine position grid and, optionally, omega embryos (see
+`ReverseMonteCarlo.run`).
 
 Bragg peaks with their tails and the direct-beam bloom are masked by sigmoid
 weights; a smooth background (constant, direct-beam Lorentzian, a wide
@@ -23,6 +24,15 @@ is set by the moves' randomness unless something else tells them apart.
 species pushes its neighbours by its misfit through harmonic springs, and the
 resulting displacement field (Huang and size-effect scattering, odd about
 every Bragg peak) depends on which species sits where.
+
+Workflow: ``from_images`` -> ``set_crystal`` -> ``fit_geometry`` ->
+``fit_thickness`` -> ``set_mask`` -> ``build_supercell`` -> ``fit_background``
+-> ``run`` -> analysis and plots. ``set_envelope``, ``set_size_effect`` and
+``fit_size_effect`` are optional. See `ReverseMonteCarlo` for details.
+
+Limitations: cubic unit cells only; every mixed-occupancy site must share one
+composition; static displacements (and ``displacement_correlations``) are
+implemented for BCC site lattices only.
 """
 
 from __future__ import annotations
@@ -84,8 +94,45 @@ def _default_device() -> str:
 class ReverseMonteCarlo(AutoSerialize):
     """Reverse Monte Carlo fit of one supercell to diffraction patterns along several zone axes.
 
-    Build with :meth:`from_images`, then ``set_crystal`` -> ``fit_geometry`` ->
-    ``set_mask`` -> ``build_supercell`` -> ``fit_background`` -> ``run``.
+    Notes
+    -----
+    Workflow:
+
+    1. ``from_images``: patterns, their zone axes, beam energy and pixel size.
+    2. ``set_crystal``: average structure with the mixed-occupancy sites.
+    3. ``fit_geometry``: center, detector distortion and tilt of each pattern.
+    4. ``fit_thickness``: Bloch-wave thickness and tilt from the Bragg
+       intensities (required for ``envelope="bloch"``; recommended otherwise
+       since it refines the tilts).
+    5. ``set_mask``: diffuse weights, binned data and Bragg intensities.
+    6. ``build_supercell``: random supercell at the crystal's composition.
+    7. ``fit_background``: diffuse scale and smooth background per pattern.
+    8. ``run``: Monte Carlo sweeps.
+    9. Analysis (``r_factors``, ``warren_cowley``, ``displacement_correlations``,
+       ``diffuse_section``, ...) and ``plot_*`` methods.
+
+    Optional steps after ``build_supercell``: ``set_envelope`` switches the
+    diffuse envelope; ``set_size_effect`` / ``fit_size_effect`` add the linear
+    size effect.
+
+    Moves: ``run`` mixes three move types on the current supercell:
+
+    - species swaps of two unlike atoms (composition conserved);
+    - single-atom random displacements by one step of the fine position grid
+      along each axis (``random_fraction``, default 0.5, when the supercell
+      was built with ``displacements=True``);
+    - omega embryos, three consecutive atoms of a <111> row with the last two
+      collapsed toward each other (``omega_fraction``, default 0).
+
+    Limitations: cubic unit cells only. Every mixed-occupancy site must share one
+    composition. Static displacements and ``displacement_correlations`` are
+    implemented for BCC site lattices only.
+
+    Saving and loading: save without the arrays that can be rebuilt, then load with
+    `quantem.core.io.load`, which calls ``_post_load`` to rebuild them::
+
+        rmc.save(path, mode="o", skip=rmc.DERIVED_ATTRIBUTES)
+        rmc = quantem.core.io.load(path)
     """
 
     _token = object()
@@ -323,6 +370,35 @@ class ReverseMonteCarlo(AutoSerialize):
         excitation error is ``s = -(|g|^2 / 2K + tilt . g)`` and its intensity
         ``|F|^2 exp(-s^2 / 2 sigma^2)``. Zero tilt puts the Laue circle on the
         direct beam.
+
+        Parameters
+        ----------
+        scale_range : (float, float), optional
+            Range of the pixel-size scale factor searched in the coarse
+            indexing step, relative to ``sampling``. Default (0.85, 1.2).
+        k_max : float, optional
+            Largest scattering vector (1/A) of the reflections used for
+            indexing and tilt fitting. Default 1.6.
+        centers : sequence of (row, col) or None, optional
+            Approximate direct-beam position of each pattern in pixels; None
+            entries (or ``centers=None``) use the halo center.
+        fit_tilt : bool, optional
+            Fit the tilt of each pattern. If False, the tilts are zero.
+        verbose : bool, optional
+            Print the fitted geometry of each pattern.
+
+        Returns
+        -------
+        ReverseMonteCarlo
+            self. The results are stored in ``self.geometry``, a dict of
+            per-pattern lists: "centers" (row, col) px, "matrices" (2x2, px
+            per 1/A at the CIF lattice parameter), "tilts" (zone-frame vector,
+            radians), "a" (lattice parameter, A), "rms_px", "n_matched",
+            "peaks", "bragg_hkl", "bragg_g", "bragg_px", "bragg_intensity" and
+            "excitation_width" (1/A). "excitation_width" is the width of the
+            Gaussian excitation-error profile fitted with the tilt; it is a
+            diagnostic only and is not used later. ``self.lattice_parameter``
+            is set to the mean of "a".
         """
         if self.crystal is None:
             raise RuntimeError("set_crystal first")
@@ -330,6 +406,7 @@ class ReverseMonteCarlo(AutoSerialize):
         k_wave = 1.0 / self.wavelength
         geo = dict(centers=[], matrices=[], tilts=[], a=[], rms_px=[], n_matched=[], peaks=[])
         geo.update(bragg_hkl=[], bragg_g=[], bragg_intensity=[], bragg_px=[], excitation_width=[])
+        geo["_inten_kin"] = []  # kinematic |F|^2 of each pattern's reflections, for _fit_tilt
         for i, (im, zone) in enumerate(zip(self.images, self.zone_axes)):
             pts, heights, prom = self._find_peaks(im)
             guess = (
@@ -395,7 +472,7 @@ class ReverseMonteCarlo(AutoSerialize):
             geo["bragg_g"].append(g2)  # zone frame, at the CIF lattice parameter
             geo["bragg_px"].append(p_all)
             geo["bragg_intensity"].append(inten_meas)
-            geo["_inten_kin"] = geo.get("_inten_kin", []) + [inten]
+            geo["_inten_kin"].append(inten)
             if verbose:
                 print(
                     f"{self.names[i]}: center ({c[0]:.1f}, {c[1]:.1f}), a = {a_i:.4f} A, "
@@ -521,7 +598,37 @@ class ReverseMonteCarlo(AutoSerialize):
         best thickness and tilt are stored, with each beam's intensity averaged over depth,
         ``(1/t) int_0^t |phi_g(z)|^2 dz``: the beams that generate diffuse scattering inside
         the foil, used by ``envelope="bloch"``.
+
+        Parameters
+        ----------
+        thickness : (float, float), optional
+            Thickness range searched, in A. Default (20, 1000).
+        step : float, optional
+            Thickness step, in A. Default 10.
+        tilt_range_deg : float, optional
+            Half width of the tilt search about the current tilt, along each
+            zone-frame axis, in degrees. Default 0.6.
+        tilt_step_deg : float, optional
+            Tilt search step, in degrees. Default 0.1.
+        k_max : float, optional
+            Largest scattering vector (1/A) of the Bloch-wave beams. Default
+            1.6. Stored in ``geometry["thickness_k_max"]`` for
+            ``plot_thickness``.
+        depth_samples : int, optional
+            Depths at which the beam intensities are averaged. Default 24.
+        verbose : bool, optional
+            Print the result for each pattern.
+
+        Returns
+        -------
+        dict
+            ``{name: {"thickness": A, "tilt_deg": degrees off the zone axis}}``
+            per pattern. ``self.geometry`` is updated in place: "tilts",
+            "thickness", "bloch_g", "bloch_p", "bloch_score" and
+            "thickness_k_max".
         """
+        if self.geometry is None:
+            raise RuntimeError("fit_geometry first")
         from quantem.diffraction import bloch
 
         crystal = self.crystal
@@ -533,6 +640,7 @@ class ReverseMonteCarlo(AutoSerialize):
         geo.setdefault("bloch_g", [None] * len(self.images))
         geo.setdefault("bloch_p", [None] * len(self.images))
         geo.setdefault("bloch_score", [None] * len(self.images))
+        geo["thickness_k_max"] = float(k_max)
         results = {}
         for i in range(len(self.images)):
             hkl_m, meas = self._measured_bragg(i)
@@ -591,7 +699,8 @@ class ReverseMonteCarlo(AutoSerialize):
 
     def plot_thickness(self, **kwargs):
         """Bloch thickness fit per pattern: misfit against thickness (top) and measured against
-        calculated Bragg intensities at the best fit, square-root scale (bottom)."""
+        calculated Bragg intensities at the best fit, square-root scale (bottom). Uses the
+        ``k_max`` given to ``fit_thickness``."""
         import matplotlib.pyplot as plt
 
         from quantem.diffraction import bloch
@@ -613,7 +722,7 @@ class ReverseMonteCarlo(AutoSerialize):
                 self._orientation_quat(i, self.geometry["tilts"][i]),
                 [t_best],
                 self.energy,
-                k_max=1.6,
+                k_max=self.geometry.get("thickness_k_max", 1.6),
             )
             lookup = {
                 tuple(h): v
@@ -677,7 +786,34 @@ class ReverseMonteCarlo(AutoSerialize):
         percent of the local diffuse level by 0.12 1/A.
 
         Each reflection's integrated intensity weights the diffuse envelope.
+
+        Parameters
+        ----------
+        bragg_radius : float, optional
+            Distance (1/A) from each reflection at which the weight reaches
+            0.5. Default 0.12.
+        softness : float, optional
+            Width (1/A) of the sigmoid edges. Default 0.01.
+        q_max : float, optional
+            Largest scattering vector (1/A) fitted. Default 1.2.
+        center_radius : float, optional
+            Radius (1/A) of the direct-beam bloom removed. Default 0.25.
+        edge_px : int, optional
+            Detector-edge border (unbinned pixels) given zero weight. 0 keeps
+            the whole detector. Default 8.
+
+        Returns
+        -------
+        ReverseMonteCarlo
+            self. The results are stored in ``self.mask``: per-pattern lists
+            "y" (weighted mean of each binned pixel, normalized), "w" (binned
+            weight, 0 to 1), "k" (zone-frame q of each binned pixel, 1/A),
+            "data" (binned pattern, normalized), "scale" (normalization),
+            "bragg_k" and "bragg_intensity" (reflections fully on the
+            detector), plus the parameters above.
         """
+        if self.geometry is None:
+            raise RuntimeError("fit_geometry first")
         b = self.bin_factor
         out = dict(
             bragg_radius=bragg_radius, softness=softness, q_max=q_max, center_radius=center_radius
@@ -698,8 +834,9 @@ class ReverseMonteCarlo(AutoSerialize):
                 * _sigmoid((q - center_radius) / softness)
                 * (q < q_max)
             )
-            w[:edge_px] = w[-edge_px:] = 0
-            w[:, :edge_px] = w[:, -edge_px:] = 0
+            if edge_px > 0:
+                w[:edge_px] = w[-edge_px:] = 0
+                w[:, :edge_px] = w[:, -edge_px:] = 0
             y = im[:ny, :nx].astype(np.float64)
 
             # integrated Bragg intensities over the local ring median
@@ -763,10 +900,16 @@ class ReverseMonteCarlo(AutoSerialize):
         cells : int
             Unit cells along each cube edge. The diffuse model is sampled
             every ``1 / (cells a)`` in reciprocal space.
+        seed : int or None
+            Seed of the random generator (stored as ``self.rng``) used for the
+            initial species arrangement and for every later Monte Carlo move.
+            None seeds from fresh OS entropy. Default 0.
         displacements : bool
             Allow static displacements. Positions live on a grid
             ``a / displacement_grid`` fine, so every move is still scored
-            exactly.
+            exactly. Implemented for BCC site lattices only: the default
+            True raises NotImplementedError for any other site lattice, so
+            pass False there.
         displacement_grid : int
             Steps per lattice parameter of the displacement grid (a multiple
             of 24): 24 gives 0.15 A steps, 48 gives 0.076 A for a = 3.66 A.
@@ -791,8 +934,9 @@ class ReverseMonteCarlo(AutoSerialize):
             averaged intensities, which dynamical diffraction makes differ
             from their exit intensities. "bloch" takes the depth-averaged
             Bloch-wave beam intensities at each pattern's fitted thickness and
-            tilt (``fit_thickness``), with one diffuse scale for all patterns.
-            "kinematic" keeps only the direct beam.
+            tilt (requires ``fit_thickness``); use it with ``shared_scale``
+            so one diffuse scale covers all patterns. "kinematic" keeps only
+            the direct beam.
         resolution : float
             Gaussian sigma, in supercell reciprocal-grid steps, with which
             each pixel reads the diffuse grid (27 nearest points). A finite
@@ -801,14 +945,22 @@ class ReverseMonteCarlo(AutoSerialize):
             trilinearly, about half as many grid points in total (faster).
         shared_scale : bool
             One diffuse scale for every pattern; the envelope carries each
-            pattern's absolute Bragg intensities.
+            pattern's absolute Bragg intensities. Ignored with
+            ``envelope="fitted"``, whose beam weights are solved per pattern.
         max_beams : int
             Strongest Bragg beams of each pattern in the diffuse envelope.
         device : str, optional
-            torch device; default cuda, then mps, then cpu.
+            torch device. Default cuda when available, otherwise cpu; mps is
+            used only when requested explicitly.
+
+        Returns
+        -------
+        ReverseMonteCarlo
+            self.
         """
         if self.mask is None:
             raise RuntimeError("set_mask first")
+        self._check_envelope(envelope)
         rng = np.random.default_rng(seed)
         self.rng = rng
         d = self.grid_divisor
@@ -976,7 +1128,7 @@ class ReverseMonteCarlo(AutoSerialize):
             self.images
         ):
             # direct-beam Lorentzian half width, wide Gaussian sigma and its center, 1/A; the
-            # wide Gaussian floats because a tilted crystal centers its diffuse and Kikuchi
+            # wide Gaussian's center floats because a tilted crystal centers its smooth
             # background on the zone-axis pole rather than the direct beam
             self.background_sigmas = [(0.1, 0.8, 0.0, 0.0) for _ in self.images]
         self._sigma_bounds = (np.array([0.01, 0.3, -1.0, -1.0]), np.array([1.0, 3.0, 1.0, 1.0]))
@@ -990,9 +1142,31 @@ class ReverseMonteCarlo(AutoSerialize):
                 self.coefficients = c
             self._update_residual()
 
+    _ENVELOPES = ("measured", "fitted", "bloch", "kinematic")
+
+    def _check_envelope(self, envelope: str) -> None:
+        """Raise if ``envelope`` is unknown, or is "bloch" before ``fit_thickness``."""
+        if envelope not in self._ENVELOPES:
+            raise ValueError(f"unknown envelope {envelope!r}; use one of {self._ENVELOPES}")
+        if envelope == "bloch":
+            bloch_g = (self.geometry or {}).get("bloch_g")
+            if bloch_g is None or any(g is None for g in bloch_g):
+                raise RuntimeError("fit_thickness before envelope='bloch'")
+
     def set_envelope(self, envelope: str) -> "ReverseMonteCarlo":
-        """Switch the diffuse envelope ("fitted", "measured", "bloch", "kinematic") and refit the
-        scale and background for the current supercell."""
+        """Switch the diffuse envelope and refit the scale and background.
+
+        Parameters
+        ----------
+        envelope : {"measured", "fitted", "bloch", "kinematic"}
+            See ``build_supercell``. "bloch" requires ``fit_thickness``.
+
+        Returns
+        -------
+        ReverseMonteCarlo
+            self.
+        """
+        self._check_envelope(envelope)
         self.envelope = envelope
         self._setup_forward()
         self._solve_linear(self._model_diffuse(), refit_sigmas=True)
@@ -1062,11 +1236,27 @@ class ReverseMonteCarlo(AutoSerialize):
         return out
 
     def set_size_effect(self, eta: dict[str, float] | str | None = "radii") -> "ReverseMonteCarlo":
-        """Linear size effect: species mismatch ``eta_s`` (dimensionless, relative to the mean).
+        """Set the linear size effect: species mismatch ``eta_s`` (dimensionless).
 
-        ``"radii"`` takes ``(r_s - r_mean) / r_mean`` from metallic radii (V 1.34, Nb 1.46,
-        Zr 1.60 A); a dict sets them; None switches the size effect off. Only differences
-        between species matter (a common shift only moves the Bragg peaks).
+        Only differences between species matter (a common shift only moves the
+        Bragg peaks). The forward model is rebuilt; call ``fit_background``
+        afterwards to refit the scale and background.
+
+        Parameters
+        ----------
+        eta : "radii", dict or None, optional
+            "radii" (default) takes ``(r_s - r_mean) / r_mean`` from metallic
+            radii (e.g. V 1.34, Nb 1.46, Zr 1.60 A; ASE covalent radii for
+            species without a tabulated metallic radius), with ``r_mean``
+            the composition-weighted mean. A dict ``{species: eta}`` sets
+            them directly (missing species get 0). None switches the size
+            effect off.
+
+        Returns
+        -------
+        ReverseMonteCarlo
+            self. The mismatches are stored in ``self.size_eta``, in the
+            order of ``self.species``.
         """
         if eta is None:
             self.size_eta = np.zeros(len(self.species))
@@ -1097,19 +1287,38 @@ class ReverseMonteCarlo(AutoSerialize):
         return out
 
     def fit_size_effect(self, step: float = 0.005, verbose: bool = True) -> dict:
-        """Fit the species size mismatches eta_s to the diffuse scattering of the current
-        supercell (background and scale re-solved at each step; one eta fixed by
-        ``sum c_s eta_s = 0``)."""
-        A = torch.as_tensor(self._species_amplitudes())
+        """Fit the species size mismatches eta_s to the diffuse scattering of the current supercell.
+
+        Nelder-Mead from no size effect; the background and scale are
+        re-solved at each step, and one eta is fixed by ``sum c_s eta_s = 0``.
+        If the fit does not lower the loss, the size effect stays off.
+
+        Parameters
+        ----------
+        step : float, optional
+            Size of the initial Nelder-Mead simplex in eta. Default 0.005.
+        verbose : bool, optional
+            Print the fitted mismatches and the loss change.
+
+        Returns
+        -------
+        dict
+            "eta": ``{species: eta_s}``; "loss": (loss without size effect,
+            loss after the fit and a background refit).
+        """
+        dev = self.device
+        A = torch.as_tensor(self._species_amplitudes(), device=dev)
         n = self.grid_size
         hn = np.stack(np.unravel_index(self._needed, (n,) * 3), -1)
         hm = np.where(hn > n // 2, hn - n, hn)
         chi = torch.as_tensor(
-            self._size_chi(hm / (self.lattice_parameter * self.cells)), dtype=torch.float32
+            self._size_chi(hm / (self.lattice_parameter * self.cells)),
+            dtype=torch.float32,
+            device=dev,
         )
         self.size_eta = np.zeros(len(self.species))
         fs0, _ = self._grid_factors(hn)
-        fs0 = torch.as_tensor(fs0, dtype=torch.float32)
+        fs0 = torch.as_tensor(fs0, dtype=torch.float32, device=dev)
         c = self.concentrations
 
         def full_eta(x):
@@ -1117,7 +1326,7 @@ class ReverseMonteCarlo(AutoSerialize):
             return e - (c * e).sum()
 
         def loss(x):
-            eta = torch.as_tensor(full_eta(x), dtype=torch.float32)
+            eta = torch.as_tensor(full_eta(x), dtype=torch.float32, device=dev)
             F = ((fs0 + eta[:, None] * chi[None]) * A).sum(0)
             self._Fr, self._Fi = F.real.contiguous(), F.imag.contiguous()
             self._solve_linear(self._model_diffuse())
@@ -1167,10 +1376,10 @@ class ReverseMonteCarlo(AutoSerialize):
         beam weights, which ``envelope="fitted"`` re-solves.
         """
         if self.envelope == "bloch":
-            g = self.geometry["bloch_g"][i]
-            p = self.geometry["bloch_p"][i]
+            g = (self.geometry.get("bloch_g") or [None] * len(self.images))[i]
             if g is None:
                 raise RuntimeError("fit_thickness before envelope='bloch'")
+            p = self.geometry["bloch_p"][i]
             order = np.argsort(p)[::-1][: getattr(self, "max_beams", 40)]
             g, p = g[order], p[order]
         elif self.envelope in ("measured", "fitted"):
@@ -1200,7 +1409,8 @@ class ReverseMonteCarlo(AutoSerialize):
         return cols @ p, tds
 
     def _bg_lower(self, n: int) -> np.ndarray:
-        """Lower bounds of the background amplitudes: free sign for the constant and Kikuchi."""
+        """Lower bounds of the background amplitudes: the constant may be negative, the others
+        are non-negative."""
         lo = np.zeros(n)
         lo[0] = -np.inf
         return lo
@@ -1452,16 +1662,57 @@ class ReverseMonteCarlo(AutoSerialize):
         number that adapts so the joint step never raises the loss. A sweep
         is one proposal per site. Scale and background are refit every
         ``refit_every`` sweeps.
+
+        Parameters
+        ----------
+        n_sweeps : int, optional
+            Number of sweeps. Default 20.
+        batch : int, optional
+            Moves proposed per batch. Default 32.
+        temperature : float, optional
+            Initial Metropolis temperature as a fraction of the median
+            absolute score change of the first batch. Default 0.05.
+        random_fraction : float, optional
+            Probability that a batch proposes single-atom displacements.
+            Ignored (0) if the supercell has no displacements. Default 0.5.
+        omega_fraction : float, optional
+            Probability that a batch proposes omega embryos. Ignored (0) if
+            the supercell has no displacements. Default 0.
+        max_static_b : float or None, optional
+            Cap on the static Debye-Waller B (A^2) of all displacements; None
+            for no cap. Default 0.5.
+        refit_every : int, optional
+            Sweeps between refits of the scale and background. Default 2.
+        progress : bool, optional
+            Show a progress bar.
+
+        Returns
+        -------
+        ReverseMonteCarlo
+            self. The weighted loss after each sweep is appended to
+            ``self.loss_history``.
         """
+        if (
+            not isinstance(batch, (int, np.integer))
+            or isinstance(batch, (bool, np.bool_))
+            or batch < 1
+        ):
+            raise ValueError("batch must be a positive integer.")
         if self.coefficients is None:
             self.fit_background()
         n_sites = len(self.site_x)
+        if n_sites < 1:
+            raise ValueError("RMC requires at least one site in the supercell.")
         loss = self._update_residual()
         if not self.loss_history:
             self.loss_history.append(loss)
+        # Swap batches draw two distinct sites per proposed move. Keep batches
+        # within that limit, and use a smaller final batch to include any
+        # leftover proposal slots when the site count is not divisible.
+        batch = min(batch, max(n_sites // 2, 1))
         cap = max(batch // 8, 1)
         t0 = None
-        n_batches = max(n_sites // batch, 1)
+        n_batches = (n_sites + batch - 1) // batch
         p_omega = omega_fraction if self.displacements else 0.0
         p_random = random_fraction if self.displacements else 0.0
         budget = (
@@ -1472,23 +1723,27 @@ class ReverseMonteCarlo(AutoSerialize):
         su = None
         for sweep in sweeps:
             accepted = {"swap": 0, "random": 0, "omega": 0}
-            for _ in range(n_batches):
+            for batch_index in range(n_batches):
+                current_batch = min(batch, n_sites - batch_index * batch)
                 if su is None:
                     su = self._scale * self._u
                 spec = self.species_index
                 roll = self.rng.random()
                 if roll < p_random:
                     kind = "random"
-                    sites, new = self._random_proposals(batch)
+                    sites, new = self._random_proposals(current_batch)
                 elif roll < p_random + p_omega:
                     kind = "omega"
-                    sites, new = self._omega_proposals(batch)
+                    sites, new = self._omega_proposals(current_batch)
                 else:
                     kind = "swap"
-                    j = self.rng.choice(n_sites, 2 * batch, replace=False)
-                    j1, j2 = j[:batch], j[batch:]
-                    ok = spec[j1] != spec[j2]
-                    sites = np.stack([j1[ok], j2[ok]], 1)
+                    if n_sites < 2:
+                        sites = np.empty((0, 2), dtype=int)
+                    else:
+                        j = self.rng.choice(n_sites, 2 * current_batch, replace=False)
+                        j1, j2 = j[:current_batch], j[current_batch:]
+                        ok = spec[j1] != spec[j2]
+                        sites = np.stack([j1[ok], j2[ok]], 1)
                     new = None
                 if len(sites) == 0:
                     continue
@@ -1611,6 +1866,88 @@ class ReverseMonteCarlo(AutoSerialize):
 
     # ---------------------------------------------------------------- analysis
 
+    def to_atoms(self, lattice_parameter: float | None = None):
+        """The fitted supercell as an ``ase.Atoms`` object, one atom per site.
+
+        The mixed sites carry the species and static displacements of the fit; any ordered
+        sites of the average crystal are repeated over the supercell without displacements.
+        Atoms are grouped by species.
+        Species are labelled as fitted, so with ``set_crystal(merge={"Zr": "Nb"})`` the Nb
+        sites stand for both Nb and Zr.
+
+        Parameters
+        ----------
+        lattice_parameter : float, optional
+            Edge of the cubic unit cell in A. Default None: the lattice parameter of the
+            crystal passed to :meth:`set_crystal`. The fractional coordinates do not depend
+            on it; the lattice parameter fitted by :meth:`fit_geometry` also absorbs any error
+            in the detector pixel size.
+
+        Returns
+        -------
+        ase.Atoms
+            Periodic cubic supercell of ``cells`` unit cells along each axis.
+        """
+        from ase import Atoms
+        from ase.data import chemical_symbols
+
+        if getattr(self, "site_x", None) is None:
+            raise RuntimeError("build_supercell first")
+        a = self._a_crystal if lattice_parameter is None else float(lattice_parameter)
+        if not np.isfinite(a) or a <= 0:
+            raise ValueError("lattice_parameter must be positive")
+        frac = [self._positions(np.arange(len(self.site_x))) / self.grid_size]
+        symbols = [self.species[k] for k in self.species_index]
+
+        # ordered sites of the average crystal (any site that is not a fitted mixed site)
+        mixed = self.site_grid / self.grid_divisor
+        pos0 = np.mod(self.crystal.positions_frac.numpy(), 1.0)
+        numbers = self.crystal.numbers.numpy()
+        ordered = {}
+        for f, z in zip(pos0, numbers):
+            if np.any(np.all(np.abs(np.mod(f - mixed + 0.5, 1.0) - 0.5) < 1e-4, axis=1)):
+                continue
+            key = tuple(np.round(f, 6))
+            ordered.setdefault(key, chemical_symbols[int(z)])
+        if ordered:
+            idx = np.stack(np.meshgrid(*(np.arange(self.cells),) * 3, indexing="ij"), -1).reshape(
+                -1, 3
+            )
+            f0 = np.array(list(ordered))
+            frac.append(((idx[:, None, :] + f0[None]) / self.cells).reshape(-1, 3))
+            symbols += list(ordered.values()) * len(idx)
+        # atoms grouped by species (stable within each), so the formula reads e.g. Nb12480V3520
+        order = np.argsort(np.array(symbols), kind="stable")
+        return Atoms(
+            [symbols[i] for i in order],
+            scaled_positions=np.mod(np.concatenate(frac), 1.0)[order],
+            cell=np.eye(3) * a * self.cells,
+            pbc=True,
+        )
+
+    def to_cif(self, path, lattice_parameter: float | None = None):
+        """Write the fitted supercell (see :meth:`to_atoms`) to a CIF file with ASE.
+
+        Parameters
+        ----------
+        path : str or Path
+            Output file.
+        lattice_parameter : float, optional
+            Edge of the cubic unit cell in A. Default None: the crystal's lattice parameter.
+
+        Returns
+        -------
+        pathlib.Path
+            The file written.
+        """
+        from pathlib import Path
+
+        from ase.io import write
+
+        path = Path(path)
+        write(path, self.to_atoms(lattice_parameter), format="cif")
+        return path
+
     def model_images(self, diffuse_only: bool = False) -> list[np.ndarray]:
         """Model on the binned grid of every pattern (data units): scaled diffuse + background,
         or the scaled diffuse term alone. The diffuse term is zero beyond ``q_max``."""
@@ -1628,9 +1965,17 @@ class ReverseMonteCarlo(AutoSerialize):
         return out
 
     def r_factors(self) -> dict:
-        """Weighted R of the diffuse fit per pattern, ``sqrt(sum w (y - model)^2 / sum w (y -
-        background)^2)``: the fraction of the diffuse signal (experiment minus fitted
-        background) the supercell leaves unexplained."""
+        """Weighted R of the diffuse fit per pattern.
+
+        ``R = sqrt(sum w (y - model)^2 / sum w (y - background)^2)``: the
+        fraction of the diffuse signal (experiment minus fitted background)
+        the supercell leaves unexplained.
+
+        Returns
+        -------
+        dict
+            ``{pattern name: R}``.
+        """
         full = self.model_images()
         bg = self.background_images()
         out = {}
@@ -1647,14 +1992,46 @@ class ReverseMonteCarlo(AutoSerialize):
         diffuse = self.model_images(diffuse_only=True)
         return [f - d for f, d in zip(full, diffuse)]
 
-    def warren_cowley(self, n_shells: int = 6) -> dict:
+    def warren_cowley(self, n_shells: int | None = 6, max_radius: float | None = None) -> dict:
         """Warren-Cowley alpha for every species pair over the first neighbour shells.
 
         ``alpha[shell, s, t] = 1 - P(t | s) / c_t`` for unlike pairs and
         ``(P(s | s) - c_s) / (1 - c_s)`` for like pairs, with ``P(t | s)`` the
         fraction of the shell around an ``s`` atom occupied by ``t``.
         Negative: unlike neighbours preferred; positive: like.
+
+        Parameters
+        ----------
+        n_shells : int, optional
+            Largest number of neighbour shells. Default 6; None keeps every shell within
+            `max_radius`.
+        max_radius : float, optional
+            Largest neighbour distance in A. Default None (no limit beyond half the
+            supercell).
+
+        Returns
+        -------
+        dict
+            "radius": (n_shells,) shell radii in A; "alpha": (n_shells, K, K)
+            Warren-Cowley parameters; "species": the K species in index order.
         """
+        radii, prob = self._pair_probabilities(n_shells=n_shells, max_radius=max_radius)
+        c = self.concentrations
+        K = len(self.species)
+        alpha = np.zeros_like(prob)
+        for s in range(K):
+            for t in range(K):
+                p = prob[:, s, t]
+                alpha[:, s, t] = (p - c[t]) / (1 - c[t]) if s == t else 1 - p / c[t]
+        return dict(radius=radii, alpha=alpha, species=list(self.species))
+
+    def _pair_probabilities(
+        self, n_shells: int | None = None, max_radius: float | None = None
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Shell radii (A) and ``P(t | s)`` (n_shells, K, K): the fraction of the sites in each
+        neighbour shell of an ``s`` atom that hold a ``t`` atom, averaged over every ``s`` atom
+        of the supercell (periodic boundaries). Shells are kept up to `n_shells` and up to
+        `max_radius` (A), whichever ends first, and never beyond half the supercell."""
         d = self.grid_divisor
         n = self.cells * d
         xs = self.site_x // self.refine
@@ -1671,19 +2048,73 @@ class ReverseMonteCarlo(AutoSerialize):
         ss = np.real(np.fft.ifftn(fsite * np.conj(fsite)))
         v = np.stack(np.meshgrid(*(np.fft.fftfreq(n, 1 / n),) * 3, indexing="ij"), -1)
         r = np.linalg.norm(v, axis=-1) / d * self.lattice_parameter
-        valid = ss > 0.5
-        radii = np.unique(np.round(r[valid], 4))[1 : n_shells + 1]
-        shells = [valid & (np.abs(r - rad) < 1e-3) for rad in radii]
-        c = self.concentrations
-        alpha = np.zeros((len(radii), K, K))
+        half_box = self.cells * self.lattice_parameter / 2
+        r_max = half_box if max_radius is None else min(max_radius, half_box)
+        valid = (ss > 0.5) & (r <= r_max + 1e-6)
+        radii = np.unique(np.round(r[valid], 4))[1:]
+        if n_shells is not None:
+            radii = radii[:n_shells]
+        shell = np.searchsorted(radii, np.round(r, 4))
+        inside = valid & (shell < len(radii))
+        inside[inside] = radii[shell[inside]] == np.round(r[inside], 4)
+        index = shell[inside]
+
+        def shell_sums(a):
+            return np.bincount(index, weights=a[inside], minlength=len(radii))
+
+        prob = np.zeros((len(radii), K, K))
         for s in range(K):
-            cs_site = np.real(np.fft.ifftn(focc[s] * np.conj(fsite)))
+            cs_site = shell_sums(np.real(np.fft.ifftn(focc[s] * np.conj(fsite))))
             for t in range(K):
-                cst = np.real(np.fft.ifftn(focc[s] * np.conj(focc[t])))
-                for k, m in enumerate(shells):
-                    p = cst[m].sum() / cs_site[m].sum()
-                    alpha[k, s, t] = (p - c[t]) / (1 - c[t]) if s == t else 1 - p / c[t]
-        return dict(radius=radii, alpha=alpha, species=list(self.species))
+                cst = shell_sums(np.real(np.fft.ifftn(focc[s] * np.conj(focc[t]))))
+                prob[:, s, t] = cst / cs_site
+        return radii, prob
+
+    def shell_correlations(
+        self, n_shells: int | None = None, max_radius: float | None = None
+    ) -> dict:
+        """Pair correlation of every species pair per neighbour shell, relative to a random
+        alloy.
+
+        ``ratio[shell, s, t] = P(t | s) / c_t``, the number of ``s``-``t`` pairs in the shell
+        divided by the number expected for a random arrangement at the same composition. It
+        is symmetric in ``s`` and ``t``, equals 1 for a random alloy, is above 1 for pairs that
+        are favoured and below 1 for pairs that are avoided. ``c_t`` is the composition of
+        the supercell itself. For an unlike pair, ``ratio = 1 - alpha`` with the Warren-Cowley
+        parameter of :meth:`warren_cowley`, up to the rounding of the composition to whole
+        atoms.
+
+        Parameters
+        ----------
+        n_shells : int, optional
+            Largest number of neighbour shells. Default None (every shell within
+            `max_radius`).
+        max_radius : float, optional
+            Largest neighbour distance in A. Default None: five lattice parameters, far
+            enough for the short-range order to decay. Never beyond half the supercell.
+
+        Returns
+        -------
+        dict
+            "radius": (n_shells,) shell radii in A; "shell": bond-vector labels in units of a
+            (e.g. "1/2<111>"), or None for site lattices other than BCC; "ratio":
+            (n_shells, K, K) pair correlations relative to random; "species": the K species
+            in index order.
+        """
+        if max_radius is None:
+            max_radius = 5 * self.lattice_parameter
+        radii, prob = self._pair_probabilities(n_shells=n_shells, max_radius=max_radius)
+        # the supercell's own composition, so that the ratio is exactly symmetric
+        counts = np.bincount(self.species_index, minlength=len(self.species))
+        ratio = prob / (counts / counts.sum())[None, None, :]
+        shell = None
+        if self.grid_divisor == 2:
+            reach = int(np.ceil(radii[-1] / (self.lattice_parameter / 2))) + 1
+            offsets = self._shells(len(radii), reach=reach)
+            dist = [np.linalg.norm(o[0]) * self.lattice_parameter / 2 for o in offsets]
+            if len(offsets) == len(radii) and np.allclose(dist, radii, atol=1e-3):
+                shell = [self._shell_label(o[0]) for o in offsets]
+        return dict(radius=radii, shell=shell, ratio=ratio, species=list(self.species))
 
     def _u2(self, disp: np.ndarray) -> np.ndarray:
         """Squared displacement (A^2) of each displacement vector (..., 3)."""
@@ -1932,18 +2363,33 @@ class ReverseMonteCarlo(AutoSerialize):
             **kwargs,
         )
 
-    def plot_warren_cowley(self, n_shells: int = 8):
-        """Warren-Cowley alpha against neighbour distance (< 0 unlike neighbours preferred, > 0
-        like); one curve for a binary site, one per species pair otherwise."""
+    def plot_warren_cowley(self, max_radius: float | None = None):
+        """Warren-Cowley alpha against neighbour distance (0 = random, < 0 unlike neighbours
+        preferred, > 0 like); one curve for a binary site, one per species pair otherwise.
+
+        Parameters
+        ----------
+        max_radius : float, optional
+            Largest neighbour distance in A. Default None: five lattice parameters.
+
+        Returns
+        -------
+        fig, ax
+        """
         import matplotlib.pyplot as plt
 
-        sro = self.warren_cowley(n_shells)
+        max_radius = self._default_shell_radius(max_radius)
+        sro = self.warren_cowley(n_shells=None, max_radius=max_radius)
+        sc = self.shell_correlations(max_radius=max_radius)
+        labelled = self._direction_shells(sc["radius"], sc["shell"])
         K = len(self.species)
-        fig, ax = plt.subplots(figsize=(5.5, 4))
+        fig, ax = plt.subplots(figsize=(8.0, 3.6))
         ax.axhline(0, color="0.6", lw=0.8)
+        for radius, _ in labelled:
+            ax.axvline(radius, color="0.9", lw=0.6, zorder=0)
         if K == 2:  # a binary site has one alpha for every pair
-            ax.plot(sro["radius"], sro["alpha"][:, 0, 0], "o-", ms=4, color="k")
-            ax.set_title(f"{self.species[0]}-{self.species[1]}")
+            ax.plot(sro["radius"], sro["alpha"][:, 0, 0], "o-", ms=3, lw=1.2, color="tab:blue")
+            ax.set_ylabel(f"Warren-Cowley alpha, {self.species[0]}-{self.species[1]}")
         else:
             for s_ in range(K):
                 for t in range(s_, K):
@@ -1951,14 +2397,111 @@ class ReverseMonteCarlo(AutoSerialize):
                         sro["radius"],
                         sro["alpha"][:, s_, t],
                         "o-" if s_ == t else "s--",
-                        ms=4,
+                        ms=3,
+                        lw=1.2,
                         label=f"{self.species[s_]}-{self.species[t]}",
                     )
             ax.legend(fontsize=8)
+            ax.set_ylabel("Warren-Cowley alpha")
         ax.set_xlabel("neighbour distance (A)")
-        ax.set_ylabel("Warren-Cowley alpha")
+        ax.set_xlim(0, sro["radius"][-1] * 1.02)
         fig.tight_layout()
+        self._label_direction_shells(fig, ax, labelled, sro["radius"][-1] * 1.02)
         return fig, ax
+
+    def _default_shell_radius(self, max_radius: float | None) -> float:
+        """Largest neighbour distance of the shell plots: `max_radius`, or five lattice parameters."""
+        return 5 * self.lattice_parameter if max_radius is None else max_radius
+
+    @staticmethod
+    def _direction_shells(radii, labels) -> list[tuple[float, str]]:
+        """(radius, label) of the shells along <100>, <110> and <111>, from the bond-vector
+        labels of :meth:`shell_correlations`; empty when there are no labels."""
+        if labels is None:
+            return []
+        out = []
+        for radius, label in zip(radii, labels):
+            digits = [int(c) for c in label.split("<")[1].rstrip(">")]
+            if (
+                digits[1:] == [0, 0]
+                or (digits[0] == digits[1] and digits[2] == 0)
+                or digits[0] == digits[1] == digits[2]
+            ):
+                out.append((radius, label))
+        return out
+
+    @staticmethod
+    def _label_direction_shells(fig, ax, labelled, span: float) -> None:
+        """Write shell labels above `ax`, stacked in rows so that none overlap, and make room
+        for them at the top of the figure. Call after ``tight_layout``."""
+        last: list[float] = []
+        for radius, label in labelled:
+            width = 0.012 * span * len(label)
+            row = next((k for k, x in enumerate(last) if radius - width / 2 > x), len(last))
+            if row == len(last):
+                last.append(0.0)
+            last[row] = radius + width / 2
+            ax.annotate(
+                label,
+                (radius, 1.0),
+                xycoords=("data", "axes fraction"),
+                xytext=(0, 3 + 11 * row),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                annotation_clip=False,
+            )
+        if last:
+            height = fig.get_size_inches()[1]
+            fig.subplots_adjust(top=fig.subplotpars.top - (0.03 + 0.15 * len(last)) / height)
+
+    def plot_shell_correlations(
+        self,
+        max_radius: float | None = None,
+        panel_size: tuple[float, float] = (8.0, 2.2),
+    ):
+        """Pair correlation of every species pair against neighbour distance, relative to a
+        random alloy (1 = random), one panel per pair stacked on shared distance and ratio axes. The
+        shells along <100>, <110> and <111> are labelled above the top panel (BCC only).
+
+        Parameters
+        ----------
+        max_radius : float, optional
+            Largest neighbour distance in A. Default None: five lattice parameters.
+        panel_size : tuple of float, optional
+            Width and height of each panel in inches. Default (8.0, 2.2).
+
+        Returns
+        -------
+        fig, axs
+            The figure and the array of panels, top to bottom.
+        """
+        import matplotlib.pyplot as plt
+
+        sc = self.shell_correlations(max_radius=self._default_shell_radius(max_radius))
+        K = len(self.species)
+        pairs = [(s, t) for s in range(K) for t in range(s, K)]
+        fig, axs = plt.subplots(
+            len(pairs),
+            1,
+            sharex=True,
+            sharey=True,
+            figsize=(panel_size[0], panel_size[1] * len(pairs)),
+        )
+        axs = np.atleast_1d(axs)
+        labelled = self._direction_shells(sc["radius"], sc["shell"])
+        for ax, (s, t) in zip(axs, pairs):
+            ax.axhline(1, color="0.6", lw=0.8)
+            for radius, _ in labelled:
+                ax.axvline(radius, color="0.9", lw=0.6, zorder=0)
+            ax.plot(sc["radius"], sc["ratio"][:, s, t], "o-", ms=3, lw=1.2, color="tab:blue")
+            ax.set_ylabel(f"{self.species[s]}-{self.species[t]}\n/ random")
+        axs[-1].set_xlabel("neighbour distance (A)")
+        axs[-1].set_xlim(0, sc["radius"][-1] * 1.02)
+        fig.tight_layout()
+        self._label_direction_shells(fig, axs[0], labelled, sc["radius"][-1] * 1.02)
+        return fig, axs
 
     def plot_diffuse_sections(self, extent: float = 2.0, normals=((0, 0, 1), (1, -1, 0))):
         """Symmetrized diffuse intensity of the supercell in Laue units (1 = random alloy) on
@@ -1985,14 +2528,24 @@ class ReverseMonteCarlo(AutoSerialize):
         fig.tight_layout()
         return fig, axs
 
-    def _shells(self, n_shells: int):
-        """Neighbour offsets of the BCC site lattice (site units, a / 2) grouped by distance."""
-        r = np.arange(-4, 5)
+    def _shells(self, n_shells: int, reach: int = 4):
+        """Neighbour offsets of the BCC site lattice (site units, a / 2) grouped by distance,
+        complete for every shell within `reach` site units."""
+        r = np.arange(-reach, reach + 1)
         v = np.stack(np.meshgrid(r, r, r, indexing="ij"), -1).reshape(-1, 3)
         bcc = np.all(v % 2 == 0, axis=1) | np.all(v % 2 == 1, axis=1)
         v = v[bcc & np.any(v != 0, axis=1)]
         d2 = (v**2).sum(1)
-        return [v[d2 == d] for d in np.unique(d2)[:n_shells]]
+        return [v[d2 == d] for d in np.unique(d2[d2 <= reach**2])[:n_shells]]
+
+    @staticmethod
+    def _shell_label(offset) -> str:
+        """Bond vector of a BCC neighbour shell in units of a, e.g. "1/2<111>" or "<100>", from
+        one offset in site units (a / 2)."""
+        v = np.sort(np.abs(np.asarray(offset)))[::-1]
+        if np.all(v % 2 == 0):
+            return "<" + "".join(str(int(x)) for x in v // 2) + ">"
+        return "1/2<" + "".join(str(int(x)) for x in v) + ">"
 
     def displacement_correlations(self, n_shells: int = 6) -> dict:
         """Displacement short-range order per neighbour shell.
@@ -2001,6 +2554,23 @@ class ReverseMonteCarlo(AutoSerialize):
         ``transverse``: the same for the components normal to the bond. Omega embryos give a
         strong negative longitudinal correlation on the nearest-neighbour <111> bond (the
         collapsing pair moves together).
+
+        Parameters
+        ----------
+        n_shells : int, optional
+            Number of neighbour shells. Default 6.
+
+        Returns
+        -------
+        dict
+            "radius": (n_shells,) shell radii in A; "shell": bond-vector
+            labels (e.g. "1/2<111>", "<100>"); "longitudinal" and
+            "transverse": lists of correlations, dimensionless.
+
+        Raises
+        ------
+        NotImplementedError
+            For site lattices other than BCC.
         """
         if self.grid_divisor != 2:
             raise NotImplementedError("Displacement correlations are implemented for BCC sites.")
@@ -2010,12 +2580,7 @@ class ReverseMonteCarlo(AutoSerialize):
         xc = self.site_x // self.refine
         out = dict(radius=[], shell=[], longitudinal=[], transverse=[])
         for offs in self._shells(n_shells):
-            v = np.sort(np.abs(offs[0]))[::-1]
-            out["shell"].append(
-                "<" + "".join(str(int(x)) for x in v // 2) + ">"
-                if np.all(v % 2 == 0)
-                else "1/2<" + "".join(str(int(x)) for x in v) + ">"
-            )
+            out["shell"].append(self._shell_label(offs[0]))
             rhat = offs / np.linalg.norm(offs, axis=1, keepdims=True)
             nb = np.stack([self._site_lookup[tuple(np.mod(xc + o, nc).T)] for o in offs], 1)
             ui = u[:, None, :]
@@ -2105,6 +2670,13 @@ class ReverseMonteCarlo(AutoSerialize):
         return fig, axs
 
     def plot_loss(self):
+        """Weighted loss after each sweep (``loss_history``) on a log scale.
+
+        Returns
+        -------
+        tuple
+            ``(fig, ax)``.
+        """
         import matplotlib.pyplot as plt
 
         fig, ax = plt.subplots(figsize=(5, 3))

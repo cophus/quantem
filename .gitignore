@@ -194,17 +194,3 @@ ipynb-playground/
 CLAUDE.md
 AGENTS.md
 AGENT.md
-
-# widget (JS build artifacts); acom keeps the diffraction widget under widget/
-node_modules/
-widget/src/quantem/widget/static/
-widget/dist/
-
-# widget, local-only (per-developer notebooks, docs scratch, build/test scripts)
-widget/.gitignore
-widget/docs/
-widget/notebooks/
-widget/scripts/
-!widget/scripts/build.mjs
-widget/tests/integration/
-widget/tests/snapshots/

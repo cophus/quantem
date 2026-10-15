@@ -41,12 +41,8 @@ def test_cluster_vector_and_filter():
             inten = rng.uniform(1, 2, (n, 1))
             row.append(np.concatenate([q, inten], axis=1))
         nested.append(row)
-    vec = Vector.from_data(
-        nested, fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t"
-    )
-    labeled, labels = cluster_vector(
-        vec, fields=("qx", "qy"), eps=0.05, min_samples=10
-    )
+    vec = Vector.from_data(nested, fields=["qx", "qy", "intensity"], units=["A^-1"] * 3, name="t")
+    labeled, labels = cluster_vector(vec, fields=("qx", "qy"), eps=0.05, min_samples=10)
     assert "cluster" in labeled.fields
     assert labels.max() == 0  # exactly one cluster found
     got = labeled[1, 2].numpy()
@@ -55,3 +51,15 @@ def test_cluster_vector_and_filter():
     kept = filter_rows(vec, labels == 0)
     assert kept.total_rows == int((labels == 0).sum())
     assert kept.shape[:2] == vec.shape[:2]
+
+
+def test_filter_rows_checks_mask_length():
+    import pytest
+
+    from quantem.core.datastructures.vector import Vector
+
+    nested = [[np.ones((2, 1)), np.ones((3, 1))]]
+    vec = Vector.from_data(nested, fields=["intensity"], units=["counts"], name="t")
+    assert filter_rows(vec, [True, False, True, True, False]).total_rows == 3
+    with pytest.raises(ValueError, match="rows"):
+        filter_rows(vec, [True, False])

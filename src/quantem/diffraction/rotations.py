@@ -12,9 +12,10 @@ laboratory (beam) frame::
 
     v_lab = R(q) @ v_crystal
 
-The electron beam travels along -z in the lab frame. The zone axis --- the
-beam direction expressed in crystal Cartesian coordinates --- is therefore
-the third row of R(q)::
+The electron beam travels along -z in the lab frame. The zone axis is the
+crystal direction that points from the specimen back toward the source,
+lab +z, expressed in crystal Cartesian coordinates. It is therefore the
+third row of R(q)::
 
     zone_axis = R(q).T @ [0, 0, 1]
 
@@ -28,7 +29,20 @@ import torch
 
 
 def qmult(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Hamilton product of quaternions, broadcasting over leading dims."""
+    """Hamilton product a * b of quaternions, broadcasting over leading dims.
+
+    The product applies `b` first, then `a`: R(a * b) = R(a) @ R(b).
+
+    Parameters
+    ----------
+    a, b : torch.Tensor
+        Scalar-first quaternions (..., 4), broadcastable.
+
+    Returns
+    -------
+    torch.Tensor
+        Product quaternions (..., 4), not renormalized.
+    """
     aw, ax, ay, az = a.unbind(-1)
     bw, bx, by, bz = b.unbind(-1)
     return torch.stack(
@@ -43,25 +57,75 @@ def qmult(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 def qconj(q: torch.Tensor) -> torch.Tensor:
-    """Quaternion conjugate (inverse for unit quaternions)."""
+    """Quaternion conjugate (inverse for unit quaternions).
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Scalar-first quaternions (..., 4).
+
+    Returns
+    -------
+    torch.Tensor
+        (w, -x, -y, -z), shape (..., 4). For a crystal-to-lab orientation
+        this is the lab-to-crystal rotation.
+    """
     w, x, y, z = q.unbind(-1)
     return torch.stack((w, -x, -y, -z), dim=-1)
 
 
 def qnormalize(q: torch.Tensor) -> torch.Tensor:
-    """Normalize to unit length, with w >= 0 canonicalization."""
+    """Normalize to unit length, with w >= 0 canonicalization.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Scalar-first quaternions (..., 4), nonzero.
+
+    Returns
+    -------
+    torch.Tensor
+        Unit quaternions (..., 4) with w >= 0; q and -q describe the same
+        rotation, so this picks one of the two.
+    """
     q = q / torch.linalg.norm(q, dim=-1, keepdim=True)
     return torch.where(q[..., :1] < 0, -q, q)
 
 
 def qrotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Rotate vectors v (..., 3) by quaternions q (..., 4)."""
+    """Rotate vectors by quaternions, v' = R(q) @ v.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Unit scalar-first quaternions (..., 4). For an orientation, crystal
+        frame vectors are rotated into the lab frame.
+    v : torch.Tensor
+        Vectors (..., 3), broadcastable against `q`.
+
+    Returns
+    -------
+    torch.Tensor
+        Rotated vectors (..., 3).
+    """
     qv = torch.cat((torch.zeros_like(v[..., :1]), v), dim=-1)
     return qmult(qmult(q, qv), qconj(q))[..., 1:]
 
 
 def quat_to_matrix(q: torch.Tensor) -> torch.Tensor:
-    """Convert quaternions (..., 4) to rotation matrices (..., 3, 3)."""
+    """Convert quaternions to rotation matrices.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Unit scalar-first quaternions (..., 4).
+
+    Returns
+    -------
+    torch.Tensor
+        Rotation matrices (..., 3, 3) with v_lab = R @ v_crystal for an
+        orientation.
+    """
     w, x, y, z = q.unbind(-1)
     two = 2.0
     R = torch.stack(
@@ -82,10 +146,21 @@ def quat_to_matrix(q: torch.Tensor) -> torch.Tensor:
 
 
 def quat_from_matrix(R: torch.Tensor) -> torch.Tensor:
-    """Convert rotation matrices (..., 3, 3) to unit quaternions (..., 4).
+    """Convert rotation matrices to unit quaternions.
 
     Uses the numerically stable branch selection of Shepperd's method,
     vectorized over leading dimensions.
+
+    Parameters
+    ----------
+    R : torch.Tensor
+        Proper rotation matrices (..., 3, 3).
+
+    Returns
+    -------
+    torch.Tensor
+        Unit scalar-first quaternions (..., 4) with w >= 0, the inverse of
+        :func:`quat_to_matrix`.
     """
     batch_shape = R.shape[:-2]
     R = R.reshape(-1, 3, 3)
@@ -110,7 +185,20 @@ def quat_from_matrix(R: torch.Tensor) -> torch.Tensor:
 
 
 def quat_from_axis_angle(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
-    """Quaternion for rotation of `angle` (radians) about `axis` (..., 3)."""
+    """Quaternion for a right-handed rotation about an axis.
+
+    Parameters
+    ----------
+    axis : torch.Tensor
+        Rotation axes (..., 3); need not be normalized.
+    angle : torch.Tensor
+        Rotation angles (...,), radians.
+
+    Returns
+    -------
+    torch.Tensor
+        Unit scalar-first quaternions (..., 4).
+    """
     axis = axis / torch.linalg.norm(axis, dim=-1, keepdim=True)
     angle = torch.as_tensor(angle, dtype=axis.dtype, device=axis.device)
     half = angle[..., None] / 2
@@ -118,7 +206,21 @@ def quat_from_axis_angle(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tenso
 
 
 def quat_to_axis_angle(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return (axis (..., 3), angle (...,)) of unit quaternions."""
+    """Rotation axis and angle of unit quaternions.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Scalar-first quaternions (..., 4).
+
+    Returns
+    -------
+    axis : torch.Tensor
+        Unit rotation axes (..., 3). Undefined (near zero) for the identity.
+    angle : torch.Tensor
+        Rotation angles (...,) in [0, pi], radians, after w >= 0
+        canonicalization.
+    """
     q = qnormalize(q)
     angle = 2 * torch.acos(q[..., 0].clamp(-1, 1))
     sin_half = torch.sqrt((1 - q[..., 0] ** 2).clamp_min(1e-24))
@@ -127,7 +229,19 @@ def quat_to_axis_angle(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def quat_from_euler_zxz(angles: torch.Tensor) -> torch.Tensor:
-    """Quaternion from Z-X-Z Euler angles (..., 3) in radians."""
+    """Quaternion from Z-X-Z Euler angles.
+
+    Parameters
+    ----------
+    angles : torch.Tensor
+        (phi1, Phi, phi2) Euler angles (..., 3), radians, applied as
+        R = Rz(phi1) @ Rx(Phi) @ Rz(phi2).
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar-first quaternions (..., 4).
+    """
     a, b, c = angles.unbind(-1)
     z = torch.zeros_like(a)
     qa = torch.stack((torch.cos(a / 2), z, z, torch.sin(a / 2)), dim=-1)
@@ -137,7 +251,20 @@ def quat_from_euler_zxz(angles: torch.Tensor) -> torch.Tensor:
 
 
 def quat_to_euler_zxz(q: torch.Tensor) -> torch.Tensor:
-    """Z-X-Z Euler angles (..., 3) in radians from unit quaternions."""
+    """Z-X-Z Euler angles from unit quaternions.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Unit scalar-first quaternions (..., 4).
+
+    Returns
+    -------
+    torch.Tensor
+        (phi1, Phi, phi2) Euler angles (..., 3), radians, the inverse of
+        :func:`quat_from_euler_zxz`. In the gimbal-locked case (Phi = 0 or
+        pi) the whole rotation about z is put in phi1 and phi2 is 0.
+    """
     R = quat_to_matrix(q)
     beta = torch.acos(R[..., 2, 2].clamp(-1, 1))
     alpha = torch.atan2(R[..., 0, 2], -R[..., 1, 2])
@@ -159,14 +286,16 @@ def quat_from_zone_axis(
     Parameters
     ----------
     zone_axis : torch.Tensor
-        Crystal-frame Cartesian direction(s) (..., 3) to place along the beam.
+        Crystal-frame Cartesian direction(s) (..., 3) to place along lab +z,
+        pointing toward the source; need not be normalized.
     in_plane_deg : torch.Tensor | float, default=0.0
-        Additional in-plane rotation of the pattern, degrees.
+        Additional rotation about lab z, degrees.
 
     Returns
     -------
     torch.Tensor
-        Quaternions (..., 4) such that quat_to_matrix(q).T @ [0,0,1] == zone_axis.
+        Unit quaternions (..., 4), crystal to lab, such that
+        quat_to_matrix(q).T @ [0, 0, 1] == zone_axis.
     """
     v = zone_axis / torch.linalg.norm(zone_axis, dim=-1, keepdim=True)
     zhat = torch.zeros_like(v)
@@ -190,7 +319,19 @@ def quat_from_zone_axis(
 
 
 def zone_axis_from_quat(q: torch.Tensor) -> torch.Tensor:
-    """Beam direction in crystal Cartesian coordinates (third row of R)."""
+    """Zone axis of orientations, in crystal Cartesian coordinates.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Unit scalar-first quaternions (..., 4), crystal to lab.
+
+    Returns
+    -------
+    torch.Tensor
+        Unit crystal directions (..., 3) along lab +z, toward the source:
+        the third row of R(q).
+    """
     return quat_to_matrix(q)[..., 2, :]
 
 
@@ -228,10 +369,30 @@ def misorientation_axis_angle(
     qb: torch.Tensor,
     sym_ops: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Symmetry-reduced misorientation axis (crystal frame) and angle.
+    """Symmetry-reduced misorientation axis and angle.
 
-    Returns the rotation axis (..., 3) in crystal Cartesian coordinates and
-    the angle (...,) in degrees, minimized over the symmetry operators.
+    The misorientation dq = conj(qa) * qb takes the crystal frame of `qa`
+    onto that of `qb`, R(qb) = R(qa) @ R(dq). Among the equivalent
+    dq * s over the symmetry operators s, the one with the smallest angle is
+    returned.
+
+    Parameters
+    ----------
+    qa, qb : torch.Tensor
+        Unit scalar-first quaternions (..., 4), crystal to lab,
+        broadcastable against each other.
+    sym_ops : torch.Tensor | None
+        Proper rotation symmetry quaternions (S, 4) of the crystal. If None,
+        the raw misorientation is returned.
+
+    Returns
+    -------
+    axis : torch.Tensor
+        Unit rotation axes (..., 3) in the crystal Cartesian frame of `qa`.
+        Undefined (near zero) when the angle is zero.
+    angle : torch.Tensor
+        Misorientation angles (...,) in degrees, in [0, 180]; equal to
+        :func:`misorientation_angle_deg` for the same inputs.
     """
     dq = qmult(qconj(qa), qb)
     if sym_ops is not None:
@@ -244,7 +405,20 @@ def misorientation_axis_angle(
 
 
 def slerp(v0: torch.Tensor, v1: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-    """Spherical linear interpolation between unit vectors v0 and v1."""
+    """Spherical linear interpolation between directions.
+
+    Parameters
+    ----------
+    v0, v1 : torch.Tensor
+        End directions (..., 3); normalized internally.
+    t : torch.Tensor
+        Interpolation fractions (...,), 0 at `v0` and 1 at `v1`.
+
+    Returns
+    -------
+    torch.Tensor
+        Unit vectors (..., 3) along the great circle from `v0` to `v1`.
+    """
     v0 = v0 / torch.linalg.norm(v0, dim=-1, keepdim=True)
     v1 = v1 / torch.linalg.norm(v1, dim=-1, keepdim=True)
     omega = torch.acos((v0 * v1).sum(-1, keepdim=True).clamp(-1, 1))
@@ -311,9 +485,20 @@ def sample_zone_axes(
 def symmetry_axes(sym_quats: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Distinct rotation axes of a proper point group and their orders.
 
-    Returns (axes (A, 3) unit vectors, orders (A,) long): each axis once,
-    with the highest rotation order about it (a 4-fold axis is listed as
-    order 4, not also as 2).
+    Parameters
+    ----------
+    sym_quats : torch.Tensor
+        Proper rotation quaternions (S, 4) of the group, crystal Cartesian
+        frame.
+
+    Returns
+    -------
+    axes : torch.Tensor
+        Unit axes (A, 3), each listed once with the sign that makes it
+        point into the upper hemisphere (+z, then +y, then +x on ties).
+    orders : torch.Tensor
+        Long (A,), the highest rotation order about each axis (a 4-fold
+        axis is listed as order 4, not also as 2).
     """
     axis, angle = quat_to_axis_angle(sym_quats)
     keep = angle > 1e-6
@@ -362,6 +547,23 @@ def symmetry_aligned(
     into a common symmetry branch first. For each input this returns the
     symmetry-equivalent quaternion whose misorientation to the reference is
     smallest, which makes a weighted quaternion mean well defined.
+
+    Parameters
+    ----------
+    reference : torch.Tensor
+        Unit scalar-first quaternion (4,), crystal to lab.
+    quats : torch.Tensor
+        Unit quaternions, reshaped to (N, 4).
+    sym_quats : torch.Tensor
+        Proper rotation symmetry quaternions (S, 4) of the crystal, crystal
+        Cartesian frame. Each candidate is q * s, the same lab orientation
+        of the symmetric crystal.
+
+    Returns
+    -------
+    torch.Tensor
+        (N, 4) float64 quaternions with w >= 0, each describing the same
+        orientation as the corresponding input.
     """
     ref = torch.as_tensor(reference, dtype=torch.float64).reshape(4)
     q = torch.as_tensor(quats, dtype=torch.float64).reshape(-1, 4)
@@ -387,6 +589,21 @@ def sample_zone_axis_cap(
     Points are placed on a Fibonacci spiral restricted to the cap, which
     gives an equal-area covering; the count follows the cap area divided by
     `step_deg` squared.
+
+    Parameters
+    ----------
+    axis : torch.Tensor
+        Center of the cap (3,), crystal Cartesian; need not be normalized.
+    half_angle_deg : float
+        Angular radius of the cap, degrees.
+    step_deg : float
+        Approximate spacing between neighboring directions, degrees.
+
+    Returns
+    -------
+    torch.Tensor
+        Unit directions (N, 3), float64, all within `half_angle_deg` of
+        `axis`; (1, 3) holding `axis` itself when `half_angle_deg` is zero.
     """
     axis = torch.as_tensor(axis, dtype=torch.float64)
     axis = axis / torch.linalg.norm(axis).clamp_min(1e-12)
@@ -426,9 +643,18 @@ def fundamental_zone_axis_wedge(sym_quats: torch.Tensor) -> torch.Tensor | None:
     non-standard Cartesian setting the corners follow the axes wherever
     they point.
 
-    Returns (3, 3) corner directions, or None for Laue classes -1 and 2/m
-    whose fundamental domain is not a spherical triangle (sample the
-    hemisphere instead).
+    Parameters
+    ----------
+    sym_quats : torch.Tensor
+        Proper rotation quaternions (S, 4) of the group, crystal Cartesian
+        frame.
+
+    Returns
+    -------
+    torch.Tensor | None
+        Corner directions as rows (3, 3), or None for Laue classes -1 and
+        2/m whose fundamental domain is not a spherical triangle (sample the
+        hemisphere instead).
     """
     axes, orders = symmetry_axes(sym_quats)
     n_ops = sym_quats.shape[0]
@@ -485,10 +711,28 @@ def fundamental_zone_axis_wedge(sym_quats: torch.Tensor) -> torch.Tensor | None:
 def symmetry_reduced_zone_angles(
     zone_axes: torch.Tensor, sym_quats: torch.Tensor, chunk: int = 8
 ) -> torch.Tensor:
-    """(Z, Z) angular distances between zone axes, minimized over the
-    symmetry operations and the inversion (zone axes are directions modulo
-    sign). Symmetry-equivalent zones are at distance zero, so an exclusion
-    ball around a match also excludes its symmetry copies."""
+    """Angular distances between zone axes, minimized over symmetry.
+
+    The minimum is over the symmetry operations and the inversion (zone axes
+    are directions modulo sign). Symmetry-equivalent zones are at distance
+    zero, so an exclusion ball around a match also excludes its symmetry
+    copies.
+
+    Parameters
+    ----------
+    zone_axes : torch.Tensor
+        Unit directions (Z, 3), crystal Cartesian.
+    sym_quats : torch.Tensor
+        Proper rotation quaternions (S, 4) of the crystal.
+    chunk : int, default=8
+        Symmetry operations processed at once, which bounds the memory to
+        chunk * Z * Z.
+
+    Returns
+    -------
+    torch.Tensor
+        (Z, Z) angles in degrees.
+    """
     Rs = quat_to_matrix(sym_quats).to(zone_axes.dtype)
     best = torch.full((zone_axes.shape[0],) * 2, -1.0, dtype=zone_axes.dtype)
     for s0 in range(0, Rs.shape[0], chunk):

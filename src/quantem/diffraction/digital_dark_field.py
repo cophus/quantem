@@ -7,8 +7,8 @@ the peaks in three ways, following MacLaren and co-workers
 
 - Virtual apertures: peaks within a radius of a set of aperture positions,
   usually a lattice built from two reciprocal lattice vectors
-  (fit_lattice, lattice_distance, aperture_array, aperture_array_subtract,
-  aperture_ddf_image).
+  (refine_lattice_vectors, lattice_distance, aperture_array,
+  aperture_array_subtract, aperture_ddf_image).
 - Polar selection: peaks within a ring of radius q, optionally restricted to
   a range of azimuthal angles (add_polar_fields, polar_mask,
   radial_ddf_image).
@@ -20,12 +20,31 @@ the peaks in three ways, following MacLaren and co-workers
   components (L3) (ddf_images, cluster_coms, cluster_centers,
   group_ddf_images, assign_grain_labels).
 
+The aperture, polar and DDF image functions are ports of Ian MacLaren's
+digital dark field functions in py4DSTEM (aperture_array_generator,
+aperture_array_subtract, DDFimage, pointlist_to_array with rphi=True,
+DDF_radial_image and DDFradialazimuthimage), rewritten to read the peaks
+from a Vector.
+
 All functions read the peaks from a Vector with one cell per probe position.
 The diffraction coordinates are given by `q_fields`, which defaults to
 ("qx", "qy") for calibrated peaks or ("q_row", "q_col") for peaks in detector
 pixels. Boolean masks are aligned with the flattened rows of the Vector, so
 they can be combined with & and | and passed to ddf_image or to
 quantem.core.utils.clustering.filter_rows.
+
+Where a function needs the diffraction origin (`center=None`), calibrated
+("qx", "qy") peaks are taken to be relative to the direct beam, so the origin
+is (0, 0). Peaks in detector pixels ("q_row", "q_col") use the "origin_ref"
+stored in the Vector metadata by BraggVectors.correct_peak_origins; without
+it, pass `center` explicitly.
+
+The azimuth qphi of the polar functions follows py4DSTEM's DDF functions:
+qphi = atan2(-q0, q1) in degrees, measured anticlockwise from the +col
+(right) direction as the pattern is displayed with rows increasing
+downward, so phi ranges written for py4DSTEM carry over unchanged. This is
+not the azimuth used by quantem.diffraction.calibration, atan2(q1, q0),
+which is measured from the +row axis toward +col.
 """
 
 from __future__ import annotations
@@ -58,6 +77,27 @@ def _resolve_q_fields(vector, q_fields) -> tuple[str, str]:
     raise KeyError(
         f"No diffraction coordinate fields found in {vector.fields}; pass q_fields explicitly."
     )
+
+
+def _resolve_center(vector, q_fields, center) -> np.ndarray:
+    """Diffraction origin: `center` if given, else (0, 0) or the stored origin_ref.
+
+    Calibrated fields are relative to the direct beam already. Detector-pixel
+    fields ("q_row", "q_col") need the common origin that
+    BraggVectors.correct_peak_origins stores as "origin_ref".
+    """
+    if center is not None:
+        return np.asarray(center, dtype=np.float64).reshape(2)
+    if tuple(q_fields) == ("q_row", "q_col"):
+        origin_ref = vector.metadata.get("origin_ref")
+        if origin_ref is None:
+            raise ValueError(
+                "Peaks are in detector pixels and carry no 'origin_ref'; pass "
+                "center=(row, col) of the direct beam, or correct the origins with "
+                "BraggVectors.correct_peak_origins first."
+            )
+        return np.asarray(origin_ref, dtype=np.float64).reshape(2)
+    return np.zeros(2)
 
 
 def _q_coordinates(vector, q_fields=None, center=(0.0, 0.0)) -> np.ndarray:
@@ -115,7 +155,7 @@ def aperture_array(
     g2=None,
     mode: str = "array",
     center=(0.0, 0.0),
-    shift=(0, 0),
+    shift=(0.0, 0.0),
     n1_range: tuple[int, int] = (-5, 5),
     n2_range: tuple[int, int] = (-5, 5),
     radius_range: tuple[float, float] = (0.0, np.inf),
@@ -135,8 +175,9 @@ def aperture_array(
     Parameters
     ----------
     g1, g2 : array-like of float
-        (2,) lattice vectors in the same coordinates as the peaks. g2 is not
-        needed for mode="line".
+        (2,) lattice vectors in the same coordinates as the peaks. g2 is
+        required for mode="array", ignored for mode="line", and optional for
+        mode="single" (where it is only used with a nonzero s2).
     mode : {"array", "line", "single"}, default="array"
         "array" places a 2D lattice of apertures over n1_range and n2_range,
         "line" places a row of apertures along g1 over n1_range (a systematic
@@ -144,8 +185,10 @@ def aperture_array(
         at (s1 g1 + s2 g2).
     center : array-like of float, default=(0, 0)
         (2,) origin of the lattice, normally the direct beam.
-    shift : (int, int), default=(0, 0)
-        Lattice offset (s1, s2) in multiples of g1 and g2.
+    shift : (float, float), default=(0, 0)
+        Lattice offset (s1, s2) in multiples of g1 and g2; fractional values
+        place apertures between lattice points, for example (0.5, 0.5) for a
+        centered superlattice.
     n1_range, n2_range : (int, int), default=(-5, 5)
         Inclusive range of lattice multiples of g1 and g2.
     radius_range : (float, float), default=(0, inf)
@@ -162,13 +205,15 @@ def aperture_array(
     np.ndarray
         (N, 2) aperture positions.
     """
+    if mode == "array" and g2 is None:
+        raise ValueError('mode="array" needs both g1 and g2.')
     g1 = np.asarray(g1, dtype=np.float64)
     g2 = np.zeros(2) if g2 is None else np.asarray(g2, dtype=np.float64)
-    s1, s2 = shift
+    s1, s2 = (float(v) for v in shift)
     if mode == "single":
         n1 = np.array([0])
         n2 = np.array([0])
-    elif mode in ("line", "2-beam"):
+    elif mode == "line":
         n1 = np.arange(n1_range[0], n1_range[1] + 1)
         n2 = np.zeros_like(n1)
     elif mode == "array":
@@ -195,11 +240,11 @@ def aperture_array(
     return positions[keep]
 
 
-def fit_lattice(
+def refine_lattice_vectors(
     peaks,
     g1,
     g2,
-    center=(0.0, 0.0),
+    center=None,
     radius: float = 6.0,
     n1_range: tuple[int, int] = (-5, 5),
     n2_range: tuple[int, int] = (-5, 5),
@@ -207,9 +252,12 @@ def fit_lattice(
     q_fields=None,
     intensity_field: str = "intensity",
 ):
-    """Refine two lattice vectors against the peaks of every probe position.
+    """Refine one pair of lattice vectors against the peaks of the whole scan.
 
-    For each lattice point n1 g1 + n2 g2 (excluding the origin) we take the
+    This is a single global refinement, used to place virtual apertures; it is
+    not the per-position lattice fit of BraggVectors.fit_lattice used for
+    strain mapping. For each lattice point n1 g1 + n2 g2 (excluding the
+    origin) we take the
     intensity-weighted mean position of all peaks within `radius` of it,
     summed over the scan, then solve for g1 and g2 by weighted least squares
     with each point weighted by its summed intensity. Repeating this a few
@@ -222,11 +270,13 @@ def fit_lattice(
     peaks : Vector
         Peaks with one cell per probe position.
     g1, g2 : array-like of float
-        (2,) starting lattice vectors.
-    center : array-like of float, default=(0, 0)
-        (2,) lattice origin, held fixed.
+        (2,) starting lattice vectors, in the units of the peak coordinates.
+    center : array-like of float, optional
+        (2,) lattice origin, held fixed. None uses (0, 0) for calibrated peaks
+        and the stored "origin_ref" for peaks in detector pixels.
     radius : float, default=6.0
-        Search radius around each lattice point.
+        Search radius around each lattice point, in the units of the peak
+        coordinates.
     n1_range, n2_range : (int, int), default=(-5, 5)
         Inclusive range of lattice multiples used in the fit.
     num_iterations : int, default=3
@@ -241,6 +291,8 @@ def fit_lattice(
     g1, g2 : np.ndarray
         (2,) refined lattice vectors.
     """
+    q_fields = _resolve_q_fields(peaks, q_fields)
+    center = _resolve_center(peaks, q_fields, center)
     q = _q_coordinates(peaks, q_fields, center)
     w = peaks.select_fields(intensity_field).numpy()[:, 0].astype(np.float64).clip(min=0)
     n1, n2 = np.meshgrid(
@@ -485,8 +537,10 @@ def plot_apertures(
 # --------------------------------------------------------------------------- #
 
 
-def _polar_coordinates(peaks, q_fields=None, center=(0.0, 0.0)):
-    """(qr, qphi) of every flattened row, with qphi in degrees."""
+def _polar_coordinates(peaks, q_fields=None, center=None):
+    """(qr, qphi) of every flattened row, with qphi = atan2(-q0, q1) in degrees."""
+    q_fields = _resolve_q_fields(peaks, q_fields)
+    center = _resolve_center(peaks, q_fields, center)
     q = _q_coordinates(peaks, q_fields, center)
     qr = np.hypot(q[:, 0], q[:, 1])
     qphi = np.degrees(np.arctan2(-q[:, 0], q[:, 1]))
@@ -496,15 +550,17 @@ def _polar_coordinates(peaks, q_fields=None, center=(0.0, 0.0)):
 def add_polar_fields(
     peaks,
     q_fields=None,
-    center=(0.0, 0.0),
+    center=None,
     names: tuple[str, str] = ("qr", "qphi"),
 ):
     """Copy of the peaks with polar coordinate fields added.
 
     The radius qr has the units of the diffraction coordinates. The angle
-    qphi is in degrees, measured anticlockwise from the +col (right) direction
-    as the pattern is displayed with rows increasing downward, over the range
-    (-180, 180].
+    qphi = atan2(-q0, q1) is in degrees, measured anticlockwise from the +col
+    (right) direction as the pattern is displayed with rows increasing
+    downward, over the range (-180, 180]. This is py4DSTEM's DDF convention
+    (see the module docstring); it differs from the azimuth used in
+    quantem.diffraction.calibration.
 
     Parameters
     ----------
@@ -512,8 +568,10 @@ def add_polar_fields(
         Peaks with one cell per probe position.
     q_fields : (str, str), optional
         Diffraction coordinate fields.
-    center : array-like of float, default=(0, 0)
-        (2,) origin of the polar coordinates, normally the direct beam.
+    center : array-like of float, optional
+        (2,) origin of the polar coordinates, normally the direct beam. None
+        uses (0, 0) for calibrated peaks and the stored "origin_ref" for peaks
+        in detector pixels.
     names : (str, str), default=("qr", "qphi")
         Names of the new fields.
 
@@ -535,7 +593,7 @@ def polar_mask(
     tol: float = 1.0,
     phi_range: tuple[float, float] | None = None,
     q_fields=None,
-    center=(0.0, 0.0),
+    center=None,
 ) -> np.ndarray:
     """Peaks inside a ring, optionally restricted to a range of angles.
 
@@ -553,8 +611,9 @@ def polar_mask(
         phi_0 > phi_1 the range wraps through 180 degrees.
     q_fields : (str, str), optional
         Diffraction coordinate fields.
-    center : array-like of float, default=(0, 0)
-        (2,) origin of the polar coordinates.
+    center : array-like of float, optional
+        (2,) origin of the polar coordinates. None uses (0, 0) for calibrated
+        peaks and the stored "origin_ref" for peaks in detector pixels.
 
     Returns
     -------
@@ -578,13 +637,31 @@ def radial_ddf_image(
     tol: float = 1.0,
     phi_range: tuple[float, float] | None = None,
     q_fields=None,
-    center=(0.0, 0.0),
+    center=None,
     intensity_field: str = "intensity",
 ) -> np.ndarray:
     """Digital dark field image from a ring of diffraction space.
 
-    Equivalent to ddf_image(peaks, polar_mask(peaks, q_radius, tol, phi_range)).
-    See polar_mask for the parameters.
+    Equivalent to ddf_image(peaks, polar_mask(peaks, q_radius, tol,
+    phi_range, q_fields, center)).
+
+    Parameters
+    ----------
+    peaks : Vector
+        Peaks with one cell per probe position.
+    q_radius : float
+        Ring radius, in the units of the diffraction coordinates.
+    tol : float, default=1.0
+        Half width of the ring, in the same units.
+    phi_range : (float, float), optional
+        Angular range (phi_0, phi_1) in degrees, as in polar_mask.
+    q_fields : (str, str), optional
+        Diffraction coordinate fields.
+    center : array-like of float, optional
+        (2,) origin of the polar coordinates. None uses (0, 0) for calibrated
+        peaks and the stored "origin_ref" for peaks in detector pixels.
+    intensity_field : str, default="intensity"
+        Field summed at each probe position.
 
     Returns
     -------
@@ -614,13 +691,18 @@ def cluster_coms(
     ----------
     labeled : Vector
         Vector carrying a cluster label field (from cluster_vector).
+    label_field : str, default="cluster"
+        Field holding the cluster labels; negative labels are ignored.
+    intensity_field : str, default="intensity"
+        Field used as the weight of each peak when `weighted` is True.
     weighted : bool, default=True
         Weight the center of mass by peak intensity.
 
     Returns
     -------
     coms : np.ndarray
-        (K, 2) scan-coordinate centers of mass, ordered by cluster id.
+        (K, 2) centers of mass in scan (row, col) pixels, ordered by cluster
+        id. K is the largest label plus one; (0, 2) when no peak is labeled.
     sizes : np.ndarray
         (K,) number of peaks per cluster.
     """
@@ -630,7 +712,7 @@ def cluster_coms(
     w = flat[:, fields.index(intensity_field)].clip(min=0) if weighted else None
     rc = _scan_cells(labeled).astype(float)
 
-    n = labels.max() + 1
+    n = max(int(labels.max()) + 1, 0) if labels.size else 0
     coms = np.zeros((n, 2))
     sizes = np.zeros(n, dtype=int)
     for k in range(n):
@@ -667,13 +749,16 @@ def cluster_centers(
     Returns
     -------
     np.ndarray
-        (K, 2) mean diffraction positions, ordered by cluster id.
+        (K, 2) mean diffraction positions, ordered by cluster id; (0, 2) when
+        no peak is labeled.
     """
     q = _q_coordinates(labeled, q_fields)
     labels = labeled.select_fields(label_field).numpy()[:, 0].astype(int)
     w = labeled.select_fields(intensity_field).numpy()[:, 0].astype(np.float64).clip(min=0)
     m = labels >= 0
-    n = labels.max() + 1
+    n = int(labels[m].max()) + 1 if m.any() else 0
+    if n == 0:
+        return np.zeros((0, 2))
     wsum = np.maximum(np.bincount(labels[m], weights=w[m], minlength=n), 1e-12)
     return np.stack(
         [np.bincount(labels[m], weights=w[m] * q[m, k], minlength=n) / wsum for k in range(2)],
@@ -688,6 +773,17 @@ def ddf_images(
     intensity_field: str = "intensity",
 ) -> np.ndarray:
     """Digital dark field images: per-cluster summed intensity per position.
+
+    Parameters
+    ----------
+    labeled : Vector
+        Peaks carrying a cluster label field (from cluster_vector).
+    cluster_ids : int or array-like of int
+        Cluster labels to image, one image each, in this order.
+    label_field : str, default="cluster"
+        Field holding the cluster labels.
+    intensity_field : str, default="intensity"
+        Field summed at each probe position. Negative values are clipped to 0.
 
     Returns
     -------
@@ -887,8 +983,10 @@ def plot_cluster_scatter(
         Marker opacity. Values well below 1 show the dense regions of large
         datasets.
     center : array-like of float, optional
-        (2,) diffraction origin at the middle of the plot. Defaults to the
-        "origin_ref" stored by BraggVectors.correct_peak_origins, or (0, 0).
+        (2,) diffraction origin at the middle of the plot. None uses (0, 0)
+        for calibrated peaks and the "origin_ref" stored by
+        BraggVectors.correct_peak_origins for peaks in detector pixels (or the
+        middle of the peak positions when there is none).
     figax : (Figure, Axes), optional
         Axes to draw into.
 
@@ -897,10 +995,12 @@ def plot_cluster_scatter(
     fig, ax
     """
     q_fields = _resolve_q_fields(labeled, q_fields)
-    if center is None:
-        center = labeled.metadata.get("origin_ref", (0.0, 0.0))
-    center = np.asarray(center, dtype=np.float64)
     q = labeled.select_fields(*q_fields).numpy().astype(np.float64)
+    try:
+        center = _resolve_center(labeled, q_fields, center)
+    except ValueError:
+        # pixel peaks without a stored origin: frame the peaks themselves
+        center = 0.5 * (q.min(axis=0) + q.max(axis=0)) if q.size else np.zeros(2)
     labels = labeled.select_fields(label_field).numpy()[:, 0].astype(int)
     q0, q1 = q[:, 0], q[:, 1]
 
@@ -923,7 +1023,7 @@ def plot_cluster_scatter(
     if show_unclustered:
         m = labels < 0
         ax.scatter(q1[m], q0[m], s=point_size, color="0.85", lw=0)
-    n = labels.max() + 1
+    n = max(int(labels.max()) + 1, 0) if labels.size else 0
     n_show = n if max_clusters is None else min(n, max_clusters)
     cmap = plt.get_cmap("hsv")
     rng = np.random.default_rng(0)

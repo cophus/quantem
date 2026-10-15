@@ -1274,6 +1274,8 @@ class Vector(AutoSerialize):
         lhs = self.flatten()
 
         if isinstance(other, Vector):
+            if other.shape != self.shape:
+                raise ValueError("Vector inputs must have matching fixed-grid shapes.")
             if other.num_cells != self.num_cells:
                 raise ValueError(f"Expected {self.num_cells} cells, got {other.num_cells}")
             if other.num_fields != self.num_fields:
@@ -1313,6 +1315,8 @@ class Vector(AutoSerialize):
         lhs = self.flatten()
 
         if isinstance(other, Vector):
+            if other.shape != self.shape:
+                raise ValueError("Vector inputs must have matching fixed-grid shapes.")
             if other.num_cells != self.num_cells:
                 raise ValueError(f"Expected {self.num_cells} cells, got {other.num_cells}")
             if other.num_fields != self.num_fields:

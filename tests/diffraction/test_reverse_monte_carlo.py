@@ -241,3 +241,133 @@ def test_random_displacement_scores_exactly_and_stays_bounded(rmc):
 def test_shell_labels(rmc):
     c = rmc.displacement_correlations(n_shells=4)
     assert c["shell"] == ["1/2<111>", "<100>", "<110>", "1/2<311>"]
+
+
+def test_set_mask_edge_px_zero_keeps_detector(rmc):
+    rmc.set_mask(bragg_radius=0.06, q_max=0.6, center_radius=0.1, edge_px=0)
+    assert all(np.any(w > 0.5) for w in rmc.mask["w"])
+
+
+def test_bloch_envelope_needs_fit_thickness(rmc):
+    with pytest.raises(RuntimeError, match="fit_thickness"):
+        rmc.set_envelope("bloch")
+    assert rmc.envelope == "measured"
+    with pytest.raises(ValueError, match="unknown envelope"):
+        rmc.set_envelope("nope")
+    assert rmc.envelope == "measured"
+
+
+def test_fit_size_effect_runs_on_model_device(rmc):
+    out = rmc.fit_size_effect(verbose=False)
+    assert set(out["eta"]) == set(rmc.species)
+    assert out["loss"][1] <= out["loss"][0] * (1 + 1e-6)
+    assert abs((rmc.concentrations * rmc.size_eta).sum()) < 1e-12
+
+
+def _synthetic_pattern(rmc, zone, center, theta, shape=(160, 160)):
+    """Gaussian spots at the kinematic intensities on a broad halo about the direct beam."""
+    from quantem.diffraction.reverse_monte_carlo import _rot2
+
+    _, g2, inten = rmc._zone_reflections(zone, 1.6)
+    A = _rot2(theta) / rmc.sampling
+    pos = np.vstack([center, np.asarray(center) + g2 @ A.T])
+    inten = np.concatenate([[2 * inten.max()], inten])  # direct beam first
+    rr, cc = np.mgrid[0 : shape[0], 0 : shape[1]].astype(float)
+    im = 50.0 * np.exp(-((rr - center[0]) ** 2 + (cc - center[1]) ** 2) / (2 * 40.0**2))
+    for (pr, pc), i in zip(pos, inten / inten.max()):
+        im += 1e3 * i * np.exp(-((rr - pr) ** 2 + (cc - pc) ** 2) / (2 * 1.2**2))
+    return im + 1.0
+
+
+def test_fit_geometry_on_synthetic_lattice(tmp_path):
+    path = tmp_path / "vnb.cif"
+    path.write_text(CIF)
+    zones = [(0, 0, 1), (0, 1, 1)]
+    centers = [np.array([78.3, 81.6]), np.array([80.5, 79.2])]
+    out = ReverseMonteCarlo.from_images(
+        [np.zeros((160, 160))] * 2, zone_axes=zones, sampling=0.03, bin_factor=4
+    )
+    out.set_crystal(Crystal.from_cif(path, verbose=False))
+    out.images = [
+        _synthetic_pattern(out, z, c, th).astype(np.float32)
+        for z, c, th in zip(zones, centers, (0.3, -0.7))
+    ]
+    out.fit_geometry(scale_range=(0.97, 1.03), verbose=False)
+    geo = out.geometry
+    for c, c_fit in zip(centers, geo["centers"]):
+        assert np.allclose(c_fit, c, atol=0.3)
+    # the halo biases the peak centroids slightly on so small a detector
+    assert out.lattice_parameter == pytest.approx(3.2, rel=1e-2)
+    assert all(np.rad2deg(np.linalg.norm(t)) < 0.5 for t in geo["tilts"])
+    assert all(rms < 0.3 for rms in geo["rms_px"])
+    assert len(geo["_inten_kin"]) == len(geo["excitation_width"]) == 2
+
+    out.fit_thickness(
+        thickness=(100.0, 200.0), step=50.0, tilt_range_deg=0.0, k_max=1.0, depth_samples=4,
+        verbose=False,
+    )  # fmt: skip
+    assert out.geometry["thickness_k_max"] == 1.0
+    assert all(g is not None for g in out.geometry["bloch_g"])
+
+    out.set_mask(bragg_radius=0.08, q_max=1.0, center_radius=0.15, edge_px=4)
+    out.build_supercell(cells=3, seed=0, device="cpu")
+    out.fit_background()
+    for envelope in ("kinematic", "bloch"):
+        out.set_envelope(envelope)
+        assert out.envelope == envelope
+        assert np.isfinite(out._update_residual())
+
+
+def test_shell_correlations_match_warren_cowley(rmc):
+    sc = rmc.shell_correlations(n_shells=4)
+    sro = rmc.warren_cowley(n_shells=4)
+    ratio = sc["ratio"]
+    np.testing.assert_allclose(sc["radius"], sro["radius"])
+    # pair counts are symmetric, and an unlike pair has ratio = 1 - alpha
+    np.testing.assert_allclose(ratio, np.swapaxes(ratio, 1, 2), atol=1e-9)
+    np.testing.assert_allclose(ratio[:, 0, 1], 1 - sro["alpha"][:, 0, 1], atol=0.02)
+    # a random arrangement sits near 1 in every shell
+    assert np.abs(ratio - 1).max() < 0.2
+    assert sc["shell"][:3] == ["1/2<111>", "<100>", "<110>"]
+    # the default radius reaches five lattice parameters, or half the supercell
+    far = rmc.shell_correlations()
+    assert far["radius"][-1] <= min(5, rmc.cells / 2) * rmc.lattice_parameter + 1e-6
+    assert len(far["shell"]) == len(far["radius"])
+
+
+def test_plot_shell_correlations(rmc):
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axs = rmc.plot_shell_correlations()
+    K = len(rmc.species)
+    assert len(axs) == K * (K + 1) // 2
+    plt.close(fig)
+
+
+def test_to_atoms_and_cif_round_trip(rmc, tmp_path):
+    from ase.io import read
+
+    atoms = rmc.to_atoms()
+    n = len(rmc.site_x)
+    assert len(atoms) == n
+    assert np.allclose(atoms.cell.lengths(), rmc._a_crystal * rmc.cells)
+    counts = {s: int((np.array(atoms.get_chemical_symbols()) == s).sum()) for s in rmc.species}
+    expected = np.bincount(rmc.species_index, minlength=len(rmc.species))
+    assert [counts[s] for s in rmc.species] == expected.tolist()
+    # displacements move the atoms off the ideal sites by the fitted amount
+    first = int(
+        np.argsort(np.array([rmc.species[k] for k in rmc.species_index]), kind="stable")[0]
+    )
+    rmc.displacement[first] = [1, 0, 0]
+    step = rmc._a_crystal * rmc.cells / rmc.grid_size
+    shifted = rmc.to_atoms().get_positions()[0] - atoms.get_positions()[0]
+    assert np.allclose(shifted, [step, 0, 0])
+    rmc.displacement[first] = 0
+    path = rmc.to_cif(tmp_path / "rmc.cif")
+    back = read(path)
+    assert len(back) == n
+    assert np.allclose(back.cell.lengths(), atoms.cell.lengths())
+    assert np.allclose(back.get_scaled_positions(), atoms.get_scaled_positions(), atol=1e-5)

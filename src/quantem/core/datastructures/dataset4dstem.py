@@ -10,9 +10,53 @@ from numpy.typing import NDArray
 from quantem.core.datastructures.dataset2d import Dataset2d
 from quantem.core.datastructures.dataset4d import Dataset4d
 from quantem.core.datastructures.polar4dstem import dataset4dstem_polar_transform
+from quantem.core.utils.diffractive_imaging_utils import (
+    fit_probe_circle as _fit_probe_circle,
+)
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
+
+
+def q_to_r_matrix(rotation_ccw_deg: float = 0.0, transpose: bool = False) -> np.ndarray:
+    """The 2x2 map from detector (q) to scan (r) coordinates, ``v_r = M @ v_q``.
+
+    The one convention shared by calibration, orientation and strain mapping
+    and ptychography, stored on a dataset as
+    ``metadata["q_to_r_rotation_ccw_deg"]`` and ``metadata["q_transpose"]``:
+    a detector vector (row, col) is first swapped to (col, row) if
+    `transpose`, then rotated counter-clockwise by `rotation_ccw_deg`,
+    ``row' = cos(t) row - sin(t) col``, ``col' = sin(t) row + cos(t) col``.
+    Ptychography stores the same rotation as ``com_rotation_rad`` and
+    ``com_transpose``.
+
+    Parameters
+    ----------
+    rotation_ccw_deg : float, default=0.0
+        Counter-clockwise rotation, degrees.
+    transpose : bool, default=False
+        Swap the detector row and column axes before the rotation.
+
+    Returns
+    -------
+    np.ndarray
+        (2, 2) matrix; its inverse maps scan vectors back onto the detector.
+    """
+    th = np.deg2rad(float(rotation_ccw_deg or 0.0))
+    M = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+    return M[:, ::-1].copy() if transpose else M
+
+
+def scan_rotation_from_metadata(metadata) -> tuple[float | None, bool | None]:
+    """``(q_to_r_rotation_ccw_deg, q_transpose)`` recorded on a dataset, or None
+    for either that is not set. Reads the older ``r_to_q_rotation_cw_deg``
+    name too (the same number)."""
+    md = metadata or {}
+    rot = md.get("q_to_r_rotation_ccw_deg")
+    if rot is None:
+        rot = md.get("r_to_q_rotation_cw_deg")
+    tr = md.get("q_transpose")
+    return (None if rot is None else float(rot)), (None if tr is None else bool(tr))
 
 
 class Dataset4dstem(Dataset4d):
@@ -74,11 +118,29 @@ class Dataset4dstem(Dataset4d):
         signal_units : str, optional
             Units for the array values, by default "arb. units"
         metadata : dict
-            "r_to_q_rotation_cw_deg":  rotation r to q clockwise in degrees
-            "ellipticity": 3 parameters (a, b, theta (degrees))
+            Missing keys below are set to None.
+
+            "q_to_r_rotation_ccw_deg" : float
+                Rotation in degrees that maps detector (q) vectors onto the
+                scan (r) frame. A detector vector (dr, dc) is first swapped to
+                (dc, dr) if "q_transpose" is True, then rotated as
+                dr' = cos(t) dr - sin(t) dc, dc' = sin(t) dr + cos(t) dc.
+            "q_transpose" : bool
+                If True, swap the detector row and column axes before the
+                rotation.
+            "ellipticity" : tuple
+                3 parameters (a, b, theta in degrees).
         _token : object | None, optional
             Token to prevent direct instantiation, by default None
         """
+        # The old name described the inverse transform. Its clockwise angle
+        # has the same numeric value as the new q-to-r counterclockwise angle.
+        if (
+            metadata.get("q_to_r_rotation_ccw_deg") is None
+            and metadata.get("r_to_q_rotation_cw_deg") is not None
+        ):
+            metadata["q_to_r_rotation_ccw_deg"] = metadata["r_to_q_rotation_cw_deg"]
+
         mdata_keys_4dstem = ["q_to_r_rotation_ccw_deg", "q_transpose", "ellipticity"]
         for k in mdata_keys_4dstem:
             if k not in metadata.keys():
@@ -97,6 +159,16 @@ class Dataset4dstem(Dataset4d):
         )
         self._virtual_images = {}
         self._virtual_detectors = {}  # Store detector information for regeneration
+
+    def _post_load(self) -> None:
+        """Migrate detector rotation metadata from older serialized datasets."""
+        metadata = getattr(self, "_metadata", None)
+        if (
+            isinstance(metadata, dict)
+            and metadata.get("q_to_r_rotation_ccw_deg") is None
+            and metadata.get("r_to_q_rotation_cw_deg") is not None
+        ):
+            metadata["q_to_r_rotation_ccw_deg"] = metadata["r_to_q_rotation_cw_deg"]
 
     @classmethod
     def from_file(cls, file_path: str | PathLike, file_type: str | None = None) -> "Dataset4dstem":
@@ -275,6 +347,39 @@ class Dataset4dstem(Dataset4d):
             self._dp_mean = dp_mean_dataset
 
         return dp_mean_dataset
+
+    def fit_probe_circle(
+        self,
+        array: NDArray | Dataset2d | None = None,
+        threshold: float | None = None,
+        show: bool = True,
+    ) -> tuple[float, float, float]:
+        """Fit a circle to the probe in a diffraction pattern.
+
+        Parameters
+        ----------
+        array : NDArray | Dataset2d | None, optional
+            2D diffraction pattern to fit, either as an array or a Dataset2d. If
+            None, uses this dataset's mean diffraction pattern, computing it if needed.
+        threshold : float | None, optional
+            Threshold for binarizing the diffraction pattern. If None, Otsu's method
+            is used.
+        show : bool, optional
+            Whether to display the fitted circle, by default True.
+
+        Returns
+        -------
+        tuple[float, float, float]
+            Probe center in diffraction-pattern row and column coordinates
+            (probe_qy0, probe_qx0), followed by the fitted radius.
+        """
+        if array is None:
+            dp_mean = (
+                self._dp_mean if hasattr(self, "_dp_mean") else self.get_dp_mean(attach=False)
+            )
+            array = dp_mean.array
+
+        return _fit_probe_circle(array, threshold=threshold, show=show)
 
     @property
     def dp_max(self) -> Dataset2d:
