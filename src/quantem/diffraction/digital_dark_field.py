@@ -920,7 +920,7 @@ def composite_ddf(
     else:
         norm = np.maximum(images.reshape(K, -1).max(axis=1), 1e-12)
     scaled = (images / norm[:, None, None]) ** gamma
-    rgb = np.einsum("krc,kj->rcj", scaled, colors)
+    rgb = np.einsum("krc,kj->krcj", scaled, colors).max(axis=0)
     return np.clip(rgb, 0, 1)
 
 
@@ -941,7 +941,7 @@ def color_wheel(n: int = 256, saturation: float = 1.0) -> np.ndarray:
     """
     y, x = np.mgrid[-1 : 1 : n * 1j, -1 : 1 : n * 1j]
     r = np.hypot(x, y)
-    hue = (np.arctan2(y, x) / (2 * np.pi)) % 1.0
+    hue = (np.arctan2(y, x) / (np.pi)) % 1.0
     hsv = np.stack([hue, np.full_like(hue, saturation), np.clip(r, 0, 1)], axis=-1)
     rgba = np.concatenate([hsv_to_rgb(hsv), (r <= 1.0)[..., None].astype(float)], axis=-1)
     return rgba
