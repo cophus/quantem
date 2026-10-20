@@ -32,16 +32,18 @@ Workflow from 4DSTEM data: ``from_dataset4dstem`` -> ``set_crystal`` ->
 ``fit_geometry`` -> ``extract_qx`` -> ``set_model`` -> ``reconstruct`` (or
 ``l_curve``) -> ``plot_*``. From an extracted qx plot, ``from_qx`` replaces the
 first and the extraction steps. Optional: ``fit_calibration``,
-``set_strain_grid`` (coarse to fine) and ``align_twins``.
+``set_strain_grid`` (coarse to fine) and ``search_twins``.
 
 Units are Angstroms and 1/Angstroms (no 2 pi); the beam energy is in eV.
 
 Limitations: one systematic row and one strain component, column
-approximation, no probe blur along x. Mirroring the field about the midplane,
-eps(x, z) -> eps(x, t - z), gives the same intensities, so every fit has a
-twin (``plot_strain(mirror=True)``); in the column approximation this holds
-column by column, which can fold an inclined feature at the midplane
-(``align_twins``).
+approximation, no probe blur along x. Mirroring the field in depth,
+eps(x, z) -> eps(x, t - z), leaves the kinematical intensities and the direct
+disk unchanged; only dynamical scattering into the other disks tells the two
+apart. A fit can therefore settle with part of the field mirrored (in the
+column approximation, column by column), which folds an inclined feature at
+the midplane. ``search_twins`` tests mirrored ranges of columns against the
+data.
 """
 
 from __future__ import annotations
@@ -115,7 +117,8 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
        fixed, on a strain-free window.
     7. ``reconstruct``: the strain nodes, or ``l_curve`` to choose the penalty
        weight as well. ``set_strain_grid`` refines the nodes between fits, and
-       ``align_twins`` unfolds a feature folded at the midplane.
+       ``search_twins`` unfolds a feature folded at the midplane, if the data
+       favour it.
     8. ``plot_geometry``, ``plot_qx``, ``plot_fit``, ``plot_strain``,
        ``plot_loss``, ``plot_l_curve``.
 
@@ -337,6 +340,8 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         threshold: float = 0.5,
         n_beams: int = 2,
         centering: bool = True,
+        descan: int | str = 2,
+        descan_sigma: float = 5.0,
         width: float | None = None,
         sigma: float = 1.5,
         verbose: bool = True,
@@ -348,16 +353,20 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         high-passed mean pattern correlated with a disk of that radius, and the
         systematic row is the neighbouring pair of candidates, opposite each
         other across the direct beam, with the strongest correlation, which
-        gives a first row direction. Along the row the problem is
-        one-dimensional: in a profile through the direct beam its two edges (the
-        steepest rise and fall of the smoothed profile) give the center and the
-        radius R. With ``centering`` this is done for every pattern, along and
-        across the row, and a robust straight line along x models the descan.
-        The profiles, aligned on those centers and averaged, have rising (and
-        falling) disk edges every |g|, so the autocorrelation of the edge
-        profile peaks at |g| in pixels; the direction is refined (within 5
-        degrees) to make that peak sharpest. This gives the q sampling
-        |g| / px and the semiconvergence R |g| / px.
+        gives a first row direction.
+
+        The direct disk is located by an ellipse fit (axes along and across the
+        row, allowing for distortion of the projection) to its rim: the
+        steepest fall of radial profiles, at angles more than 35 degrees from
+        the row. Along the row the rim faces the gaps between the disks, whose
+        aperture fringes overlap and make edges there unreliable. With ``centering`` this
+        is done for every pattern, and the descan, the drift of the direct beam
+        along x, is modelled smoothly through those centers. The profiles along
+        the row, aligned on the centers and averaged, have rising (and falling)
+        disk edges every |g|, so the autocorrelation of the edge profile peaks
+        at |g| in pixels; the direction is refined (within 5 degrees) to make
+        that peak sharpest. This gives the q sampling |g| / px along the row,
+        and the semiconvergence is the median radius along the row times it.
 
         Parameters
         ----------
@@ -367,9 +376,18 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             Disks on each side of the direct beam in the profiles used for the
             spacing.
         centering : bool
-            Measure and fit the direct-beam position of every pattern.
+            Measure the direct-beam position of every pattern and model the
+            descan.
+        descan : int or "smooth"
+            Descan model: a polynomial in x of this order (outliers rejected),
+            or the measured centers smoothed along x (Gaussian of
+            ``descan_sigma`` positions). The rim of the disk can wobble with the
+            illumination while the pattern inside does not; compare the fits.
+        descan_sigma : float
+            Smoothing of the ``"smooth"`` descan, in scan positions.
         width : float, optional
-            Profile width in pixels. Default half the disk radius.
+            Width (px) of the profiles along the row. Default half the disk
+            radius.
         sigma : float
             Smoothing (px) of the profiles before the edges are located.
         verbose : bool
@@ -379,6 +397,8 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             raise RuntimeError("fit_geometry needs CBED patterns (from_dataset4dstem).")
         if self.g is None:
             raise RuntimeError("set_crystal first")
+        if descan != "smooth" and not isinstance(descan, (int, np.integer)):
+            raise ValueError("descan is 'smooth' or a polynomial order")
         mean = self.stack.mean(0).astype(np.float64)
         (r0, c0), radius = estimate_central_beam(torch.as_tensor(mean), threshold=threshold)
         center = np.array([r0, c0])
@@ -407,39 +427,67 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         direction = d / g_guess
         if direction[0] < 0 or (abs(direction[0]) < 1e-9 and direction[1] < 0):
             direction = -direction
-        perp = np.array([-direction[1], direction[0]])
 
-        def disk_center(image, c):
-            """Direct-beam center and radius from its edges along and across the row."""
-            t = np.arange(-radius - 15.0, radius + 15.5)
-            out, rad = c.copy(), []
-            for v in (direction, perp):
-                slope = ndimage.gaussian_filter1d(
-                    self._profile(image, c, v, t, width), sigma, order=1
+        def disk_center(image, c, radius):
+            """Direct-beam center and its radii along and across the row: an ellipse with
+            axes along the row, fitted to the rim away from the row."""
+            perp = np.array([-direction[1], direction[0]])
+            ang = np.deg2rad(np.r_[np.arange(35.0, 146.0, 5.0), np.arange(215.0, 326.0, 5.0)])
+            r = np.arange(radius - 12.0, radius + 12.5, 0.5)
+            pts = []
+            for a in ang:
+                v = np.cos(a) * direction + np.sin(a) * perp
+                prof = ndimage.map_coordinates(
+                    image, [c[0] + r * v[0], c[1] + r * v[1]], order=1, mode="nearest"
                 )
-                rise = self._edge(t, slope, -radius, 12.0, 1)
-                fall = self._edge(t, slope, radius, 12.0, -1)
-                out = out + 0.5 * (rise + fall) * v
-                rad.append(0.5 * (fall - rise))
-            return out, rad[0]
+                slope = ndimage.gaussian_filter1d(prof, sigma / 0.5, order=1)
+                pts.append(c + self._edge(r, slope, radius, 10.0, -1) * v)
+            u, w = (np.array(pts) - c) @ direction, (np.array(pts) - c) @ perp
+            # A u^2 + B w^2 + C u + D w = 1
+            A = np.column_stack([u**2, w**2, u, w])
+            ok = np.ones(len(u), dtype=bool)
+            for _ in range(3):
+                sol, *_ = np.linalg.lstsq(A[ok], np.ones(int(ok.sum())), rcond=None)
+                u0, w0 = -sol[2] / (2 * sol[0]), -sol[3] / (2 * sol[1])
+                k = 1.0 + sol[0] * u0**2 + sol[1] * w0**2
+                ra, rb = float(np.sqrt(k / sol[0])), float(np.sqrt(k / sol[1]))
+                res = np.abs(np.hypot((u - u0) / ra, (w - w0) / rb) - 1.0) * 0.5 * (ra + rb)
+                ok = res < max(3.0 * 1.4826 * np.median(res[ok]), 0.5)
+            return c + u0 * direction + w0 * perp, ra, rb
 
-        center, _ = disk_center(mean, center)
+        # the descan blurs the mean pattern along the row: start the patterns from its
+        # center and its radius across the row
+        for _ in range(2):
+            center, radius, radius_across = disk_center(mean, center, radius)
         nx = self.stack.shape[0]
-        X = np.column_stack([np.ones(nx), np.arange(nx, dtype=np.float64)])
         pred = np.tile(center, (nx, 1))
         geo = dict(direction=direction)
         if centering:
-            for _ in range(2):
-                meas = np.array([disk_center(self.stack[i], pred[i])[0] for i in range(nx)])
-                ok = np.all(np.isfinite(meas), axis=1)
-                for _ in range(3):
+            fits = [disk_center(self.stack[i], center, radius_across) for i in range(nx)]
+            fits = [disk_center(self.stack[i], c, r) for i, (c, r, _) in enumerate(fits)]
+            meas = np.array([f[0] for f in fits])
+            radius = float(np.median([f[1] for f in fits]))
+            radius_across = float(np.median([f[2] for f in fits]))
+            idx = np.arange(nx, dtype=np.float64)
+            ok = np.all(np.isfinite(meas), axis=1)
+            if descan == "smooth":
+                ref = ndimage.median_filter(meas, size=(9, 1), mode="nearest")
+            else:
+                X = np.vander(idx, int(descan) + 1)
+            for _ in range(3):
+                if descan != "smooth":
                     coef, *_ = np.linalg.lstsq(X[ok], meas[ok], rcond=None)
-                    res = np.linalg.norm(meas - X @ coef, axis=1)
-                    mad = np.median(np.abs(res[ok])) + 1e-9
-                    ok = ok & (res < 4.0 * 1.4826 * mad + 0.5)
-                pred = X @ coef
+                    ref = X @ coef
+                res = np.linalg.norm(meas - ref, axis=1)
+                ok = ok & (res < 4.0 * 1.4826 * (np.median(res[ok]) + 1e-9) + 0.25)
+            if descan == "smooth":
+                filled = np.column_stack([np.interp(idx, idx[ok], meas[ok, k]) for k in (0, 1)])
+                pred = ndimage.gaussian_filter1d(filled, descan_sigma, axis=0, mode="nearest")
+            else:
+                pred = ref
+            res = np.linalg.norm(meas - pred, axis=1)
             center = pred.mean(0)
-            geo.update(centers=meas, centers_fit=pred, centers_used=ok)
+            geo.update(centers=meas, centers_fit=pred, centers_used=ok, descan=descan)
 
         # direction and spacing: the rising and falling disk edges of the aligned profiles
         # repeat every |g|, so their autocorrelation peaks there (sharpest at the right angle)
@@ -481,10 +529,6 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         perp = np.array([-direction[1], direction[0]])
         prof = mean_profile(direction)
         g_px, _ = spacing(prof)
-        slope = ndimage.gaussian_filter1d(prof, sigma, order=1)
-        rise = self._edge(t, slope, -radius, 12.0, 1)
-        fall = self._edge(t, slope, radius, 12.0, -1)
-        radius = 0.5 * (fall - rise)
         n_idx = np.arange(-n_beams, n_beams + 1)
         q_sampling = self.g / g_px
         geo.update(
@@ -492,6 +536,7 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             center=center,
             g_px=float(g_px),
             radius_px=float(radius),
+            radius_across_px=float(radius_across),
             q_sampling=float(q_sampling),
             semiconvergence=float(radius * q_sampling),
             disks=center[None] + (n_idx * g_px)[:, None] * direction[None],
@@ -504,13 +549,15 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             if centering:
                 drift = (pred[-1] - pred[0]) @ direction
                 across = (pred[-1] - pred[0]) @ perp
+                model = "smoothed" if descan == "smooth" else f"order-{int(descan)} polynomial"
                 print(
-                    f"descan over {nx} patterns: {drift:.2f} px along g, {across:.2f} px "
-                    f"across, rms scatter {np.sqrt(np.mean(res[ok] ** 2)):.2f} px"
+                    f"descan over {nx} patterns ({model}): {drift:.2f} px along g, {across:.2f} px "
+                    f"across; centers scatter {np.sqrt(np.mean(res[ok] ** 2)):.2f} px rms about "
+                    f"it, {int((~ok).sum())} rejected"
                 )
             print(
-                f"direct beam ({center[0]:.1f}, {center[1]:.1f}) px, disk radius {radius:.2f} px, "
-                f"|g| = {g_px:.2f} px, "
+                f"direct beam ({center[0]:.1f}, {center[1]:.1f}) px, disk radius {radius:.2f} px "
+                f"along the row ({radius_across:.2f} across), |g| = {g_px:.2f} px, "
                 f"{q_sampling:.6f} 1/A per px, semiconvergence {geo['semiconvergence']:.4f} 1/A "
                 f"({1e3 * geo['semiconvergence'] * self.wavelength:.2f} mrad)"
             )
@@ -792,7 +839,9 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         """Change the strain nodes, keeping the current field (linear interpolation).
 
         For coarse-to-fine fits: fit a coarse grid, then refine it here and fit
-        again. The extents default to the current ones.
+        again. The extents default to the current ones; a wider x range also
+        extends the simulated columns (same step), and the field outside the old
+        nodes starts at zero.
         """
         m, p = self.model, self.params
         f64 = dict(dtype=torch.float64, device=p["strain"].device)
@@ -802,9 +851,21 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         x_nodes = torch.linspace(*(strain_x_range or xr), strain_shape[1], **f64)
         with torch.no_grad():
             strain = _hat(z_nodes, m["z_nodes"]) @ p["strain"] @ _hat(x_nodes, m["x_nodes"]).T
+            outside_x = (x_nodes < m["x_nodes"][0] - 1e-9) | (x_nodes > m["x_nodes"][-1] + 1e-9)
+            outside_z = (z_nodes < m["z_nodes"][0] - 1e-9) | (z_nodes > m["z_nodes"][-1] + 1e-9)
+            strain[:, outside_x] = 0.0
+            strain[outside_z, :] = 0.0
+        xs = m["x_sim"]
+        if len(xs) > 1 and (x_nodes[0] < xs[0] or x_nodes[-1] > xs[-1]):
+            step = float(xs[1] - xs[0])
+            x0 = min(float(xs[0]), float(np.floor(float(x_nodes[0]) / step) * step))
+            x1 = max(float(xs[-1]), float(np.ceil(float(x_nodes[-1]) / step) * step))
+            m["x_sim"] = torch.as_tensor(np.arange(x0, x1 + 0.5 * step, step), **f64)
         m.update(z_nodes=z_nodes, x_nodes=x_nodes, wx=_hat(m["x_sim"], x_nodes).T.contiguous())
         p["strain"] = strain
-        print(f"{strain_shape[0]} x {strain_shape[1]} strain nodes")
+        print(
+            f"{strain_shape[0]} x {strain_shape[1]} strain nodes, {len(m['x_sim'])} simulated columns"
+        )
         return self
 
     def _strain_field(self, p: dict, h: torch.Tensor) -> torch.Tensor:
@@ -982,6 +1043,8 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             n_eval=state["n_eval"],
             message=str(res.message),
             fitted=tuple(names),
+            reg=reg,
+            reg_type=reg_type,
         )
         if verbose:
             print(
@@ -1308,6 +1371,8 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             n_eval=max_iter,
             message="torch " + str(optimizer),
             fitted=tuple(names),
+            reg=reg,
+            reg_type=reg_type,
         )
         if verbose:
             zero = float((self.params["strain"] == 0).double().mean())
@@ -1318,111 +1383,115 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             )
         return self
 
-    def align_twins(
+    def _mirror(self, strain: torch.Tensor) -> torch.Tensor:
+        """Node values of the depth-mirrored field eps(x, t - z) (linear interpolation)."""
+        t = self.params["thickness"].detach()
+        zn = self.model["z_nodes"]
+        return _hat((t - zn).clamp(min=0.0), zn) @ strain
+
+    def search_twins(
         self,
-        width: float | None = None,
-        surface: float = 0.1,
-        x_range: tuple[float, float] | None = None,
-        slope_range: tuple[float, float] | None = None,
-        detrend: bool = True,
-        n_grid: int = 121,
+        reg: float | None = None,
+        reg_type: str | None = None,
+        max_iter: int = 60,
+        rounds: int = 4,
+        step: int = 1,
         verbose: bool = True,
-    ) -> np.ndarray:
-        """Choose the depth twin of every column of strain nodes so the strain follows one line.
+    ) -> list[tuple[int, int]]:
+        """Choose the depth twin of ranges of node columns by the fit to the data.
 
-        In the column approximation each column of the field can be mirrored,
-        eps(x, z) -> eps(x, t - z), with almost no change of its qx plot, so a
-        fit can mix the two twins column by column. Mixing them where a feature
-        is away from the midplane leaves steps in the field, which the penalties
-        remove; where it crosses the midplane the twins meet, so one inclined
-        layer comes out folded there, as a V or an inverted V.
+        Mirroring the field in depth, eps(x, z) -> eps(x, t - z), leaves the
+        kinematical intensities and the direct disk unchanged; only dynamical
+        scattering into the other disks tells the twins apart. A fit started
+        from zero can therefore settle with part of the field mirrored, for
+        example an inclined layer folded at the midplane into a V: a local
+        minimum, since mirroring part of it back makes the field worse until
+        all of that part is mirrored and refitted.
 
-        Straight lines z(x) are searched on a grid of their depths at the two
-        ends of the node range (``n_grid`` each, from -t/2 to 3t/2). A column's
-        cost is the second moment of eps^2 about the line, with distances capped
-        at ``width`` (default t/4) so that strain far from the line counts the
-        same anywhere, for the column or its mirror, whichever is smaller. The
-        columns whose mirror fits the best line are mirrored in
-        ``params["strain"]``. Refit afterwards (``reconstruct``); the global
-        twin (the whole field mirrored) is still undetermined.
+        Each round mirrors the node columns on either side of every split point
+        (every ``step`` columns), and the whole field, refits every candidate
+        for ``max_iter`` iterations, and refits the current field for as many.
+        The candidate with the lowest loss replaces the current field if it is
+        lower; rounds repeat until none is. Only the data decide. Refit longer
+        afterwards (``reconstruct``).
 
         Parameters
         ----------
-        width : float, optional
-            Distance cap of the cost, A. Default t/4.
-        surface : float
-            Nodes within this fraction of t of either surface are left out:
-            surface strain mirrors onto the other surface and would favour lines
-            along the surfaces.
-        x_range : (float, float), optional
-            Only the node columns inside this x range (A) are used and mirrored.
-        slope_range : (float, float), optional
-            Limits on |dz/dx| of the line, e.g. from a known inclination of the
-            feature.
-        detrend : bool
-            Remove the median over x of every row of nodes first. Strain that is
-            the same at every x cannot be told apart from calibration errors
-            (thickness, tilt), and such bands favour horizontal lines.
-        n_grid : int
-            Line end depths searched.
+        reg, reg_type : optional
+            Penalty of the refits. Default those of the last fit.
+        max_iter : int
+            BFGS iterations of every refit.
+        rounds : int
+            Most rounds.
+        step : int
+            Spacing of the split points, in node columns.
         verbose : bool
-            Print the chosen line.
+            Print every round.
 
         Returns
         -------
-        np.ndarray
-            Boolean mask of the mirrored node columns.
+        list of (int, int)
+            The node column ranges (first, stop) mirrored, in order.
         """
-        m, p = self.model, self.params
-        t = float(p["thickness"])
-        zn, xn = m["z_nodes"], m["x_nodes"]
-        s = p["strain"].detach()
-        cols = np.ones(len(xn), dtype=bool)
-        if x_range is not None:
-            xv = xn.cpu().numpy()
-            cols = (xv >= x_range[0]) & (xv <= x_range[1])
-        sc = s.cpu().numpy()
-        if detrend:
-            sc = sc - np.median(sc[:, cols], axis=1, keepdims=True)
-        interior = ((zn >= surface * t) & (zn <= (1.0 - surface) * t)).cpu().numpy()
-        w = sc**2 * interior[:, None] * cols[None]
-        z = zn.cpu().numpy()[:, None]
-        ends = np.linspace(-0.5 * t, 1.5 * t, n_grid)
-        frac = ((xn - xn[0]) / max(float(xn[-1] - xn[0]), 1e-12)).cpu().numpy()
-        lines = ends[:, None, None] + (ends[None, :, None] - ends[:, None, None]) * frac
-        # sum_z w min((z - line)^2, width^2) for the column (z) and its mirror (t - z)
-        cap = (0.25 * t if width is None else width) ** 2
-        cost = [
-            (w[None, None] * np.minimum((zz[None, None] - lines[:, :, None, :]) ** 2, cap)).sum(2)
-            for zz in (z, t - z)
-        ]
-        best = np.minimum(cost[0], cost[1]).sum(-1)
-        if slope_range is not None:
-            slope = np.abs(ends[None, :] - ends[:, None]) / max(float(xn[-1] - xn[0]), 1e-12)
-            best[(slope < slope_range[0]) | (slope > slope_range[1])] = np.inf
-        i, j = np.unravel_index(np.argmin(best), best.shape)
-        flip = (cost[1][i, j] < cost[0][i, j]) & cols
-        mirrored = _hat((t - zn).clamp(min=0.0), zn) @ s
-        mask = torch.as_tensor(flip, device=s.device)
-        new = s.clone()
-        new[:, mask] = mirrored[:, mask]
-        self.params["strain"] = new
-        if verbose:
-            print(
-                f"mirrored {int(flip.sum())} of {len(flip)} node columns; line from z = "
-                f"{ends[i]:.0f} A at x = {float(xn[0]):.0f} A to z = {ends[j]:.0f} A at "
-                f"x = {float(xn[-1]):.0f} A"
-            )
-        return flip
+        if self.params is None:
+            raise RuntimeError("set_model first")
+        last = self.result or {}
+        reg = float(last.get("reg", 0.0)) if reg is None else float(reg)
+        reg_type = last.get("reg_type", "l2") if reg_type is None else reg_type
+        rows = self.model["rows"]
+        history = list(self.loss_history)
+
+        def refit(strain):
+            self.params["strain"] = strain.clone()
+            self._fit(("strain",), rows, reg, reg_type, max_iter, "BFGS", 1e-6, False, "")
+            return self.params["strain"].clone(), self.result["loss"]
+
+        current, loss = refit(self.params["strain"].detach())
+        nx = current.shape[1]
+        splits = range(step, nx, step)
+        candidates = [(0, k) for k in splits] + [(k, nx) for k in splits] + [(0, nx)]
+        flips = []
+        for r in tqdm(range(rounds), desc="twin search", disable=not verbose):
+            mirrored = self._mirror(current)
+            best = None
+            for a, b in candidates:
+                trial = current.clone()
+                trial[:, a:b] = mirrored[:, a:b]
+                strain, trial_loss = refit(trial)
+                if best is None or trial_loss < best[1]:
+                    best = (strain, trial_loss, (a, b))
+            current, loss = refit(current)
+            if best[1] >= loss:
+                if verbose:
+                    print(f"round {r}: no mirrored range lowers the loss {loss:.6g}")
+                break
+            current, loss = best[0], best[1]
+            flips.append(best[2])
+            if verbose:
+                print(
+                    f"round {r}: mirrored node columns {best[2][0]}..{best[2][1] - 1}, "
+                    f"loss {loss:.6g}"
+                )
+        self.params["strain"] = current
+        self.loss_history = history + [loss]
+        return flips
 
     # ------------------------------------------------------------------ results
 
-    def simulate(self, rows: torch.Tensor | None = None) -> np.ndarray:
-        """Model qx plot on the data grid, scaled to the data, (n_rows, n_q)."""
+    def simulate(self, rows: torch.Tensor | None = None, scaled: bool = True) -> np.ndarray:
+        """Model qx plot on the data grid, (n_rows, n_q).
+
+        Scaled to the data (the closed-form scale of the fit), or with
+        ``scaled=False`` in units of the incident intensity per tilt, e.g. to
+        make test data from a known field: ``from_qx`` with an empty qx plot of
+        the wanted sampling, ``set_model``, set ``params["strain"]``, simulate.
+        """
         rows = self.model["rows"] if rows is None else rows
         with torch.no_grad():
-            _, parts = self._loss(self.params, rows)
             inten = self._render(self._propagate(self.params), self.params, rows)
+            if not scaled:
+                return inten.cpu().numpy()
+            _, parts = self._loss(self.params, rows)
         return (parts["scale"] * inten).cpu().numpy()
 
     def strain_map(
@@ -1430,18 +1499,22 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         shape: tuple[int, int] = (110, 200),
         mirror: bool = False,
         nodes: np.ndarray | None = None,
+        x_range: tuple[float, float] | None = None,
     ) -> Dataset2d:
-        """eps(z, x) on a regular grid over the strain nodes and the foil, as a Dataset2d.
+        """eps(z, x) on a regular grid over the foil, as a Dataset2d.
 
-        Includes the fixed ``strain_gradient``. ``mirror`` returns the twin
-        eps(x, t - z), which gives the same qx plot. ``nodes`` (n_z, n_x)
-        replaces the fitted node values, e.g. to show another reconstruction on
-        the same grid.
+        Includes the fixed ``strain_gradient``. ``mirror`` returns the
+        depth-mirrored field eps(x, t - z). ``nodes`` (n_z, n_x) replaces the
+        fitted node values, e.g. to show another reconstruction on the same
+        grid. ``x_range`` (A) defaults to the node range; outside the nodes the
+        field is held at its edge value.
         """
         m, p = self.model, self.params
         strain = p["strain"] if nodes is None else torch.as_tensor(nodes).to(p["strain"])
         t = float(p["thickness"])
-        x0, x1 = float(m["x_nodes"][0]), float(m["x_nodes"][-1])
+        if x_range is None:
+            x_range = (float(m["x_nodes"][0]), float(m["x_nodes"][-1]))
+        x0, x1 = float(x_range[0]), float(x_range[1])
         z = torch.linspace(0.0, t, shape[0], dtype=torch.float64, device=p["strain"].device)
         x = torch.linspace(x0, x1, shape[1], dtype=torch.float64, device=p["strain"].device)
         with torch.no_grad():
@@ -1552,7 +1625,7 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             ax.set_xlabel("scan position")
             ax.set_ylabel("direct-beam shift (px)")
             ax.legend(frameon=False)
-            ax.set_title("descan: measured (dots) and line fit", loc="left")
+            ax.set_title("descan: measured (dots) and model", loc="left")
         return fig, axs
 
     def plot_qx(
@@ -1576,7 +1649,7 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             rows = self.model["rows"].cpu().numpy()
             ext = self._qx_extent(rows, f)
         data = np.clip(np.nan_to_num(self.data[rows]), 0, None) ** power
-        figsize = figsize or ((4.5, 7) if transpose else (8, 3.5))
+        figsize = figsize or ((5, 6.5) if transpose else (6.5, 5))
         fig, ax = plt.subplots(figsize=figsize, layout="constrained")
         self._show(ax, data, ext[:2], ext[2:], transpose, cmap=cmap, origin="lower")
         xl, ql = f"x ({lu})", f"q ({qu})"
@@ -1587,9 +1660,7 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
     def plot_fit(
         self,
         strain: bool = True,
-        mirror: bool = False,
         residual: bool = True,
-        transpose: bool = False,
         power: float = 1.0,
         cmap: str = "gray",
         units: str = "nm",
@@ -1598,19 +1669,16 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
     ):
         """Measured and model qx plots, their weighted residual and the strain, sharing x.
 
-        Panels are stacked with x horizontal, or side by side with x running
-        down when ``transpose`` (better for long scans). Data and model share
-        one intensity scale; the strain panel has z (depth from the entrance
-        surface) as its other axis and its own colorbar, in units of 1e-3.
+        A grid of two panels per row, all with x horizontal: data and model on
+        top (one intensity scale), the weighted residual and the strain (z,
+        depth from the entrance surface, down) below.
 
         Parameters
         ----------
-        strain, mirror : bool
-            Add the strain map, and its depth-mirrored twin.
+        strain : bool
+            Add the strain map, in units of 1e-3.
         residual : bool
             Add the weighted residual (model - data).
-        transpose : bool
-            Side-by-side panels with x vertical.
         power : float
             Display power of the qx intensities.
         units : {"nm", "A"}
@@ -1634,29 +1702,15 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             panels.append(("weighted residual", "res"))
         if strain:
             panels.append(("strain", "eps"))
-            if mirror:
-                panels.append(("strain, mirrored twin", "twin"))
-        t = float(self.params["thickness"])
-        span = abs(ext[1] - ext[0])
-        sizes = [
-            1.0 if kind in ("qx", "res") else float(np.clip(f * t / span * 2.0, 0.6, 1.6))
-            for _, kind in panels
-        ]
+        nrows = (len(panels) + 1) // 2
         if figsize is None:
-            figsize = (2.6 * sum(sizes) + 1.0, 7.5) if transpose else (8.5, 2.2 * sum(sizes) + 0.6)
+            figsize = (11, 3.2 * nrows + 0.4)
         fig, axs = plt.subplots(
-            1 if transpose else len(panels),
-            len(panels) if transpose else 1,
-            figsize=figsize,
-            sharey=transpose,
-            sharex=not transpose,
-            layout="constrained",
-            **({"width_ratios": sizes} if transpose else {"height_ratios": sizes}),
+            nrows, 2, figsize=figsize, sharex=True, squeeze=False, layout="constrained"
         )
-        axs = np.atleast_1d(axs)
         xl, ql, zl = f"x ({lu})", f"q ({qu})", f"z ({lu})"
-        cbar = dict(pad=0.01, fraction=0.04, location="bottom" if transpose else "right")
-        for ax, (title, kind) in zip(axs, panels):
+        t = float(self.params["thickness"])
+        for ax, (title, kind) in zip(axs.ravel(), panels):
             if kind == "qx":
                 img = data if title == "data" else model
                 im = self._show(
@@ -1664,14 +1718,14 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
                     np.clip(img, 0, None) ** power,
                     ext[:2],
                     ext[2:],
-                    transpose,
+                    False,
                     cmap=cmap,
                     vmin=0,
                     vmax=vmax,
                     origin="lower",
                 )
-                fig.colorbar(im, ax=ax, **cbar)
-                other = ql
+                fig.colorbar(im, ax=ax, pad=0.01)
+                ax.set_ylabel(ql)
             elif kind == "res":
                 res = weight * (model - data)
                 lim = np.percentile(np.abs(res), 99.5)
@@ -1680,53 +1734,41 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
                     res,
                     ext[:2],
                     ext[2:],
-                    transpose,
+                    False,
                     cmap="RdBu_r",
                     vmin=-lim,
                     vmax=lim,
                     origin="lower",
                 )
-                fig.colorbar(im, ax=ax, **cbar)
-                other = ql
+                fig.colorbar(im, ax=ax, pad=0.01)
+                ax.set_ylabel(ql)
             else:
-                ds = self.strain_map(mirror=kind == "twin")
+                ds = self.strain_map()
                 eps = 1e3 * ds.array
                 lim = np.abs(eps).max() if strain_range is None else strain_range
                 x0 = float(ds.origin[1])
                 x1 = x0 + (eps.shape[1] - 1) * float(ds.sampling[1])
-                if transpose:
-                    im = ax.imshow(
-                        eps.T,
-                        extent=[0, f * t, f * x1, f * x0],
-                        aspect="auto",
-                        cmap="RdBu_r",
-                        vmin=-lim,
-                        vmax=lim,
-                        interpolation="bilinear",
-                    )
-                else:
-                    im = ax.imshow(
-                        eps,
-                        extent=[f * x0, f * x1, f * t, 0],
-                        aspect="auto",
-                        cmap="RdBu_r",
-                        vmin=-lim,
-                        vmax=lim,
-                        interpolation="bilinear",
-                    )
-                fig.colorbar(im, ax=ax, label=r"$\partial u_g/\partial z$ ($10^{-3}$)", **cbar)
-                other = zl
+                im = ax.imshow(
+                    eps,
+                    extent=[f * x0, f * x1, f * t, 0],
+                    aspect="auto",
+                    cmap="RdBu_r",
+                    vmin=-lim,
+                    vmax=lim,
+                    interpolation="bilinear",
+                )
+                ax.set_ylim(f * t, 0)
+                fig.colorbar(im, ax=ax, pad=0.01, label=r"$\partial u_g/\partial z$ ($10^{-3}$)")
+                ax.set_ylabel(zl)
             ax.set_title(title, loc="left", fontsize=10)
-            if transpose:
-                ax.set_xlabel(other)
-            else:
-                ax.set_ylabel(other)
-        if transpose:
-            axs[0].set_ylabel(xl)
-            axs[0].set_ylim(ext[1], ext[0])
-        else:
-            axs[-1].set_xlabel(xl)
-            axs[0].set_xlim(ext[0], ext[1])
+        for ax in axs.ravel()[len(panels) :]:
+            ax.set_visible(False)
+        for ax in axs[-1]:
+            ax.set_xlabel(xl)
+        if len(panels) % 2:
+            axs[-2, 1].xaxis.set_tick_params(labelbottom=True)
+            axs[-2, 1].set_xlabel(xl)
+        axs[0, 0].set_xlim(ext[0], ext[1])
         return fig, axs
 
     def plot_strain(
@@ -1735,52 +1777,98 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         strain_range: float | None = None,
         units: str = "nm",
         show_nodes: bool = True,
-        equal_aspect: bool = True,
         nodes: np.ndarray | None = None,
         title: str | None = None,
+        panels: dict | None = None,
         figsize=None,
     ):
         """eps(x, z) in units of 1e-3, entrance surface at the top, at true aspect ratio.
 
-        ``nodes`` (n_z, n_x) shows other node values on the same grid (see
-        ``strain_map``).
+        Parameters
+        ----------
+        mirror : bool
+            Show the depth-mirrored field eps(x, t - z).
+        strain_range : float, optional
+            Color limit, in 1e-3. Default the largest |eps| of all panels.
+        units : {"nm", "A"}
+            Display length unit.
+        show_nodes : bool
+            Mark the strain nodes.
+        nodes : ndarray, optional
+            Other node values (n_z, n_x) on the same grid (see ``strain_map``).
+        title : str, optional
+            Panel title.
+        panels : dict, optional
+            ``{title: field}``: several fields with shared axes and color scale,
+            side by side (stacked when the foil is wider than deep), e.g. to
+            compare with another fit or a known field. A field is None (the
+            fit), node values (n_z, n_x) on the same grid, or a function
+            f(z, x) of the depth and position in A.
         """
         f, lu, _ = self._display_units(units)
-        ds = self.strain_map(mirror=mirror, nodes=nodes)
-        eps = 1e3 * ds.array
-        x0 = float(ds.origin[1])
-        x1 = x0 + (eps.shape[1] - 1) * float(ds.sampling[1])
-        t = (eps.shape[0] - 1) * float(ds.sampling[0])
-        lim = np.abs(eps).max() if strain_range is None else strain_range
+        if panels is None:
+            if title is None:
+                title = "strain, mirrored twin" if mirror else "strain"
+            panels = {title: nodes}
+        grid = self.strain_map()
+        maps = {}
+        for k, v in panels.items():
+            if callable(v):
+                z = float(grid.origin[0]) + float(grid.sampling[0]) * np.arange(grid.shape[0])
+                x = float(grid.origin[1]) + float(grid.sampling[1]) * np.arange(grid.shape[1])
+                eps = np.asarray(v(z[:, None], x[None, :]), dtype=np.float64)
+                eps = np.broadcast_to(eps, grid.shape)
+                maps[k] = 1e3 * (eps[::-1] if mirror else eps)
+            else:
+                maps[k] = 1e3 * self.strain_map(mirror=mirror, nodes=v).array
+        x0 = float(grid.origin[1])
+        x1 = x0 + (grid.shape[1] - 1) * float(grid.sampling[1])
+        t = (grid.shape[0] - 1) * float(grid.sampling[0])
+        lim = max(np.abs(e).max() for e in maps.values()) if strain_range is None else strain_range
+        n = len(maps)
+        aspect = t / (x1 - x0)
+        tall = aspect > 0.75
         if figsize is None:
-            aspect = t / (x1 - x0) if equal_aspect else 0.5
-            figsize = (5.5 / aspect + 1.6, 5.5) if aspect > 0.75 else (8.0, 6.4 * aspect + 1.2)
-        fig, ax = plt.subplots(figsize=figsize, layout="constrained")
-        im = ax.imshow(
-            eps,
-            extent=[f * x0, f * x1, f * t, 0.0],
-            cmap="RdBu_r",
-            vmin=-lim,
-            vmax=lim,
-            aspect="equal" if equal_aspect else "auto",
-            interpolation="bilinear",
+            if tall:
+                figsize = (n * 5.5 / aspect + 1.6, 6.0)
+            else:
+                w = 8.0 if n == 1 else 7.0
+                figsize = (w + 1.6, n * (w * aspect + 0.6) + 0.3)
+        fig, axs = plt.subplots(
+            1 if tall else n,
+            n if tall else 1,
+            figsize=figsize,
+            sharex=True,
+            sharey=True,
+            squeeze=False,
+            layout="constrained",
         )
-        if show_nodes:
-            xn = self.model["x_nodes"].cpu().numpy()
-            zn = self.model["z_nodes"].cpu().numpy()
-            zn = zn[zn <= t]
-            zn = t - zn if mirror else zn
-            xx, zz = np.meshgrid(xn, zn)
-            ax.plot(f * xx.ravel(), f * zz.ravel(), ".", color="k", ms=1.5)
-            ax.set_xlim(f * x0, f * x1)
-            ax.set_ylim(f * t, 0.0)
-        fig.colorbar(im, ax=ax, label=r"$\partial u_g/\partial z$ ($10^{-3}$)", shrink=0.9)
-        ax.set_xlabel(f"x ({lu})")
-        ax.set_ylabel(f"z ({lu})")
-        if title is None:
-            title = "strain, mirrored twin" if mirror else "strain"
-        ax.set_title(title, loc="left")
-        return fig, ax
+        xn = self.model["x_nodes"].cpu().numpy()
+        zn = self.model["z_nodes"].cpu().numpy()
+        zn = zn[zn <= t]
+        zn = t - zn if mirror else zn
+        for ax, (name, eps) in zip(axs.ravel(), maps.items()):
+            im = ax.imshow(
+                eps,
+                extent=[f * x0, f * x1, f * t, 0.0],
+                cmap="RdBu_r",
+                vmin=-lim,
+                vmax=lim,
+                aspect="equal",
+                interpolation="bilinear",
+            )
+            if show_nodes:
+                xx, zz = np.meshgrid(xn, zn)
+                ax.plot(f * xx.ravel(), f * zz.ravel(), ".", color="k", ms=1.5)
+                ax.set_xlim(f * x0, f * x1)
+                ax.set_ylim(f * t, 0.0)
+            ax.set_title(name, loc="left")
+        for ax in axs[-1]:
+            ax.set_xlabel(f"x ({lu})")
+        for ax in axs[:, 0]:
+            ax.set_ylabel(f"z ({lu})")
+        fig.colorbar(im, ax=axs, label=r"$\partial u_g/\partial z$ ($10^{-3}$)", shrink=0.9)
+        return fig, (axs[0, 0] if n == 1 else axs.ravel())
 
     def plot_loss(self, figsize=(5, 3.5)):
         """Loss per optimizer iteration, over all fits so far."""
