@@ -57,6 +57,7 @@ import torch
 import torch.nn.functional as F
 from scipy import ndimage, optimize
 from scipy.signal import fftconvolve
+from torch import nn
 from tqdm.auto import tqdm
 
 from quantem.core.datastructures.dataset2d import Dataset2d
@@ -77,6 +78,8 @@ _SCALES = dict(
     q_scale=1e3,
     x_offset=0.1,
     semiconvergence=100.0,
+    u_elastic=10.0,
+    u_absorptive=10.0,
 )
 
 
@@ -96,6 +99,64 @@ def _hat(coord: torch.Tensor, nodes: torch.Tensor) -> torch.Tensor:
     step = nodes[1] - nodes[0]
     c = coord.clamp(nodes[0], nodes[-1])
     return torch.relu(1.0 - (c[:, None] - nodes[None, :]).abs() / step)
+
+
+class _StrainNet(nn.Module):
+    """Network for the deep image prior of ``DepthStrain``: a fixed random code -> eps(z, x).
+
+    An encoder-decoder with skip connections built for strain fields rather
+    than images: reflection padding (the two surfaces and the two ends of the
+    scan are not neighbours, unlike with circular padding), average pooling
+    and bilinear upsampling (no checkerboard artifacts), group normalization
+    (a single field, no batch) and LeakyReLU. The skip connections carry thin
+    features such as layers, the coarse levels the smooth background. It works
+    on a grid rounded up to a multiple of ``2**levels`` and resizes the output
+    bilinearly to the node grid.
+    """
+
+    def __init__(self, out_shape, channels=32, levels=3, code_channels=8, seed=0):
+        super().__init__()
+        gen = torch.Generator().manual_seed(seed)
+        self.out_shape = tuple(int(n) for n in out_shape)
+        m = 2**levels
+        self.work_shape = tuple(int(np.ceil(n / m)) * m for n in self.out_shape)
+        code = 0.1 * torch.randn((1, code_channels) + self.work_shape, generator=gen)
+        self.register_buffer("code", code)
+        torch.manual_seed(seed)
+
+        def block(c_in, c_out):
+            return nn.Sequential(
+                nn.Conv2d(c_in, c_out, 3, padding=1, padding_mode="reflect"),
+                nn.LeakyReLU(0.2),
+                nn.GroupNorm(4, c_out),
+                nn.Conv2d(c_out, c_out, 3, padding=1, padding_mode="reflect"),
+                nn.LeakyReLU(0.2),
+                nn.GroupNorm(4, c_out),
+            )
+
+        self.down = nn.ModuleList(
+            [block(code_channels if i == 0 else channels, channels) for i in range(levels)]
+        )
+        self.middle = block(channels, channels)
+        self.up = nn.ModuleList([block(2 * channels, channels) for _ in range(levels)])
+        self.head = nn.Conv2d(channels, 1, 1)
+
+    def forward(self, noise: float = 0.0) -> torch.Tensor:
+        x = self.code if noise <= 0 else self.code + noise * torch.randn_like(self.code)
+        skips = []
+        for blk in self.down:
+            x = blk(x)
+            skips.append(x)
+            x = F.avg_pool2d(x, 2)
+        x = self.middle(x)
+        for blk in self.up:
+            skip = skips.pop()
+            x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
+            x = blk(torch.cat([x, skip], 1))
+        x = self.head(x)
+        if self.work_shape != self.out_shape:
+            x = F.interpolate(x, size=self.out_shape, mode="bilinear", align_corners=True)
+        return x[0, 0]
 
 
 class DepthStrain(AutoSerialize, OptimizerMixin):
@@ -126,8 +187,11 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
     values, ``thickness`` (A), ``tilt`` (incident tilt along g at the disk
     center, 1/A), ``shear`` (disk shift along q per unit x, 1/A^2: descan and
     pivot error), ``q_offset`` and ``q_scale`` (q of data column 0 and per
-    column, 1/A), ``x_offset`` (x of data row 0, A) and ``semiconvergence``
-    (aperture radius, 1/A).
+    column, 1/A), ``x_offset`` (x of data row 0, A), ``semiconvergence``
+    (aperture radius, 1/A), and ``u_elastic`` and ``u_absorptive``: scale
+    factors of the elastic and absorptive structure factors for each order
+    |n - m| of the coupling (1 = the factors of ``set_crystal``), which
+    ``fit_calibration`` or ``reconstruct(also=...)`` can refine.
     """
 
     _token = object()
@@ -164,12 +228,20 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         self.l_curve_result: dict | None = None
         OptimizerMixin.__init__(self)
         self._opt_vars: torch.Tensor | None = None
+        self._dip: dict | None = None
 
     # optimizer state of OptimizerMixin, rebuilt by every torch fit: not saved
-    _OPTIMIZER_STATE = ("_optimizer", "_scheduler", "_optimizer_params", "_scheduler_params")
+    _OPTIMIZER_STATE = (
+        "_optimizer",
+        "_scheduler",
+        "_optimizer_params",
+        "_scheduler_params",
+        "_dip",
+    )
 
     def save(self, path, mode="w", store="auto", skip=(), compression_level=4) -> None:
-        """Save with ``AutoSerialize`` (zarr), without the optimizer state.
+        """Save with ``AutoSerialize`` (zarr), without the optimizer state and the DIP network
+        (the strain nodes it produced are saved).
 
         Pass ``skip=("stack",)`` to leave out the CBED patterns.
         """
@@ -180,6 +252,8 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         """AutoSerialize hook: restore the empty optimizer state."""
         if not hasattr(self, "_optimizer_params"):
             OptimizerMixin.__init__(self)
+        if not hasattr(self, "_dip"):
+            self._dip = None
 
     # -------------------------------------------------------------------- input
 
@@ -671,6 +745,7 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         g_max: float = 3.0,
         s_max: float = 0.05,
         scale: str = "global",
+        structure_factor_orders: int = 2,
         device: str = "cpu",
     ) -> "DepthStrain":
         """Forward model, sampling, strain grid and the starting parameters.
@@ -723,6 +798,12 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             Intensity scale of the model, in closed form: one factor for the
             whole qx plot, or one per probe position, which absorbs probe current
             (dose) fluctuations between positions.
+        structure_factor_orders : int
+            Orders |n - m| of the coupling whose elastic and absorptive
+            structure factors can be refined (``u_elastic``, ``u_absorptive``);
+            higher orders keep the factors of ``set_crystal``. The weak higher
+            orders are poorly determined by a systematic row and would absorb
+            model errors.
         device : str
             Torch device (float64).
         """
@@ -747,15 +828,21 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         hkl = torch.as_tensor(np.outer(n, self.g_hkl), dtype=torch.long)
         crystal = self.crystal
         k_need = 2 * np.abs(n).max() * g * 1.01
-        if (
-            getattr(crystal, "U_dyn", None) is None
-            or getattr(crystal, "dyn_energy_ev", None) != self.energy
-            or getattr(crystal, "dyn_k_max", 0.0) < k_need
-        ):
-            crystal.calculate_dynamical_structure_factors(
-                self.energy, thermal_sigma=self.thermal_sigma, k_max=k_need
-            )
-        U, u0_imag, _ = _coupling_matrix(crystal, hkl, relativistic_gamma(self.energy))
+        gamma = relativistic_gamma(self.energy)
+        # elastic and absorptive parts of the coupling, refined separately per order
+        crystal.calculate_dynamical_structure_factors(
+            self.energy,
+            thermal_sigma=self.thermal_sigma,
+            k_max=k_need,
+            include_core=False,
+            include_phonon=False,
+        )
+        U_el, _, _ = _coupling_matrix(crystal, hkl, gamma)
+        crystal.calculate_dynamical_structure_factors(
+            self.energy, thermal_sigma=self.thermal_sigma, k_max=k_need
+        )
+        U, u0_imag, _ = _coupling_matrix(crystal, hkl, gamma)
+        order = np.abs(n[:, None] - n[None, :])
 
         # data rows and simulated columns
         n_rows = self.data.shape[0]
@@ -790,6 +877,9 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             gn=torch.as_tensor(n * g, **f64),
             i0=int(np.flatnonzero(n == 0)[0]),
             U=U.to(dev),
+            U_el=U_el.to(dev),
+            U_abs=(U - U_el).to(dev),
+            order=torch.as_tensor(order, device=dev),
             u0_imag=float(u0_imag),
             x_sim=x_sim_t,
             K=torch.as_tensor(K, **f64),
@@ -820,6 +910,8 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             q_scale=torch.tensor(float(self.q_sampling), **f64),
             x_offset=torch.tensor(float(self.x_origin), **f64),
             semiconvergence=torch.tensor(float(semiconvergence), **f64),
+            u_elastic=torch.ones(min(int(structure_factor_orders), int(order.max())), **f64),
+            u_absorptive=torch.ones(min(int(structure_factor_orders), int(order.max())), **f64),
         )
         self.loss_history = []
         self._set_weights()
@@ -868,6 +960,21 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         )
         return self
 
+    def _coupling(self, p: dict) -> torch.Tensor:
+        """Coupling matrix U_(n-m): elastic and absorptive parts, each scaled per order |n - m|
+        by ``u_elastic`` and ``u_absorptive`` (1 = the structure factors of ``set_crystal``)."""
+        m = self.model
+        if "U_el" not in m or "u_elastic" not in p:
+            return m["U"]
+        rest = torch.ones(
+            int(m["order"].max()) + 1 - p["u_elastic"].numel(),
+            dtype=p["u_elastic"].dtype,
+            device=p["u_elastic"].device,
+        )
+        s_el = torch.cat([rest[:1], p["u_elastic"], rest[1:]])[m["order"]]
+        s_abs = torch.cat([rest[:1], p["u_absorptive"], rest[1:]])[m["order"]]
+        return m["U_el"] * s_el + m["U_abs"] * s_abs
+
     def _strain_field(self, p: dict, h: torch.Tensor) -> torch.Tensor:
         """eps at the slice midpoints of every simulated column, (n_slices, n_columns)."""
         m = self.model
@@ -882,7 +989,7 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         h = p["thickness"] / ns
         K, gn = m["K"], m["gn"]
         diag = -gn[None, :] * (gn[None, :] + 2 * K[:, None]) + 1j * m["u0_imag"]
-        A = m["U"][None] + torch.diag_embed(diag)
+        A = self._coupling(p)[None] + torch.diag_embed(diag)
         e_half = torch.linalg.matrix_exp((0.5j * np.pi * self.wavelength) * h * A)
         e_full = e_half @ e_half
         eps = self._strain_field(p, h)
@@ -1068,7 +1175,7 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         ----------
         names : sequence of str
             Any of thickness, tilt, shear, q_offset, q_scale, x_offset,
-            semiconvergence.
+            semiconvergence, u_elastic, u_absorptive (structure factors).
         x_range : (float, float), optional
             Fit only the data rows in this x window (A), e.g. a strain-free region.
         max_iter, method, gtol
@@ -1078,8 +1185,13 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         rows = self._rows_in(x_range)
         self._fit(names, rows, 0.0, "l2", max_iter, method, gtol, verbose, "calibration")
         if verbose:
-            print(", ".join(f"{k} {float(self.params[k]):.6g}" for k in names))
+            print(", ".join(f"{k} {self._format(self.params[k])}" for k in names))
         return self
+
+    @staticmethod
+    def _format(v: torch.Tensor) -> str:
+        v = v.detach().cpu().numpy()
+        return f"{float(v):.6g}" if v.ndim == 0 else "[" + ", ".join(f"{x:.4g}" for x in v) + "]"
 
     def reconstruct(
         self,
@@ -1093,6 +1205,8 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         shrinkage_target: str = "strain",
         optimizer: dict | None = None,
         scheduler: dict | None = None,
+        validation=None,
+        validate_every: int = 25,
         verbose: bool = True,
     ) -> "DepthStrain":
         """Fit the strain nodes.
@@ -1100,7 +1214,8 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         ``method`` "BFGS" or "L-BFGS-B" runs ``scipy.optimize.minimize`` (the
         paper's choice). "adam", "adamw" or "sgd" runs a torch optimizer
         (``OptimizerMixin``) on the same variables, which allows the shrinkage
-        step after every update.
+        step after every update. "dip" trains the network of ``set_dip``
+        (deep image prior) with a torch optimizer instead.
 
         Parameters
         ----------
@@ -1133,10 +1248,30 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             variables are the strain times 1e3 (and the calibration scaled as
             in ``_SCALES``). Default Adam with lr 0.02.
         scheduler : dict, optional
-            Torch scheduler, e.g. ``{"name": "cosine_annealing"}``. Default none.
+            Torch scheduler, e.g. ``{"name": "cosine_annealing"}``. Default none
+            (cosine annealing for "dip").
+        validation : DepthStrain or ndarray, optional
+            "dip" only: independent data of the same scan (``validate``). Every
+            ``validate_every`` iterations the network output is scored on them,
+            and the best is kept: the number of iterations, which regularizes a
+            deep image prior, is then chosen by the data.
+        validate_every : int
+            Iterations between validations.
         """
         names = ("strain",) + tuple(k for k in also if k != "strain")
         rows = self.model["rows"] if self.model is not None else None
+        if method.lower() == "dip":
+            return self._fit_dip(
+                rows,
+                reg,
+                reg_type,
+                max_iter,
+                optimizer,
+                scheduler,
+                validation,
+                validate_every,
+                verbose,
+            )
         if method.lower() in ("adam", "adamw", "sgd"):
             if optimizer is None:
                 optimizer = {"name": method.lower(), "lr": 0.02}
@@ -1155,6 +1290,157 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         if shrinkage > 0:
             raise ValueError("shrinkage needs a torch method (adam, adamw or sgd)")
         return self._fit(names, rows, reg, reg_type, max_iter, method, gtol, verbose, "strain")
+
+    def set_dip(
+        self,
+        channels: int = 32,
+        levels: int = 3,
+        scale: float = 1e-2,
+        input_noise_std: float = 0.0,
+        pretrain_iters: int = 3000,
+        pretrain_lr: float = 1e-3,
+        seed: int = 0,
+        verbose: bool = True,
+    ) -> "DepthStrain":
+        """Represent the strain nodes as the output of a network (deep image prior, DIP).
+
+        The nodes become ``scale`` times the output of a network built for
+        strain fields (``_StrainNet``) for a fixed random code. The structure
+        of the network, not a penalty, is then the prior: it builds smooth
+        fields with sharp features such as layers much more easily than noise.
+        As in the ptychography DIP, the network is first pretrained to
+        reproduce the current nodes, so start from a fit (e.g. TV) on a fine
+        grid (``set_strain_grid``); ``reconstruct(method="dip")`` then trains
+        it on the data, best with a small learning rate (the default 3e-4) so
+        that it refines that fit rather than leaving it.
+
+        Parameters
+        ----------
+        channels, levels : int
+            Width of the network and number of resolution levels.
+        scale : float
+            Strain per unit of network output.
+        input_noise_std : float
+            Noise added to the code at every training step (0: none).
+        pretrain_iters, pretrain_lr : int, float
+            Adam steps and learning rate fitting the output to the current nodes.
+        seed : int
+            Seed of the code and of the initial weights.
+        """
+        dev = self.params["strain"].device
+        net = _StrainNet(
+            self.params["strain"].shape, channels=channels, levels=levels, seed=seed
+        ).to(dev)
+        self._dip = dict(net=net, scale=float(scale), noise=float(input_noise_std))
+        target = self.params["strain"].detach().to(torch.float32)
+        norm = max(float((target**2).mean()), 1e-8)  # strains of order 1e-4 and more
+        opt = torch.optim.Adam(net.parameters(), lr=pretrain_lr)
+        net.train()
+        for _ in tqdm(range(pretrain_iters), desc="DIP pretrain", disable=not verbose):
+            opt.zero_grad()
+            loss = ((self._dip_nodes(noise=True).float() - target) ** 2).mean() / norm
+            loss.backward()
+            opt.step()
+        with torch.no_grad():
+            self.params["strain"] = self._dip_nodes(noise=False)
+        if verbose:
+            n_par = sum(v.numel() for v in net.parameters())
+            print(
+                f"DIP: network with {levels} levels x {channels} channels, {n_par} weights; "
+                f"pretrained to the current nodes (rms error {(loss.item() * norm) ** 0.5:.2e})"
+            )
+        return self
+
+    def _dip_nodes(self, noise: bool = True) -> torch.Tensor:
+        """Strain nodes from the DIP network, (n_z, n_x) float64."""
+        d = self._dip
+        out = d["net"](d["noise"] if noise else 0.0)
+        return d["scale"] * out.to(torch.float64)
+
+    def _fit_dip(
+        self,
+        rows,
+        reg,
+        reg_type,
+        max_iter,
+        optimizer,
+        scheduler,
+        validation,
+        validate_every,
+        verbose,
+    ):
+        if self._dip is None:
+            raise RuntimeError("set_dip first")
+        self._set_weights()
+        p = {k: v.detach().clone() for k, v in self.params.items()}
+        with torch.no_grad():
+            f0 = float(self._loss(p, rows, reg, reg_type)[0])
+        f0 = f0 if f0 > 0 else 1.0
+        self._dip["active"] = True
+        self.set_optimizer(optimizer or {"name": "adam", "lr": 3e-4})
+        self.set_scheduler(scheduler or {"name": "cosine_annealing"}, num_iter=max_iter)
+        net = self._dip["net"]
+        net.train()
+        best = dict(value=np.inf, nodes=None, iteration=-1)
+        val_curve = []
+        if validation is not None:
+            with torch.no_grad():
+                nodes = self._dip_nodes(noise=False)
+                v = self.validate(validation, params={**p, "strain": nodes})
+            val_curve.append((0, v))
+            best = dict(value=v, nodes=nodes.clone(), iteration=0)
+        bar = tqdm(range(max_iter), desc="DIP", disable=not verbose)
+        try:
+            for i in bar:
+                self.zero_optimizer_grad()
+                p["strain"] = self._dip_nodes(noise=True)
+                loss, parts = self._loss(p, rows, reg, reg_type)
+                (loss / f0).backward()
+                self.step_optimizer()
+                f = float(loss.detach())
+                self.step_scheduler(f)
+                self.loss_history.append(f)
+                if validation is not None and ((i + 1) % validate_every == 0 or i == max_iter - 1):
+                    with torch.no_grad():
+                        nodes = self._dip_nodes(noise=False)
+                        v = self.validate(validation, params={**p, "strain": nodes})
+                    val_curve.append((i + 1, v))
+                    if v < best["value"]:
+                        best = dict(value=v, nodes=nodes.clone(), iteration=i + 1)
+                    bar.set_postfix(loss=f"{f:.6g}", validation=f"{v:.6g}")
+                else:
+                    bar.set_postfix(loss=f"{f:.6g}")
+        finally:
+            self._dip["active"] = False
+            self.remove_optimizer()
+        with torch.no_grad():
+            nodes = best["nodes"] if best["nodes"] is not None else self._dip_nodes(noise=False)
+        self.params = {**{k: v.detach().clone() for k, v in p.items()}, "strain": nodes}
+        with torch.no_grad():
+            loss, parts = self._loss(self.params, rows, reg, reg_type)
+        self.result = dict(
+            loss=float(loss),
+            residual=float(parts["residual"]),
+            penalty=float(parts["penalty"]),
+            scale=float(parts["scale"].mean()),
+            initial_loss=f0,
+            n_iter=max_iter,
+            n_eval=max_iter,
+            message="DIP " + str(optimizer),
+            fitted=("dip",),
+            reg=reg,
+            reg_type=reg_type,
+        )
+        if validation is not None:
+            self.result.update(validation=val_curve, best_iteration=best["iteration"])
+        if verbose:
+            msg = (
+                f"DIP: loss {f0:.6g} -> {float(loss):.6g} (residual {self.result['residual']:.6g})"
+            )
+            if validation is not None:
+                msg += f", best validation {best['value']:.6g} at iteration {best['iteration']}"
+            print(msg)
+        return self
 
     def l_curve(
         self,
@@ -1204,23 +1490,14 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         regs = sorted((float(r) for r in regs), reverse=True)
         out = dict(regs=regs, residual=[], norm=[], strain=[])
         if validation is not None:
-            other = validation.data if hasattr(validation, "data") else validation
-            other = np.asarray(other, dtype=np.float64)
-            if other.shape != self.data.shape:
-                raise ValueError("validation data must have the shape of data")
             out["validation"] = []
-            held = self.model["data"].clone()
         for r in tqdm(regs, desc="L-curve", disable=not verbose):
             self.reconstruct(reg=r, reg_type=reg_type, max_iter=max_iter, verbose=False)
             out["residual"].append(self.result["residual"])
             out["norm"].append(self.result["penalty"] / r)
             out["strain"].append(self.params["strain"].detach().clone())
             if validation is not None:
-                self.model["data"] = torch.as_tensor(np.nan_to_num(other)).to(held)
-                with torch.no_grad():
-                    _, parts = self._loss(self.params, self.model["rows"])
-                self.model["data"] = held
-                out["validation"].append(float(parts["residual"]))
+                out["validation"].append(self.validate(validation))
         u = np.log(np.maximum(out["residual"], 1e-300))
         v = np.log(np.maximum(out["norm"], 1e-300))
         u = (u - u.min()) / max(np.ptp(u), 1e-12)
@@ -1261,6 +1538,29 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             print(f"kept: reg = {regs[pick]:.3g}")
         return out
 
+    def validate(self, data, params: dict | None = None) -> float:
+        """Weighted residual of the current fit against independent data of the same scan.
+
+        ``data`` is a qx plot on the grid of ``data`` (a DepthStrain or an
+        array), e.g. the other half set (``from_dataset4dstem(average_index=...)``
+        and ``extract_qx(geometry=...)``). The intensity scale is refitted to
+        it, everything else is kept: a fit that follows the noise or that has
+        more freedom than the data support predicts such data worse. ``params``
+        replaces the fitted parameters.
+        """
+        other = data.data if hasattr(data, "data") else data
+        other = np.asarray(other, dtype=np.float64)
+        if other.shape != self.data.shape:
+            raise ValueError("validation data must have the shape of data")
+        held = self.model["data"]
+        self.model["data"] = torch.as_tensor(np.nan_to_num(other)).to(held)
+        try:
+            with torch.no_grad():
+                _, parts = self._loss(params or self.params, self.model["rows"])
+        finally:
+            self.model["data"] = held
+        return float(parts["residual"])
+
     def plot_l_curve(self, figsize=None):
         """Residual against penalty norm of the last ``l_curve`` scan, corner marked, and the
         validation residual against the weight when the scan had validation data."""
@@ -1291,7 +1591,10 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         return fig, axs
 
     def get_optimization_parameters(self) -> dict[str, list[torch.Tensor]]:
-        """OptimizerMixin hook: the scaled variables of the current torch fit."""
+        """OptimizerMixin hook: the variables of the current torch fit (the scaled parameters, or
+        the weights of the DIP network)."""
+        if self._dip is not None and self._dip.get("active"):
+            return {self.DEFAULT_OPTIMIZER_KEY: list(self._dip["net"].parameters())}
         return {} if self._opt_vars is None else {self.DEFAULT_OPTIMIZER_KEY: [self._opt_vars]}
 
     def _shrink(self, strain: torch.Tensor, threshold: float, target: str) -> torch.Tensor:
