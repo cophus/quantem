@@ -10,6 +10,12 @@ from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.datastructures.polar4dstem import Polar4dstem
 from quantem.core.utils.utils import to_numpy
 
+# Percentile of the per-origin in-frame radius budget used to pick radial_max
+# when the caller does not supply one. A plain minimum lets a single failed
+# origin fit truncate the q-axis of an entire dataset, so a small fraction of
+# the worst origins is allowed to fall outside (and zero-pad) instead
+RADIAL_MAX_PERCENTILE = 0.1
+
 # Standard DPs use (row, col) convention. Polar coordinates use (phi, r_pix),
 # grid_sample's grid tensor requires them to be ordered (col, row)
 # but is noted where the call occures
@@ -108,7 +114,6 @@ def find_origin_angular_grid(
         drift across the scan.
     kpow : float
         Up-weight each ring's contribution to the score by ``k**kpow``
-        (k = ring radius). 
 
     Returns
     -------
@@ -173,7 +178,7 @@ def find_origin_angular_grid(
     n_r = radial_bins.numel()
     min_r_idx = 0
     max_r_idx = int(np.ceil(0.9 * n_r))
-    # k-weighting (k = ring radius). None when kpow == 0 to skip the multiply.
+    # k-weighting, none when kpow == 0 
     ring_weights = (
         None
         if kpow == 0.0
@@ -280,14 +285,19 @@ def find_origin_angular_grid(
             base_row_norm + (cand_rows.reshape(-1).float() * row_norm_scale - 1.0)[:, None, None]
         )
         grids = torch.stack([g_col, g_row], dim=-1)
-        dps = dp_batch.repeat_interleave(n_cands, dim=0)
+        # Stack each DP's candidate grids along the grid's row dim, so each DP
+        # is sampled from its own image instead of from n_cands copies of it
         polars = F.grid_sample(
-            dps, grids, mode="bilinear", padding_mode="zeros", align_corners=True
+            dp_batch,
+            grids.view(dp_batch.shape[0], n_cands * search_n_phi, n_r, 2),
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
         )
         region = polars.view(dp_batch.shape[0], n_cands, *base_col_norm.shape)[
             ..., min_r_idx:max_r_idx
         ]
-        std_r = region.std(dim=2)
+        std_r = _angular_std(region, dim=2)
         mean_r = region.mean(dim=2)
         if ring_weights is not None:
             std_r = std_r * ring_weights
@@ -321,7 +331,7 @@ def find_origin_angular_grid(
             align_corners=True,
         )
         region_coarse = polars_coarse[:, :, :, min_r_idx:max_r_idx]
-        std_r_coarse = region_coarse.std(dim=2)
+        std_r_coarse = _angular_std(region_coarse, dim=2)
         mean_r_coarse = region_coarse.mean(dim=2)
         if ring_weights is not None:
             std_r_coarse = std_r_coarse * ring_weights
@@ -376,6 +386,32 @@ def find_origin_angular_grid(
     return origin_flat_t.cpu().numpy().reshape(scan_row, scan_col, 2)
 
 
+def _ellipse_stretch_factors(
+    ellipse_params: tuple[float, float, float] | None,
+) -> tuple[float, float]:
+    """Largest factor by which polar sampling at radius ``r_pix`` can exceed
+    ``r_pix`` along each image axis.
+
+    :func:`_polar_to_cartesian_offsets` stretches the ellipse-frame major axis
+    by ``a / b``, so a sample nominally at ``r_pix`` actually lands as far as
+    ``r_pix * stretch`` from the origin. Dividing an origin's distance-to-edge
+    budget by these gives the largest radius that still samples inside the
+    frame. Both factors are 1 when no ellipse correction is applied.
+    """
+    if ellipse_params is None:
+        return 1.0, 1.0
+    if len(ellipse_params) != 3:
+        raise ValueError("ellipse_params must be (a, b, theta_deg).")
+    a, b, theta_deg = ellipse_params
+    ab = float(a) / float(b)
+    theta = np.deg2rad(float(theta_deg))
+    # offset_col = (a/b) r cos(alpha) cos(theta) - r sin(alpha) sin(theta), so
+    # max over alpha is r * hypot((a/b) cos(theta), sin(theta)); likewise for row.
+    stretch_row = float(np.hypot(ab * np.sin(theta), np.cos(theta)))
+    stretch_col = float(np.hypot(ab * np.cos(theta), np.sin(theta)))
+    return stretch_row, stretch_col
+
+
 def polar_transform(
     data: Dataset4dstem,
     origin_array: NDArray | torch.Tensor | None = None,
@@ -423,9 +459,18 @@ def polar_transform(
         dp = dps[i_row, i_col].to(device=device, dtype=torch.float32)
         r0 = float(origins[i_row, i_col, 0])
         c0 = float(origins[i_row, i_col, 1])
-        # Clamp radial range to image bounds for this origin
+        # Clamp radial range to image bounds for this origin, accounting for the
+        # ellipse correction stretching the sampling beyond r_pix
         if radial_max is None:
-            radial_max_eff = float(min(r0, (n_row - 1) - r0, c0, (n_col - 1) - c0))
+            stretch_row, stretch_col = _ellipse_stretch_factors(ellipse_params)
+            radial_max_eff = float(
+                min(
+                    r0 / stretch_row,
+                    ((n_row - 1) - r0) / stretch_row,
+                    c0 / stretch_col,
+                    ((n_col - 1) - c0) / stretch_col,
+                )
+            )
         else:
             radial_max_eff = float(radial_max)
         if radial_max_eff <= radial_min:
@@ -453,15 +498,40 @@ def polar_transform(
         )
         return polar2d.squeeze(0).squeeze(0)  # (n_phi, n_r)
 
-    # Use the global minimum safe radius across all origins so every scan
-    # position maps to the same-size polar grid (required for a uniform 4D output)
+    # Every scan position must map to the same-size polar grid (required for a
+    # uniform 4D output), so one radius has to serve all origins. Using from a
+    # low percentile rather than the minimum prevents a of failed origin fit
+    # from truncating the whole dataset's q-axis.
     if radial_max is None:
-        r_row_pos = origins[:, :, 0]
-        r_row_neg = (n_row - 1) - origins[:, :, 0]
-        r_col_pos = origins[:, :, 1]
-        r_col_neg = (n_col - 1) - origins[:, :, 1]
+        stretch_row, stretch_col = _ellipse_stretch_factors(ellipse_params)
+        r_row_pos = origins[:, :, 0] / stretch_row
+        r_row_neg = ((n_row - 1) - origins[:, :, 0]) / stretch_row
+        r_col_pos = origins[:, :, 1] / stretch_col
+        r_col_neg = ((n_col - 1) - origins[:, :, 1]) / stretch_col
         radial_max_eff_array = np.minimum.reduce([r_row_pos, r_row_neg, r_col_pos, r_col_neg])
-        radial_max = float(max(radial_max_eff_array.min(), radial_min + radial_step))
+        radial_max = float(
+            max(
+                np.percentile(radial_max_eff_array, RADIAL_MAX_PERCENTILE),
+                radial_min + radial_step,
+            )
+        )
+        # Positions in the percentile tail sample past the detector edge and are
+        # zero-filled there. The tail is non-empty by construction, and most of
+        # it only grazes the edge by a fraction of a pixel, which costs nothing.
+        # Warn only where a position loses a whole radial bin or more: that is a
+        # bad origin fit, not an artifact of choosing a percentile.
+        shortfall = radial_max - radial_max_eff_array
+        n_bad = int((shortfall > radial_step).sum())
+        if n_bad:
+            worst = float(radial_max_eff_array.min())
+            warnings.warn(
+                f"polar_transform: {n_bad} of {radial_max_eff_array.size} scan "
+                "positions have origins too close to the detector edge for "
+                f"radial_max={radial_max:.2f} px and lose more than one radial "
+                f"bin to zero-padding (the worst supports only {worst:.2f} px). "
+                "This is likely due to a failed origin fit.",
+                stacklevel=2,
+            )
 
     # Build origin-independent polar offsets ONCE. Only the per-origin shift
     # changes from one scan position to the next, so we can reuse these.
@@ -710,8 +780,7 @@ def _angular_std_scores(
 ) -> torch.Tensor:
     """Score candidate origins by angular std over a mid-radius band.
     Lower scores indicate better centering. Optional ``ring_weights``
-    (shape ``(n_r_window,)``) applies a per-ring weighting before
-    summation (e.g. ``k**kpow`` for high-k emphasis)."""
+    applies a per-ring weighting before summation."""
     n = grids.shape[0]
     # Sample the diffraction pattern at each candidate's polar grid positions
     polars = F.grid_sample(
@@ -727,12 +796,21 @@ def _angular_std_scores(
     # do not win on absolute std alone (relevant when search windows are
     # wide enough to include centers far from the direct beam).
     region = polars.squeeze(1)[:, :, min_r_idx:max_r_idx]
-    std_r = region.std(dim=1)
+    std_r = _angular_std(region, dim=1)
     mean_r = region.mean(dim=1)
     if ring_weights is not None:
         std_r = std_r * ring_weights
         mean_r = mean_r * ring_weights
     return std_r.sum(dim=1) / (mean_r.sum(dim=1) + 1e-6)
+
+
+def _angular_std(region: torch.Tensor, dim: int) -> torch.Tensor:
+    """``region.std(dim=dim)``, with a faster route on CPU."""
+    if region.device.type != "cpu":
+        return region.std(dim=dim)
+    region = region.double()
+    centred = region - region.mean(dim=dim, keepdim=True)
+    return (centred.square().sum(dim=dim) / (region.shape[dim] - 1)).sqrt().float()
 
 
 def _quadratic_subpixel_offset(patch: torch.Tensor) -> torch.Tensor:
