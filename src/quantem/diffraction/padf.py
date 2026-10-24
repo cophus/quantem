@@ -457,3 +457,55 @@ class PairAngleDistributionFunction(AutoSerialize):
 
             return ax
 
+
+# Band-limit a model g3(r, r', theta) to what a PADF measurement can resolve
+# (pypadf blfilter.py approach): expand in P_l(cos theta) for even l < l_max,
+# take each order to the measured q points with the order-l spherical Bessel
+# transform, and transform back.
+def bandlimit_volume(
+    G: NDArray,
+    r: NDArray,
+    theta_deg: NDArray,
+    q: NDArray,
+    l_max: int = 40,
+) -> NDArray:
+    """
+    Parameters
+    ----------
+    G : (Nr, Nr, Ntheta) array
+        Volume on a uniform r grid, theta in [0, 180] degrees.
+    r : (Nr,) array
+        Radial grid (Angstroms), uniformly spaced.
+    theta_deg : (Ntheta,) array
+        Angles in degrees.
+    q : (Nq,) array
+        Measured q values (1/Angstroms, no 2 pi), uniformly spaced.
+    l_max : int
+        Even orders l = 0, 2, ..., < l_max are kept (same as extract_Bl_matrices).
+
+    Returns
+    -------
+    (Nr, Nr, Ntheta) array, the band-limited volume.
+    """
+    G = np.asarray(G, dtype=np.float64)
+    r = np.asarray(r, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    theta = np.radians(np.asarray(theta_deg, dtype=np.float64))
+    dr, dq = r[1] - r[0], q[1] - q[0]
+    l_values = np.arange(0, l_max, 2)
+
+    # Legendre projection over theta with the sin(theta) d(theta) measure
+    dtheta = np.gradient(theta)
+    w = np.abs(np.sin(theta)) * dtheta
+    P = eval_legendre(l_values[:, None], np.cos(theta)[None, :])  # (Nl, Ntheta)
+    Gl = np.einsum("ijt,lt->lij", G, P * w[None, :]) * (2 * l_values[:, None, None] + 1) / 2
+
+    out = np.zeros_like(G)
+    arg = 2 * np.pi * np.outer(q, r)  # (Nq, Nr)
+    for k, l in enumerate(l_values):
+        jl = spherical_jn(l, arg)
+        fwd = 4 * np.pi * jl * (r**2 * dr)[None, :]  # r -> q
+        inv = 4 * np.pi * jl.T * (q**2 * dq)[None, :]  # q -> r
+        Bq = fwd @ Gl[k] @ fwd.T
+        out += (inv @ Bq @ inv.T)[:, :, None] * P[k][None, None, :]
+    return out
