@@ -415,28 +415,344 @@ class PairAngleDistributionFunction(AutoSerialize):
             return fig, (ax_g3, ax_g2)
         plt.show()
 
-    def simple_plot(self):
-            """
-            Plot the r = r' diagonal of the PADF as a 2D map with
-            r = r' on the x-axis and theta on the y-axis.
+    def plot_diagonal(
+        self,
+        rmin: float | None = None,
+        rmax: float | None = None,
+        r_display_power: int = 1,
+        r_max_display: float | None = None,
+        interior_theta_deg: tuple[float, float] = (15.0, 165.0),
+        r_marks=None,
+        markers=None,
+        title: str | None = None,
+        figsize: tuple[float, float] = (4.8, 4.4),
+        returnfig: bool = False,
+    ):
+        """
+        Map of the PADF's r = r' diagonal, Theta(r, r, theta), plotted as angle
+        theta (y-axis) vs radius r (x-axis).
 
-            Uses self.padf, which should be a (Nr, Nr, Ntheta) ndarray
-            (from reconstruct_PAD()) defined in __init__.
-            """
-            # Take padf[i, i, k] for every distance i and angle k -> (Nr, Ntheta)
-            diag = np.einsum("iik->ik", self.padf)
+        The full PADF Theta(r, r', theta) lives on a 3D (r, r', theta) grid. The
+        r = r' diagonal is the self-correlation slice: for every radius r, how
+        the angular correlation Theta(r, r, theta) varies with theta. This is
+        the same diagonal collapsed to a single r^(2*r_display_power)-weighted
+        RMS number by the bottom (g2) panel of plot_g2_g3; here the theta
+        dependence is kept instead of being reduced away, so structure that g2
+        averages out (e.g. which angles dominate at a given shell) is visible.
 
-            # Transpose so rows = theta, columns = r  -> (Ntheta, Nr)
-            diag = diag.T
+        Unlike plot_g2_g3's g3 map (which integrates the PADF over a chosen
+        radial shell on one axis, symmetrized over both r axes), this map takes
+        no integration and needs no symmetrization: r = r' is already a single,
+        well-defined line through the (r, r', theta) volume, so the diagonal is
+        read off directly as Theta(r, r, theta).
 
-            fig, ax = plt.subplots(figsize=(7, 5))
-            im = ax.pcolormesh(diag, shading="auto")
-            fig.colorbar(im, ax=ax, label=r"$\Theta(r, r, \theta)$")
+        As in plot_g2_g3, color limits are taken from the interior angular
+        range (theta in interior_theta_deg) rather than the full 0-180 range,
+        so the collinear theta ~ 0 / 180 bands - where the diagonal tends to be
+        large simply because forward/backward-scattered triplets are geometrically
+        degenerate - don't saturate the color scale and hide the interior-angle
+        structure. The display is weighted by r^(2 * r_display_power), matching
+        plot_g2_g3's convention (equivalent to weighting each of the two
+        coincident r, r' axes by r^r_display_power, as plot_theta does for its
+        off-diagonal map).
 
-            ax.set_xlabel("r = r' index")
-            ax.set_ylabel(r"$\theta$ index")
-            ax.set_title("PADF diagonal")
-            fig.tight_layout()
+        Parameters
+        ----------
+        padf : PairAngleDistributionFunction
+            Reconstructed PADF object exposing `.r` (radii), `.theta_deg`
+            (theta axis in degrees), and `.padf` (the (Nr, Nr, Ntheta) tensor
+            or array of Theta(r, r', theta)).
+        rmin, rmax : float or None
+            Display range of the radial axis (Angstroms). Defaults to
+            [0, r_max_display].
+        r_display_power : int
+            Display weighting exponent; the map is multiplied by
+            r^(2 * r_display_power). 0 plots the raw diagonal values.
+        r_max_display : float or None
+            Upper limit of the radial axis if rmax is not given; defaults to
+            min(8 A, r.max()).
+        interior_theta_deg : (float, float)
+            Theta range (degrees) used both to select the color-scale quantile
+            and to mark the excluded collinear bands are outside of; defaults
+            to (15, 165), matching plot_g2_g3.
+        r_marks : sequence of float or None
+            Radii (e.g. known neighbor shell distances) marked with dotted
+            vertical lines.
+        markers : sequence of (r, theta_deg) or None
+            Expected diagonal maxima overlaid as open circles - e.g. the
+            (shell distance, arm-arm angle) targets from a known structure. A
+            third element per tuple, if present, scales the marker size
+            (relative multiplicity).
+        title : str or None
+            Figure title; a generic default is used if None.
+        figsize : (float, float)
+            Figure size in inches.
+        returnfig : bool
+            Return (fig, ax) instead of calling plt.show().
 
-            return ax
+        Returns
+        -------
+        (fig, ax) if returnfig is True, otherwise None (the figure is shown).
+        """
+        r = np.asarray(self.r)
+        theta_deg = np.asarray(self.theta_deg)
+        arr = self.padf.numpy() if hasattr(self.padf, "numpy") else np.asarray(self.padf)
+
+        # r = r' diagonal: Theta(r, r, theta), shape (Nr, Ntheta)
+        diag = np.einsum("iik->ik", arr)
+
+        if r_max_display is None:
+            r_max_display = float(min(8.0, r[-1]))
+        if rmax is None:
+            rmax = r_max_display
+        rmin_eff = 0.0 if rmin is None else rmin
+        if rmax <= rmin_eff:
+            raise ValueError(f"rmax must be > rmin (got rmin={rmin_eff}, rmax={rmax}).")
+
+        r_mask = (r >= rmin_eff) & (r <= rmax)
+        if not np.any(r_mask):
+            raise ValueError("Requested plot range contains no data.")
+
+        # display weighting and orientation: theta on rows (y-axis), r on columns (x-axis)
+        weight = r ** (2 * r_display_power)
+        diag_disp = (diag * weight[:, None]).T  # (Ntheta, Nr)
+
+        # color limits from the interior angular range only, so the collinear
+        # theta ~ 0 / 180 bands don't saturate the scale
+        t_lo, t_hi = interior_theta_deg
+        interior_t = (theta_deg > t_lo) & (theta_deg < t_hi)
+        interior_vals = diag_disp[np.ix_(interior_t, r_mask)]
+        vmax = np.quantile(np.abs(interior_vals), 0.999) if interior_vals.size else \
+            np.quantile(np.abs(diag_disp[:, r_mask]), 0.999)
+
+        fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+        im = ax.pcolormesh(
+            r[r_mask], theta_deg, diag_disp[:, r_mask],
+            cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto",
+        )
+        fig.colorbar(im, ax=ax, label=r"$\Theta(r, r, \theta)$", pad=0.02)
+
+        if markers is not None:
+            for mk in markers:
+                r_mk, t_mk = mk[0], mk[1]
+                size = 12.0 * (mk[2] ** 0.5) if len(mk) > 2 else 10.0
+                if rmin_eff <= r_mk <= rmax:
+                    ax.plot(r_mk, t_mk, "o", ms=max(size, 5.0), mfc="none",
+                            mec="k", mew=1.0)
+
+        if r_marks is not None:
+            for r_mk in r_marks:
+                ax.axvline(r_mk, color="k", ls=":", lw=0.8)
+
+        ax.set_xlabel("r = r' (Å)")
+        ax.set_ylabel(r"$\theta$ (deg)")
+        ax.set_yticks(np.arange(0, 181, 45))
+        ax.set_title(
+            title if title is not None
+            else f"r = r' diagonal, θ ∈ [0°, 180°]",
+            fontsize=10,
+        )
+
+        if returnfig:
+            return fig, ax
+        plt.show()
+
+    # Theta helper
+    def _range_mask(self, x, xmin, xmax):
+        """Return a boolean mask selecting `x` within [xmin, xmax], defaulting to all True."""
+        if xmin is None and xmax is None:
+            return np.ones_like(x, dtype=bool)
+        xmin_eff = x.min() if xmin is None else xmin
+        xmax_eff = x.max() if xmax is None else xmax
+        if xmax_eff <= xmin_eff:
+            raise ValueError(f"xmax must be > xmin (got xmin={xmin_eff}, xmax={xmax_eff}).")
+        mask = (x >= xmin_eff) & (x <= xmax_eff)
+        if not np.any(mask):
+            raise ValueError("Requested plot range contains no data.")
+        return mask
+
+    # Theta helper
+    def _nearest_index(self, x, value):
+        return int(np.argmin(np.abs(x - value)))
+
+    def plot_theta(
+        self,
+        theta_deg: float,
+        rmin: float | None = None,
+        rmax: float | None = None,
+        r_display_power: int = 0,
+        r_max_display: float | None = None,
+        r_search_min: float = 0.5,
+        r_marks=None,
+        markers=None,
+        title: str | None = None,
+        figsize: tuple[float, float] = (6, 5),
+        labels: bool = True,
+        cbar: bool = True,
+        returnfig: bool = False,
+    ):
+        """
+        Plot Theta(r, r', theta) as a 2D map over the (r, r') grid at a fixed
+        angle theta (degrees), generalizing plot_theta0_map to any theta.
+
+        The raw slice mixes two very different signals: a strong ridge along
+        r = r' (essentially the g2-like self-correlation already shown by
+        plot_g2_g3's bottom panel) and the much weaker off-diagonal r != r'
+        structure that encodes genuine 3-body angular correlations. Plotted
+        naively with a linear color scale, the diagonal ridge saturates the
+        colorbar and the off-diagonal structure disappears. This version:
+
+        - Symmetrizes the slice over r <-> r', since swapping which atom is
+          "first" is just a relabeling and any asymmetry is numerical noise
+          from the reconstruction.
+        - Sets color limits from the off-diagonal region only (excluding a
+          small artifact zone near r = r' < r_search_min), analogous to how
+          plot_g2_g3 excludes the collinear theta bands when choosing vmax.
+        - Uses a diverging RdBu_r colormap centered at zero, since Theta can
+          be positive or negative.
+        - Optionally weights the display by (r * r')^r_display_power to
+          compensate for the PADF's natural radial amplitude decay.
+        - Draws the r = r' diagonal as a dashed reference line, and supports
+          the same r_marks / markers overlays as plot_g2_g3 for annotating
+          known neighbor distances or expected (r, r') pair maxima.
+        - Uses a square aspect ratio, since r and r' share the same units
+          and axis.
+
+        Parameters
+        ----------
+        theta_deg : float
+            Angle (degrees) at which to take the slice; snapped to the
+            nearest available theta bin.
+        rmin, rmax : float or None
+            Display range for both r and r' axes (Angstroms). Defaults to
+            [0, r_max_display].
+        r_display_power : int
+            Display weighting exponent; the map is multiplied by
+            (r * r')^r_display_power. 0 plots the raw values.
+        r_max_display : float or None
+            Upper limit of both axes if rmax is not given; defaults to
+            min(8 A, r.max()).
+        r_search_min : float
+            Radii below this are excluded when computing the off-diagonal
+            color scale, avoiding r ~ 0 reconstruction artifacts.
+        r_marks : sequence of float or None
+            Radii (e.g. known neighbor shell distances) marked with dotted
+            lines on both axes.
+        markers : sequence of (r, r', [size]) or None
+            Expected (r, r') pair maxima overlaid as open circles; a third
+            element per tuple scales the marker size.
+        title : str or None
+            Figure title; a theta-value summary is used if None.
+        returnfig : bool
+            Return (fig, ax) instead of calling plt.show().
+        """
+        r = np.asarray(self.r)
+        theta_axis = np.asarray(self.theta_deg)
+
+        padf_arr = self.padf.numpy() if hasattr(self.padf, "numpy") else np.asarray(self.padf)
+        theta_idx = self._nearest_index(theta_axis, theta_deg)
+        slice_2d = padf_arr[:, :, theta_idx]  # (Nr, Nr')
+
+        # symmetrize over r <-> r'
+        slice_2d = 0.5 * (slice_2d + slice_2d.T)
+
+        if r_max_display is None:
+            r_max_display = float(min(8.0, r[-1]))
+        if rmax is None:
+            rmax = r_max_display
+
+        r_mask = self._range_mask(r, rmin, rmax)
+        r_sel = r[r_mask]
+        slice_disp = slice_2d[np.ix_(r_mask, r_mask)]
+
+        # display weighting
+        weight = r_sel ** r_display_power
+        slice_disp = slice_disp * weight[:, None] * weight[None, :]
+
+        # color limits from off-diagonal region only, excluding a small
+        # zone near the origin where reconstruction artifacts dominate
+        keep = r_sel >= r_search_min
+        off_diag = ~np.eye(len(r_sel), dtype=bool)
+        keep_mask = np.outer(keep, keep)
+        sub_off = slice_disp[off_diag & keep_mask]
+        vmax = np.quantile(np.abs(sub_off), 0.999) if sub_off.size else np.quantile(np.abs(slice_disp), 0.999)
+
+        fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+        im = ax.pcolormesh(
+            r_sel, r_sel, slice_disp.T,
+            cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto",
+        )
+        if cbar:
+            fig.colorbar(im, ax=ax, label=r"$\Theta(r, r', \theta)$", pad=0.02)
+
+        # r = r' reference line
+        ax.plot([r_sel[0], r_sel[-1]], [r_sel[0], r_sel[-1]],
+                color="k", lw=0.6, ls="--", alpha=0.5)
+
+        if r_marks is not None:
+            for r_mk in r_marks:
+                ax.axvline(r_mk, color="k", ls=":", lw=0.8)
+                ax.axhline(r_mk, color="k", ls=":", lw=0.8)
+
+        if markers is not None:
+            for mk in markers:
+                r_mk, rp_mk = mk[0], mk[1]
+                size = 12.0 * (mk[2] ** 0.5) if len(mk) > 2 else 10.0
+                if r_mk <= r_sel[-1] and rp_mk <= r_sel[-1]:
+                    ax.plot(r_mk, rp_mk, "o", ms=max(size, 5.0),
+                            mfc="none", mec="k", mew=1.0)
+
+        ax.set_aspect("equal")
+        if labels:
+            ax.set_xlabel("r (Å)")
+            ax.set_ylabel("r' (Å)")
+        ax.set_title(
+            title if title is not None
+            else rf"$\Theta(r, r', \theta={theta_axis[theta_idx]:.1f}\degree)$",
+            fontsize=10,
+        )
+
+        if returnfig:
+            return fig, ax
+        plt.show()
+
+    ########################## OBSOLETE ##########################
+
+    def plot_theta_simple(
+        self,
+        theta_deg: float,
+        rmin: float | None = None,
+        rmax: float | None = None,
+        figsize: tuple[float, float] = (6, 5),
+        returnfig: bool = False,
+    ):
+        """
+        Plot Theta(r, r', theta) as a 2D map over the full (r, r') grid at a
+        fixed angle theta (degrees), generalizing plot_theta0_map to any theta.
+        """
+        r = self.r
+        theta_axis = self.theta_deg
+
+        padf_arr = self.padf.numpy() if hasattr(self.padf, "numpy") else np.asarray(self.padf)
+        theta_idx = self._nearest_index(theta_axis, theta_deg)
+        slice_2d = padf_arr[:, :, theta_idx]  # (Nr, Nr')
+
+        r_mask = self._range_mask(r, rmin, rmax)
+        r_sel = r[r_mask]
+        slice_2d = slice_2d[np.ix_(r_mask, r_mask)]
+
+        fig, ax = plt.subplots(figsize=figsize)
+        im = ax.pcolormesh(r_sel, r_sel, slice_2d.T, shading="auto")
+        fig.colorbar(im, ax=ax, label=r"$\Theta(r, r', \theta)$")
+
+        ax.set_xlabel("r (Å)")
+        ax.set_ylabel("r' (Å)")
+        ax.set_title(rf"$\Theta(r, r', \theta={theta_axis[theta_idx]:.1f}\degree)$")
+        fig.tight_layout()
+
+        if returnfig:
+            return fig
+        plt.show()
+
+
 
