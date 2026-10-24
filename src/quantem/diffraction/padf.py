@@ -66,8 +66,8 @@ class PairAngleDistributionFunction(AutoSerialize):
                                                          r_min=r_min, r_max=r_max, r_step=r_step)
         self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20) # TODO: determine atoms in beam
     
-    def rescale_intensity(self,
-                          data: Polar4dstem | Dataset4dstem | None = None,
+    @staticmethod
+    def rescale_intensity(data: Polar4dstem | Dataset4dstem | None = None,
                           rho: float | int = 1.0,
                           fq: NDArray | torch.Tensor | float | int | None = None):
         """
@@ -115,7 +115,8 @@ class PairAngleDistributionFunction(AutoSerialize):
         pass
         
 
-    def compute_avg_angular_correlation(self, data):
+    @staticmethod
+    def compute_avg_angular_correlation(data):
         """
         Equation 8: angular cross correlation implemented via Fourier correlation theorem
         """
