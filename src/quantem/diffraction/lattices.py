@@ -8,6 +8,8 @@ near-neighbor spacings:
     - honeycomb   (graphene-like, 2-atom basis; called "hexagonal" informally)
     - decagonal   (10-fold quasilattice via the de Bruijn pentagrid method)
 
+plus kinematic diffraction patterns of 3D structures (cluster_patterns).
+
 All positions are computed in pixels with (row, col) ordering; bond lengths
 and atom widths are specified in Angstroms and converted with pixel_size_ang.
 """
@@ -15,6 +17,7 @@ and atom widths are specified in Angstroms and converted with pixel_size_ang.
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import gaussian_filter
+import torch
 
 GOLDEN = (1 + np.sqrt(5)) / 2
 
@@ -454,3 +457,82 @@ def make_images(
         plt.show()
 
     return data, info
+
+
+def cluster_patterns(atoms, n_patterns, n_px=256, q_max=2.5, r_cluster=None,
+                     voltage=200e3, seed=0):
+    """
+    Kinematic diffraction patterns of spherical clusters cut from a periodic
+    structure, each with a random centre and a random 3D orientation
+    (random_clusters, same seed).
+
+    Projected atoms are deposited bilinearly on a grid at 2x Nyquist, Fourier
+    transformed and cropped to q_max. The bilinear kernel is divided out and
+    replaced by the Weickenmeier-Kohl electron scattering factor of each
+    element, so patterns follow f(q).
+
+    Returns
+    -------
+    patterns : (n_patterns, n_px, n_px) float32 intensities, q = 0 at n_px // 2.
+    dq : float, pixel size in 1/A.
+    """
+    from quantem.diffraction.wk_scattering_factors import compute_WK_factor
+
+    pix = 1.0 / (4.0 * q_max)
+    n_big = 2 * n_px
+    dq = 1.0 / (n_big * pix)
+    qx = (torch.arange(n_big, dtype=torch.float64) - n_big // 2) * dq
+    QX, QY = torch.meshgrid(qx, qx, indexing="ij")
+    Q = torch.hypot(QX, QY)
+    bilinear = torch.sinc(QX * pix) ** 2 * torch.sinc(QY * pix) ** 2
+    crop = slice(n_big // 2 - n_px // 2, n_big // 2 + n_px // 2)
+    species = np.unique(atoms.numbers)
+    filters = {
+        z: (torch.from_numpy(compute_WK_factor(Q.numpy().ravel(), int(z), voltage, include_core=False,
+                                               include_phonon=False).real).reshape(Q.shape) / bilinear)[crop, crop]
+        for z in species
+    }
+
+    patterns = torch.empty((n_patterns, n_px, n_px), dtype=torch.float32)
+    for k, (pos, z_atoms) in enumerate(random_clusters(atoms, n_patterns, r_cluster, seed)):
+        xy = torch.as_tensor(pos[:, :2] / pix + n_big / 2)
+        psi = 0
+        for z in species:
+            p = xy[torch.as_tensor(z_atoms == z)]
+            i0 = torch.floor(p).long()
+            f = p - i0
+            im = torch.zeros((n_big + 1) * (n_big + 1), dtype=torch.float64)
+            for di, dj, w in [(0, 0, (1 - f[:, 0]) * (1 - f[:, 1])), (0, 1, (1 - f[:, 0]) * f[:, 1]),
+                              (1, 0, f[:, 0] * (1 - f[:, 1])), (1, 1, f[:, 0] * f[:, 1])]:
+                im.index_add_(0, (i0[:, 0] + di) * (n_big + 1) + i0[:, 1] + dj, w)
+            im = im.reshape(n_big + 1, n_big + 1)[:n_big, :n_big]
+            psi = psi + torch.fft.fftshift(torch.fft.fft2(im))[crop, crop] * filters[z]
+        patterns[k] = torch.abs(psi) ** 2
+    return patterns.numpy(), dq
+
+
+def random_clusters(atoms, n_clusters, r_cluster=None, seed=0):
+    """
+    Yield (positions, atomic numbers) of spherical clusters cut from a periodic
+    structure, each with a random centre and rotated to a random orientation
+    (the beam is along z). The same seed gives the clusters of cluster_patterns.
+    Clusters use the minimum image about their centre, so r_cluster is capped
+    at half the shortest cell length and no atom appears twice.
+    """
+    cell = torch.as_tensor(atoms.cell.lengths())
+    pos0 = torch.as_tensor(atoms.get_positions())
+    r_max = 0.5 * float(cell.min())
+    r_cluster = r_max if r_cluster is None else min(r_cluster, r_max)
+    gen = torch.Generator().manual_seed(seed)
+    for _ in range(n_clusters):
+        # uniform random rotation from a normalized Gaussian quaternion
+        w, x, y, z = torch.nn.functional.normalize(torch.randn(4, generator=gen, dtype=torch.float64), dim=0)
+        rot = torch.stack([
+            torch.stack([1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)]),
+            torch.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)]),
+            torch.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]),
+        ])
+        d = pos0 - torch.rand(3, generator=gen, dtype=torch.float64) * cell
+        d -= cell * torch.round(d / cell)  # minimum image about the centre
+        keep = torch.linalg.norm(d, dim=1) <= r_cluster
+        yield (d[keep] @ rot.T).numpy(), atoms.numbers[keep.numpy()]

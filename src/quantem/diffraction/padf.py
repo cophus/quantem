@@ -41,6 +41,10 @@ class PairAngleDistributionFunction(AutoSerialize):
                  Bl_mats = None,
                  rho: float = 1.0,
                  fq: NDArray | torch.Tensor | float | None = None,
+                 l_max: int = 40,
+                 r_min: float = 0.0,
+                 r_max: float = 20.0,
+                 r_step: float = 0.02,
                  ):
         super().__init__()
 
@@ -54,11 +58,12 @@ class PairAngleDistributionFunction(AutoSerialize):
 
         self.ang_corr = ang_corr if ang_corr is not None else self.compute_avg_angular_correlation(self.polar_rescaled)
         self.ang_corr_corrected = self.subtract_angular_mean(self.ang_corr)
-        self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr_corrected)
+        self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr_corrected, l_max=l_max)
         # radial q calibration of the polar dataset: bin i sits at q_min + i * dq
         dq = float(np.asarray(self.polar.sampling)[3])
         q_min = float(np.asarray(self.polar.origin)[3])
-        self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1], dq=dq, q_min=q_min)
+        self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1], dq=dq, q_min=q_min,
+                                                         r_min=r_min, r_max=r_max, r_step=r_step)
         self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20) # TODO: determine atoms in beam
     
     def rescale_intensity(self,
@@ -432,30 +437,51 @@ class PairAngleDistributionFunction(AutoSerialize):
             return fig, (ax_g3, ax_g2)
         plt.show()
 
-    def simple_plot(self):
-            """
-            Plot the r = r' diagonal of the PADF as a 2D map with
-            r = r' on the x-axis and theta on the y-axis.
+    def simple_plot(
+        self,
+        padf=None,
+        r_display_power: int = 2,
+        r_max_display: float | None = None,
+        theta_marks=None,
+        title: str | None = None,
+        figsize: tuple[float, float] = (6, 4.5),
+        returnfig: bool = False,
+    ):
+        """
+        Plot the r = r' diagonal of the PADF as a 2D map, r on the x-axis and
+        theta on the y-axis, weighted by r^(2 * r_display_power) for display.
 
-            Uses self.padf, which should be a (Nr, Nr, Ntheta) ndarray
-            (from reconstruct_PAD()) defined in __init__.
-            """
-            # Take padf[i, i, k] for every distance i and angle k -> (Nr, Ntheta)
-            diag = np.einsum("iik->ik", self.padf)
+        padf : (Nr, Nr, Ntheta) array or None
+            Volume on the same (r, theta) grid, e.g. a model g3; defaults to self.padf.
+        theta_marks : sequence of float or None
+            Angles (degrees) marked with dotted lines.
+        Color limits are symmetric, from the largest |value| at 15-165 deg.
+        """
+        vol = self.padf if padf is None else padf
+        vol = vol.numpy() if isinstance(vol, torch.Tensor) else np.asarray(vol)
+        r = np.asarray(self.r)
+        theta_deg = np.asarray(self.theta_deg)
+        rs = r <= (r.max() if r_max_display is None else r_max_display)
 
-            # Transpose so rows = theta, columns = r  -> (Ntheta, Nr)
-            diag = diag.T
+        # padf[i, i, k] for every distance i and angle k -> (Nr, Ntheta)
+        diag = np.einsum("iik->ik", vol)[rs] * (r[rs] ** (2 * r_display_power))[:, None]
+        interior = (theta_deg > 15) & (theta_deg < 165)
+        vmax = np.abs(diag[:, interior]).max()
 
-            fig, ax = plt.subplots(figsize=(7, 5))
-            im = ax.pcolormesh(diag, shading="auto")
-            fig.colorbar(im, ax=ax, label=r"$\Theta(r, r, \theta)$")
-
-            ax.set_xlabel("r = r' index")
-            ax.set_ylabel(r"$\theta$ index")
-            ax.set_title("PADF diagonal")
-            fig.tight_layout()
-
-            return ax
+        fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+        im = ax.pcolormesh(r[rs], theta_deg, diag.T, cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+                           shading="auto")
+        for t in theta_marks or []:
+            ax.axhline(t, color="k", ls=":", lw=1)
+        ax.set_xlabel("r = r' (Å)")
+        ax.set_ylabel(r"$\theta$ (deg)")
+        ax.set_yticks(np.arange(0, 181, 45))
+        fig.colorbar(im, ax=ax, label=rf"$\Theta(r, r, \theta) \cdot r^{{{2 * r_display_power}}}$")
+        if title is not None:
+            ax.set_title(title)
+        if returnfig:
+            return fig, ax
+        plt.show()
 
 
 # Band-limit a model g3(r, r', theta) to what a PADF measurement can resolve
@@ -487,25 +513,127 @@ def bandlimit_volume(
     -------
     (Nr, Nr, Ntheta) array, the band-limited volume.
     """
-    G = np.asarray(G, dtype=np.float64)
-    r = np.asarray(r, dtype=np.float64)
-    q = np.asarray(q, dtype=np.float64)
-    theta = np.radians(np.asarray(theta_deg, dtype=np.float64))
-    dr, dq = r[1] - r[0], q[1] - q[0]
-    l_values = np.arange(0, l_max, 2)
+    G = torch.as_tensor(np.asarray(G), dtype=torch.float64)
+    theta = torch.deg2rad(torch.as_tensor(np.asarray(theta_deg), dtype=torch.float64))
+    l_values = torch.arange(0, l_max, 2, dtype=torch.float64)
 
     # Legendre projection over theta with the sin(theta) d(theta) measure
-    dtheta = np.gradient(theta)
-    w = np.abs(np.sin(theta)) * dtheta
-    P = eval_legendre(l_values[:, None], np.cos(theta)[None, :])  # (Nl, Ntheta)
-    Gl = np.einsum("ijt,lt->lij", G, P * w[None, :]) * (2 * l_values[:, None, None] + 1) / 2
+    w = torch.abs(torch.sin(theta)) * torch.gradient(theta)[0]
+    P = torch.special.legendre_polynomial_p(torch.cos(theta)[None, :], l_values[:, None])  # (Nl, Ntheta)
+    Gl = torch.einsum("ijt,lt->lij", G, P * w[None, :]) * (2 * l_values[:, None, None] + 1) / 2
 
-    out = np.zeros_like(G)
-    arg = 2 * np.pi * np.outer(q, r)  # (Nq, Nr)
-    for k, l in enumerate(l_values):
-        jl = spherical_jn(l, arg)
-        fwd = 4 * np.pi * jl * (r**2 * dr)[None, :]  # r -> q
-        inv = 4 * np.pi * jl.T * (q**2 * dq)[None, :]  # q -> r
-        Bq = fwd @ Gl[k] @ fwd.T
-        out += (inv @ Bq @ inv.T)[:, :, None] * P[k][None, None, :]
-    return out
+    out = torch.zeros_like(G)
+    for k, l in enumerate(l_values.int().tolist()):
+        out += _bandlimit_order(Gl[k], l, r, q)[:, :, None] * P[k][None, None, :]
+    return out.numpy()
+
+
+def _bandlimit_order(Gl: torch.Tensor, l: int, r, q) -> torch.Tensor:
+    """Order-l spherical Bessel transform of Gl(r, r') to the q points and back."""
+    r = np.asarray(r, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    jl = torch.from_numpy(spherical_jn(l, 2 * np.pi * np.outer(q, r)))  # (Nq, Nr), not in torch
+    fwd = 4 * np.pi * jl * torch.from_numpy(r**2 * (r[1] - r[0]))[None, :]  # r -> q
+    inv = 4 * np.pi * jl.T * torch.from_numpy(q**2 * (q[1] - q[0]))[None, :]  # q -> r
+    return inv @ (fwd @ Gl @ fwd.T) @ inv.T
+
+
+def _real_sph_harm_power(cos_t, sin_t, phi, l_values, weights, n_r, index):
+    """
+    sum_m A_lm(r) conj(A_lm(r')) for each l in l_values, where
+    A_lm(r) = sum_v weights[v] Y_lm(v) binned to r by index (Nvec,) -> [0, n_r].
+    Orthonormal associated Legendre functions by the standard stable
+    recurrence in l at fixed m; m < 0 enters through |A_l,-m| = |A_lm|.
+    """
+    l_max = int(l_values.max())
+    C = torch.zeros((len(l_values), n_r, n_r), dtype=torch.float64)
+    row = {int(l): k for k, l in enumerate(l_values.tolist())}
+    p_mm = torch.full_like(cos_t, (1 / (4 * np.pi)) ** 0.5)
+    for m in range(l_max + 1):
+        if m > 0:
+            p_mm = -((2 * m + 1) / (2 * m)) ** 0.5 * sin_t * p_mm
+        e = torch.polar(torch.ones_like(phi), m * phi) * weights
+        p_prev, p_l = None, p_mm
+        for l in range(m, l_max + 1):
+            if l == m + 1:
+                p_prev, p_l = p_l, (2 * m + 3) ** 0.5 * cos_t * p_l
+            elif l > m + 1:
+                a = ((4 * l * l - 1) / (l * l - m * m)) ** 0.5
+                b = (((l - 1) ** 2 - m * m) / (4 * (l - 1) ** 2 - 1)) ** 0.5
+                p_prev, p_l = p_l, a * (cos_t * p_l - b * p_prev)
+            if l in row:
+                A = torch.zeros(n_r + 1, dtype=torch.complex128).index_add_(0, index, p_l * e)[:n_r]
+                C[row[l]] += (1.0 if m == 0 else 2.0) * torch.real(A.conj()[:, None] * A[None, :])
+    return C
+
+
+def padf_from_clusters(
+    clusters,
+    r: NDArray,
+    theta_deg: NDArray,
+    q: NDArray | None = None,
+    l_max: int = 40,
+) -> NDArray:
+    """
+    PADF of atomic models: the angular correlation of all interatomic vectors
+    within each cluster, summed over clusters. Like the diffraction PADF it
+    holds two-, three- and four-body terms (Martin et al. IUCrJ 2017), not
+    only triplets sharing an atom.
+
+    Uses the addition theorem: for each even l < l_max,
+        C_l(r, r') = 2 pi sum_m A_lm(r) conj(A_lm(r')),
+        A_lm(r) = sum over vectors at |d| = r of Y_lm(d / |d|), per unit volume,
+    then Theta = |sin theta| sum_{l >= 2} C_l(r, r') P_l(cos theta), matching
+    reconstruct_PADF (l = 0 is dropped, as the PADF's mean subtraction does).
+
+    Parameters
+    ----------
+    clusters : iterable of (N, 3) arrays
+        Atom positions (Angstroms), one array per cluster.
+    r : (Nr,) array
+        Uniform radial grid (Angstroms); vectors are binned with linear weights.
+    theta_deg : (Ntheta,) array
+        Angles in degrees.
+    q : (Nq,) array or None
+        Measured q values (1/Angstroms, no 2 pi). If given, each C_l is
+        band-limited to them, as bandlimit_volume does.
+    l_max : int
+        Even orders l = 0, 2, ..., < l_max.
+
+    Returns
+    -------
+    (Nr, Nr, Ntheta) array.
+    """
+    r_t = torch.as_tensor(np.asarray(r), dtype=torch.float64)
+    dr = float(r_t[1] - r_t[0])
+    n_r = r_t.numel()
+    l_values = torch.arange(0, l_max, 2)
+    shell = 4 * np.pi * torch.clamp(r_t, min=0.5 * dr) ** 2 * dr
+    Cl = torch.zeros((len(l_values), n_r, n_r), dtype=torch.float64)
+    for pos in clusters:
+        pos = torch.as_tensor(np.asarray(pos), dtype=torch.float64)
+        d = (pos[None, :, :] - pos[:, None, :]).reshape(-1, 3)
+        dist = torch.linalg.norm(d, dim=1)
+        keep = (dist > 0) & (dist < float(r_t[-1]))
+        d, dist = d[keep], dist[keep]
+        cos_t = torch.clamp(d[:, 2] / dist, -1, 1)
+        sin_t = torch.sqrt(1 - cos_t**2)
+        phi = torch.atan2(d[:, 1], d[:, 0])
+        # linear binning onto the r grid: each vector split between bins i0 and i0 + 1
+        x = (dist - float(r_t[0])) / dr
+        i0 = torch.floor(x).long()
+        f = x - i0
+        index = torch.cat([i0, i0 + 1])
+        weights = torch.cat([1 - f, f]) / torch.cat([shell, shell[-1:]])[index]  # per unit volume
+        cos_t, sin_t, phi = (torch.cat([t, t]) for t in (cos_t, sin_t, phi))
+        Cl += _real_sph_harm_power(cos_t, sin_t, phi, l_values, weights, n_r, index)
+    Cl *= 2 * np.pi
+
+    theta = torch.deg2rad(torch.as_tensor(np.asarray(theta_deg), dtype=torch.float64))
+    out = torch.zeros((n_r, n_r, theta.numel()), dtype=torch.float64)
+    for k, l in enumerate(l_values.tolist()):
+        if l == 0:
+            continue
+        C = Cl[k] if q is None else _bandlimit_order(Cl[k], l, r, q)
+        out += C[:, :, None] * torch.special.legendre_polynomial_p(torch.cos(theta), l)[None, None, :]
+    return (out * torch.abs(torch.sin(theta))[None, None, :]).numpy()

@@ -155,7 +155,7 @@ class PairAngleDistributionFunction2D:
                       theta_max: float = 360.0, r_display_power: int = 1,
                       title: str | None = None,
                       figsize: tuple[float, float] = (5.4, 3.6),
-                      returnfig: bool = False):
+                      returnfig: bool = False, padf=None):
         """
         Map of the r = r' diagonal vs relative angle, weighted by
         r^r_display_power (r^1 by default), zero-centered RdBu_r.
@@ -163,9 +163,14 @@ class PairAngleDistributionFunction2D:
         Friedel-symmetric data); 360 shows the full relative angle
         available when odd harmonics are present. Color limits are set
         from interior angles and r <= 0.92 * r_max_display, so edge
-        artifacts do not compress the scale.
+        artifacts do not compress the scale. padf: an (Nr, Nr, Ntheta)
+        volume on this r grid and angles 360 k / Ntheta (e.g. a model from
+        padf2d_from_clusters) to plot instead of this reconstruction.
         """
-        theta_deg, padf = self.reconstruct(n_theta=n_theta)
+        if padf is None:
+            theta_deg, padf = self.reconstruct(n_theta=n_theta)
+        else:
+            theta_deg = 360.0 * np.arange(padf.shape[2]) / padf.shape[2]
         r = self.r
         rs = r <= r_max_display
         ts = theta_deg <= theta_max + 1e-9
@@ -187,3 +192,65 @@ class PairAngleDistributionFunction2D:
         if returnfig:
             return fig, ax
         plt.show()
+
+
+def padf2d_from_clusters(clusters_xy, r, n_max: int = 60, n_theta: int = 360,
+                         q=None, q_taper: float = 0.25):
+    """
+    2D PADF of atomic models: the angular correlation of all in-plane
+    interatomic vectors within each cluster (two-, three- and four-body
+    terms), summed over clusters, on the angle grid of
+    PairAngleDistributionFunction2D.reconstruct.
+
+        A_n(r) = sum over vectors at |d| = r of exp(-i n phi), per unit area
+        C_n(r, r') = conj(A_n(r)) A_n(r')
+
+    q : (Nq,) array or None
+        Measured q values. If given, each C_n is band-limited to them with
+        the same q_taper as the class (order-n Hankel transform and back).
+
+    Returns
+    -------
+    theta_deg : (n_theta,) angles in degrees.
+    padf : (Nr, Nr, n_theta) real array, n = 0 excluded.
+    """
+    r = np.asarray(r, dtype=np.float64)
+    dr = r[1] - r[0]
+    n_r = r.size
+    ring = torch.from_numpy(2 * np.pi * np.maximum(r, 0.5 * dr) * dr)
+    n_vals = torch.arange(1, n_max + 1, dtype=torch.float64)
+    Cn = torch.zeros((n_max, n_r, n_r), dtype=torch.complex128)
+    for xy in clusters_xy:
+        xy = torch.as_tensor(np.asarray(xy)[:, :2], dtype=torch.float64)
+        d = (xy[None, :, :] - xy[:, None, :]).reshape(-1, 2)
+        dist = torch.hypot(d[:, 0], d[:, 1])
+        keep = (dist > 0) & (dist < r[-1])
+        d, dist = d[keep], dist[keep]
+        phi = torch.atan2(d[:, 1], d[:, 0])
+        # linear binning onto the r grid
+        x = (dist - r[0]) / dr
+        i0 = torch.floor(x).long()
+        f = (x - i0)[:, None]
+        E = torch.polar(torch.ones(phi.numel(), n_max, dtype=torch.float64), -phi[:, None] * n_vals[None, :])
+        A = torch.zeros((n_r + 1, n_max), dtype=torch.complex128)
+        A.index_add_(0, i0, (1 - f) * E).index_add_(0, i0 + 1, f * E)
+        A = A[:n_r] / ring[:, None]
+        Cn += torch.einsum("in,jn->nij", A.conj(), A)
+
+    if q is not None:
+        q = np.asarray(q, dtype=np.float64)
+        dq, n_q = q[1] - q[0], q.size
+        taper = np.ones(n_q)
+        i0 = int((1.0 - q_taper) * n_q)
+        taper[i0:] = 0.5 * (1 + np.cos(np.pi * np.arange(n_q - i0) / max(n_q - i0, 1)))
+        for k in range(n_max):
+            Jn = torch.from_numpy(jv(k + 1, 2 * np.pi * np.outer(q, r)))  # (Nq, Nr), not in torch
+            fwd = (2 * np.pi * Jn * torch.from_numpy(r * dr)[None, :]
+                   * torch.from_numpy(taper)[:, None]).to(torch.complex128)  # r -> q, tapered
+            inv = (2 * np.pi * Jn.T * torch.from_numpy(q * dq)[None, :]).to(torch.complex128)  # q -> r
+            Cn[k] = inv @ (fwd @ Cn[k] @ fwd.T) @ inv.T
+
+    theta = 2.0 * np.pi * torch.arange(n_theta, dtype=torch.float64) / n_theta
+    E = torch.polar(torch.ones(n_max, n_theta, dtype=torch.float64), n_vals[:, None] * theta[None, :])
+    padf = 2.0 * torch.real(torch.einsum("nij,nt->ijt", Cn, E))
+    return np.degrees(theta.numpy()), padf.numpy()
