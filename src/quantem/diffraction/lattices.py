@@ -8,10 +8,12 @@ near-neighbor spacings:
     - honeycomb   (graphene-like, 2-atom basis; called "hexagonal" informally)
     - decagonal   (10-fold quasilattice via the de Bruijn pentagrid method)
 
-plus kinematic diffraction patterns of 3D structures (cluster_patterns).
+plus kinematic diffraction patterns of random clusters cut from 3D structures
+(random_clusters, cluster_patterns).
 
-All positions are computed in pixels with (row, col) ordering; bond lengths
-and atom widths are specified in Angstroms and converted with pixel_size_ang.
+The 2D lattice positions are computed in pixels with (row, col) ordering; bond
+lengths and atom widths are specified in Angstroms and converted with
+pixel_size_ang. The cluster functions work in Angstroms.
 """
 
 import matplotlib.pyplot as plt
@@ -476,24 +478,30 @@ def cluster_patterns(atoms, n_patterns, n_px=256, q_max=2.5, r_cluster=None,
 
     Returns
     -------
-    patterns : (n_patterns, n_px, n_px) float32 intensities, q = 0 at n_px // 2.
-    dq : float, pixel size in 1/A.
+    Dataset4dstem of shape (n_patterns, 1, n_px, n_px), calibrated in 1/A,
+    with q = 0 at pixel (n_px // 2, n_px // 2).
     """
+    from quantem.core.datastructures import Dataset4dstem
     from quantem.diffraction.wk_scattering_factors import compute_WK_factor
 
     pix = 1.0 / (4.0 * q_max)
     n_big = 2 * n_px
     dq = 1.0 / (n_big * pix)
-    qx = (torch.arange(n_big, dtype=torch.float64) - n_big // 2) * dq
+    sigma, half = 1.5, 6  # Gaussian atom width and patch half-width (px)
+    r_cluster = max_cluster_radius(atoms) if r_cluster is None else min(r_cluster, max_cluster_radius(atoms))
+    if r_cluster + (half + 1) * pix > 0.5 * n_big * pix:
+        raise ValueError(
+            f"r_cluster = {r_cluster:.1f} A does not fit the render grid of half-width "
+            f"{0.5 * n_big * pix:.1f} A = n_px / (4 q_max); increase n_px or reduce r_cluster."
+        )
+    qx = (torch.arange(n_px, dtype=torch.float64) - n_px // 2) * dq
     QX, QY = torch.meshgrid(qx, qx, indexing="ij")
     Q = torch.hypot(QX, QY)
-    sigma, half = 1.5, 6  # Gaussian atom width and patch half-width (px)
     gaussian = torch.exp(-2 * np.pi**2 * (sigma * pix) ** 2 * Q**2)
     crop = slice(n_big // 2 - n_px // 2, n_big // 2 + n_px // 2)
     species = np.unique(atoms.numbers)
     filters = {
-        z: (torch.from_numpy(compute_WK_factor(Q.numpy().ravel(), int(z), voltage, include_core=False,
-                                               include_phonon=False).real).reshape(Q.shape) / gaussian)[crop, crop]
+        z: torch.from_numpy(compute_WK_factor(Q.numpy().ravel(), int(z), voltage).real).reshape(Q.shape) / gaussian
         for z in species
     }
 
@@ -525,7 +533,22 @@ def cluster_patterns(atoms, n_patterns, n_px=256, q_max=2.5, r_cluster=None,
             intensity = torch.nn.functional.conv1d(intensity[:, None, :], kernel, padding=pad)[:, 0, :]
             intensity = torch.nn.functional.conv1d(intensity.T[:, None, :], kernel, padding=pad)[:, 0, :].T
         patterns[k] = intensity
-    return patterns.numpy(), dq
+    return Dataset4dstem.from_array(
+        patterns.numpy()[:, None],
+        origin=(0, 0, -(n_px // 2) * dq, -(n_px // 2) * dq),
+        sampling=(1, 1, dq, dq),
+        units=["pixels", "pixels", "A^-1", "A^-1"],
+        signal_units="intensity",
+    )
+
+
+def max_cluster_radius(atoms):
+    """Half the smallest distance between opposite faces of the periodic cell:
+    the largest sphere that contains no periodic image twice."""
+    cell = np.asarray(atoms.cell)
+    volume = abs(np.linalg.det(cell))
+    heights = [volume / np.linalg.norm(np.cross(cell[(i + 1) % 3], cell[(i + 2) % 3])) for i in range(3)]
+    return 0.5 * min(heights)
 
 
 def random_clusters(atoms, n_clusters, r_cluster=None, seed=0, random_orientation=True):
@@ -534,13 +557,12 @@ def random_clusters(atoms, n_clusters, r_cluster=None, seed=0, random_orientatio
     structure, each with a random centre and rotated to a random orientation
     (the beam is along z). With random_orientation=False the cell axes are
     kept, so the beam is along the cell's z axis. The same seed gives the
-    clusters of cluster_patterns.
-    Clusters use the minimum image about their centre, so r_cluster is capped
-    at half the shortest cell length and no atom appears twice.
+    clusters of cluster_patterns. r_cluster is capped at max_cluster_radius,
+    so no atom appears twice; any cell shape works.
     """
-    cell = torch.as_tensor(atoms.cell.lengths())
-    pos0 = torch.as_tensor(atoms.get_positions())
-    r_max = 0.5 * float(cell.min())
+    cell = torch.as_tensor(np.asarray(atoms.cell), dtype=torch.float64)  # rows are the cell vectors
+    frac0 = torch.as_tensor(atoms.get_scaled_positions(wrap=True), dtype=torch.float64)
+    r_max = max_cluster_radius(atoms)
     r_cluster = r_max if r_cluster is None else min(r_cluster, r_max)
     gen = torch.Generator().manual_seed(seed)
     for _ in range(n_clusters):
@@ -551,8 +573,10 @@ def random_clusters(atoms, n_clusters, r_cluster=None, seed=0, random_orientatio
             torch.stack([2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)]),
             torch.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]),
         ])
-        d = pos0 - torch.rand(3, generator=gen, dtype=torch.float64) * cell
-        d -= cell * torch.round(d / cell)  # minimum image about the centre
+        # minimum image about a random centre, in fractional coordinates: within r_max of
+        # the centre every fractional offset is at most 1/2, so rounding picks the right image
+        frac = frac0 - torch.rand(3, generator=gen, dtype=torch.float64)
+        d = (frac - torch.round(frac)) @ cell
         keep = torch.linalg.norm(d, dim=1) <= r_cluster
         pos = d[keep] @ rot.T if random_orientation else d[keep]
         yield pos.numpy(), atoms.numbers[keep.numpy()]

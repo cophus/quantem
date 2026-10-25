@@ -335,7 +335,7 @@ class TestBackgroundFitting:
             np.float32
         )
         # try fitting to this simulated Ik
-        weight = "default" if bg_model == "gaussian" else "k/I"
+        weight = "py4dstem" if bg_model == "gaussian" else "k/I"
         bg, f = pdf.fit_bg(Ik.copy(), bg_model=bg_model, bg_weight=weight)
         bg, f = bg.cpu().numpy(), f.cpu().numpy()
         assert (bg >= 0).all() and (f > 0).all()

@@ -2,13 +2,11 @@ import matplotlib.pyplot as plt
 import torch
 import numpy as np
 from numpy.typing import NDArray
-from scipy.special import eval_legendre, spherical_jn
-from numpy.polynomial.legendre import legval
+from scipy.special import spherical_jn
 
 from quantem.core.datastructures.dataset4dstem import Dataset4dstem
 from quantem.core.datastructures.polar4dstem import Polar4dstem
 from quantem.core.io.serialize import AutoSerialize
-from quantem.core.io.serialize import load
 from quantem.diffraction.polar_transform import (
     as_dataset4dstem,
     find_origin_angular_grid,
@@ -26,21 +24,26 @@ class PairAngleDistributionFunction(AutoSerialize):
     1. find_origin_angular_grid(ds)
     2. polar_transform(ds, origin_array=self.origin)
     3. rescale_intensity(self.polar, rho=1, fq=1)
-    4. compute_avg_angular_correlation(self.polar_rescaled)
-    5. subtract_angular_mean(self.ang_corr)
+    4. compute_avg_angular_correlation(rescaled intensity)
+    5. subtract_angular_median(self.ang_corr)
     6. extract_Bl_matrices(self.ang_corr_corrected)
     7. transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1])
-    8. reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], self.ds.shape[0] * self.ds.shape[1])
+    8. reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], Na=1); the overall scale is arbitrary
 
+    polar_ds can instead be a polar dataset, or a list of them with the same
+    q axis, in which case steps 1-2 are skipped and the angular correlation is
+    averaged over the list (useful for more patterns than fit in memory).
+    fq may be a function of q (1/A), evaluated on the polar q axis self.q.
+    The real-space grid r = r_min, r_min + r_step, ... includes r_max.
     """
     def __init__(self,
                  ds=None,
                  origin: NDArray | None = None,
-                 polar_ds: Polar4dstem | None = None,
+                 polar_ds: Polar4dstem | list[Polar4dstem] | None = None,
                  ang_corr: torch.Tensor | None = None,
                  Bl_mats = None,
                  rho: float = 1.0,
-                 fq: NDArray | torch.Tensor | float | None = None,
+                 fq=None,
                  l_max: int = 40,
                  r_min: float = 0.0,
                  r_max: float = 20.0,
@@ -51,21 +54,31 @@ class PairAngleDistributionFunction(AutoSerialize):
 
         # accept a single 2D pattern, a 3D stack, or a 4D-STEM dataset
         self.ds = as_dataset4dstem(ds) if ds is not None else None
-        self.origin = origin if origin is not None else find_origin_angular_grid(ds)
-        self.polar = polar_ds if polar_ds is not None else polar_transform(ds, origin_array=self.origin)
-
-        # TODO: look up rho and fq from sample identity when not provided
-        self.polar_rescaled = self.rescale_intensity(self.polar, rho=rho, fq=fq)
-
-        self.ang_corr = ang_corr if ang_corr is not None else self.compute_avg_angular_correlation(self.polar_rescaled)
-        self.ang_corr_corrected = self.subtract_angular_median(self.ang_corr)
-        self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr_corrected, l_max=l_max)
+        if polar_ds is None:
+            self.origin = origin if origin is not None else find_origin_angular_grid(self.ds)
+            polar_ds = polar_transform(self.ds, origin_array=self.origin)
+        else:
+            self.origin = origin
+        polars = list(polar_ds) if isinstance(polar_ds, (list, tuple)) else [polar_ds]
+        self.polar = polars[0]
         # radial q calibration of the polar dataset: bin i sits at q_min + i * dq
         dq = float(np.asarray(self.polar.sampling)[3])
         q_min = float(np.asarray(self.polar.origin)[3])
+        self.q = q_min + np.arange(self.polar.shape[-1]) * dq
+        if callable(fq):
+            fq = fq(self.q)
+
+        # TODO: look up rho and fq from sample identity when not provided
+        if ang_corr is None:
+            ang_corr = sum(
+                self.compute_avg_angular_correlation(self.rescale_intensity(p, rho=rho, fq=fq)) for p in polars
+            ) / len(polars)
+        self.ang_corr = ang_corr
+        self.ang_corr_corrected = self.subtract_angular_median(self.ang_corr)
+        self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr_corrected, l_max=l_max)
         self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1], dq=dq, q_min=q_min,
-                                                         r_min=r_min, r_max=r_max, r_step=r_step)
-        self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20, l_taper=l_taper) # TODO: determine atoms in beam
+                                                         r_min=r_min, r_max=r_max + 0.5 * r_step, r_step=r_step)
+        self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 1, l_taper=l_taper)
     
     @staticmethod
     def rescale_intensity(data: Polar4dstem | Dataset4dstem | None = None,
@@ -97,7 +110,7 @@ class PairAngleDistributionFunction(AutoSerialize):
         intensity = data.tensor.to(dtype=torch.float64)
         if fq is None:
             fq2 = 1.0
-        elif isinstance(fq, (int, float)):
+        elif np.ndim(fq) == 0:
             fq2 = float(fq) ** 2
         else:
             fq_t = torch.as_tensor(np.asarray(fq), dtype=torch.float64)
@@ -111,11 +124,6 @@ class PairAngleDistributionFunction(AutoSerialize):
         rescaled_intensity /= rescaled_intensity.mean()
         return rescaled_intensity
     
-    # phi_0 is not measureable, make a function to fit. (edit: Maybe not necessary)
-    def fit_phi_0(self):
-        pass
-        
-
     @staticmethod
     def compute_avg_angular_correlation(data):
         """
@@ -175,7 +183,7 @@ class PairAngleDistributionFunction(AutoSerialize):
         # for each l:
         #     build the linear system relating C to B_l(q, q')
         #     solve it by SVD
-        # Ignore odd l-terms, Friedel symmetry?
+        # even l only: a single kinematic pattern is Friedel symmetric
         # 5% SVD cutoff
         Nphi, Nq, Nqp = C_avg.shape
         dphi = torch.linspace(0, 2 * torch.pi, Nphi + 1, dtype=torch.float64)[:-1] # Ranges from [0, 2pi)
@@ -188,7 +196,7 @@ class PairAngleDistributionFunction(AutoSerialize):
         # Build matrix
         L = l_values.reshape(1, Nl)
         X = cos_dphi.reshape(Nphi, 1)
-        leg_matrix = eval_legendre(L, X) # Shape due to broadcasting (Nphi, Nl)
+        leg_matrix = torch.special.legendre_polynomial_p(X, L.to(torch.float64))  # (Nphi, Nl) by broadcasting
 
         # per-angle fit weight: sqrt|sin| (sin_weight), zero within theta_exclude of 0/360 deg
         w = torch.sqrt(torch.abs(torch.sin(dphi))) if sin_weight else torch.ones_like(dphi)
@@ -207,8 +215,6 @@ class PairAngleDistributionFunction(AutoSerialize):
         B_flat = Vh.T @ tmp
 
         return B_flat.reshape(Nl, Nq, Nqp), l_values
-
-        # TODO: Compare each function to the martin code to see the difference/similarity or understand the repo better
 
     def transform_to_real_space(self, Bl_mats, l_values, dq=0.01, q_min=0.0,
                                 r_min=0.0, r_max=20.0, r_step=0.02):
@@ -238,9 +244,9 @@ class PairAngleDistributionFunction(AutoSerialize):
         self.r = r.numpy()
         real_Bl = torch.zeros((Bl_mats.shape[0], r.shape[0], r.shape[0]), dtype=torch.float64)
 
+        arg = 2 * torch.pi * torch.outer(r, q)  # Shape len(r) x len(q)
         for l in range(len(l_values)):
             Bl = Bl_mats[l].to(dtype=torch.float64) # The corresponding q x q' matrix
-            arg = 2 * torch.pi * torch.outer(r, q) # Shape len(r) x len(q)
             jl = torch.from_numpy(spherical_jn(l_values[l], arg)).to(dtype=torch.float64)
 
             # Representing DSBT (eq 12) as a transformation matrix "sbessel",
@@ -258,8 +264,8 @@ class PairAngleDistributionFunction(AutoSerialize):
         - Sum Pl(cos theta) times B_l() over all l
         - Multiply by n_alpha * 2 pi
 
-        NOTE: Theta will go from 0 to pi
-        EDIT: Na should be number of atoms not number of dps
+        Theta goes from 0 to pi in 180 steps. Na scales the result; with the
+        unit-mean intensity normalization the overall scale is arbitrary.
 
         per_theta : bool
             The Legendre sum is the real-space correlation C(r, r', cos theta)
@@ -275,14 +281,12 @@ class PairAngleDistributionFunction(AutoSerialize):
         theta = np.linspace(0, np.pi, 180)
         self.theta = theta
         self.theta_deg = np.degrees(theta)
-        cos_theta = np.cos(theta)
+        cos_theta = torch.cos(torch.as_tensor(theta, dtype=torch.float64))
         chosen_l_values = l_values[1:]
 
         # Sum over all l
         for l in range(len(chosen_l_values)): # skipping l = 0
-            coeffs = np.zeros(chosen_l_values[-1] + 1)
-            coeffs[chosen_l_values[l]] = 1
-            Pl = torch.tensor(legval(cos_theta, coeffs))
+            Pl = torch.special.legendre_polynomial_p(cos_theta, int(chosen_l_values[l]))
             Bl = real_Bl[l + 1] * weights[l + 1] # skipping l = 0
             padf += Bl[:, :, np.newaxis] * Pl[np.newaxis, np.newaxis, :]
 
@@ -341,7 +345,7 @@ class PairAngleDistributionFunction(AutoSerialize):
             Display weighting exponent; each panel is multiplied by
             r^(2 * r_display_power). 0 plots the raw values.
         r_max_display : float or None
-            Upper limit of the radial axes; defaults to min(8 A, r.max()).
+            Upper limit of the radial axes; defaults to r.max().
         r_search_min : float
             Ignore r below this value when auto-locating the g2 peak
             (excludes the r ~ 0 reconstruction artifacts).
@@ -404,7 +408,7 @@ class PairAngleDistributionFunction(AutoSerialize):
 
         # display weighting and color limits
         if r_max_display is None:
-            r_max_display = float(min(8.0, r[-1]))
+            r_max_display = float(r[-1])
         weight = r ** (2 * r_display_power)
         g2_disp = g2 * weight
         g3_disp = (g3_map * weight[:, None]).T  # (Ntheta, Nr')
@@ -526,7 +530,7 @@ class PairAngleDistributionFunction(AutoSerialize):
         nearest q (1/Angstroms), against q' (x-axis) and dphi (y-axis).
         """
         C = self.ang_corr_corrected.numpy()
-        q_axis = float(np.asarray(self.polar.origin)[3]) + np.arange(C.shape[1]) * float(np.asarray(self.polar.sampling)[3])
+        q_axis = self.q
         iq = int(np.argmin(np.abs(q_axis - q)))
         dphi = np.arange(C.shape[0]) * 360.0 / C.shape[0]
         M = C[:, iq, :]
@@ -674,14 +678,14 @@ def padf_from_clusters(
     r_t = torch.as_tensor(np.asarray(r), dtype=torch.float64)
     dr = float(r_t[1] - r_t[0])
     n_r = r_t.numel()
-    l_values = torch.arange(0, l_max, 2)
+    l_values = torch.arange(2, l_max, 2)  # l = 0 is dropped, as the PADF's median subtraction does
     shell = 4 * np.pi * torch.clamp(r_t, min=0.5 * dr) ** 2 * dr
     Cl = torch.zeros((len(l_values), n_r, n_r), dtype=torch.float64)
     for pos in clusters:
         pos = torch.as_tensor(np.asarray(pos), dtype=torch.float64)
         d = (pos[None, :, :] - pos[:, None, :]).reshape(-1, 3)
         dist = torch.linalg.norm(d, dim=1)
-        keep = (dist > 0) & (dist < float(r_t[-1]))
+        keep = (dist > 0) & (dist >= float(r_t[0])) & (dist < float(r_t[-1]))
         d, dist = d[keep], dist[keep]
         cos_t = torch.clamp(d[:, 2] / dist, -1, 1)
         sin_t = torch.sqrt(1 - cos_t**2)
@@ -699,10 +703,8 @@ def padf_from_clusters(
     theta = torch.deg2rad(torch.as_tensor(np.asarray(theta_deg), dtype=torch.float64))
     out = torch.zeros((n_r, n_r, theta.numel()), dtype=torch.float64)
     for k, l in enumerate(l_values.tolist()):
-        if l == 0:
-            continue
         C = Cl[k] if q is None else _bandlimit_order(Cl[k], l, r, q)
         if l_taper:
-            C = C * float(order_taper(l, l_max))
+            C = C * float(order_taper(l, int(l_values[-1]) + 2))  # same as reconstruct_PADF
         out += C[:, :, None] * torch.special.legendre_polynomial_p(torch.cos(theta), l)[None, None, :]
     return (out * torch.abs(torch.sin(theta))[None, None, :]).numpy()

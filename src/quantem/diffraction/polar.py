@@ -493,18 +493,12 @@ class PairDistributionFunction(AutoSerialize):
         fk: NDArray | None = None,
         bg_weight: str = "k/I",
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Fit B(k) for a stack of N radial curves at once (vectorized LM).
+        """Fit B(k) for a stack of N radial curves at once.
 
         The fit minimises ``sum_k [w(k) * (B(k) - I(k))]^2`` over k in
-        [kmin, kmax], with the residual weight
-
-            w(k) = taper(k) / (k_end - 0.9 * k + dk)
-
-        Here ``taper`` rises as sin² from 0 at kmin to 1 at kmin + 0.25 1/A
-        (points where it is below 1e-4 get zero weight), and ``k_end`` is the
-        last k of the fit range. The weighting scheme follows the background fit
-        in py4DSTEM. All N curves are fit together in a single solve rather
-        than one at a time.
+        [kmin, kmax], by batched Levenberg-Marquardt on the log of the
+        (positive) parameters, or by linear least squares for "known". All N
+        curves are fit together.
 
         Parameters
         ----------
@@ -513,9 +507,6 @@ class PairDistributionFunction(AutoSerialize):
         kmin, kmax
             Fit range.
         bg_model
-            "gaussian": B(k) = c + i0 exp(-k^2 / 2 s0^2) + i1 exp(-k^4 / 2 s1^4),
-            the py4DSTEM model, which falls off too fast to follow the atomic
-            scattering factors at high k.
             "power" (default): B(k) = c + sum_i a_i (1 + k^2 / s_i^2)^(-p_i), with
             num_power_laws (1 or 2) terms. Every parameter is positive, so the
             single-scattering term f(k) = B(k) - c is positive and decreases
@@ -523,16 +514,21 @@ class PairDistributionFunction(AutoSerialize):
             scattering factors rather than exponentially.
             "known": B(k) = N fk(k)^2 + c, the standard normalization by the
             composition-averaged scattering factor, for a known composition.
-            Only N >= 0 and c >= 0 are fit (weighted linear least squares).
+            Only N >= 0 and c >= 0 are fit.
+            "gaussian": B(k) = c + i0 exp(-k^2 / 2 s0^2) + i1 exp(-k^4 / 2 s1^4),
+            the py4DSTEM model, which falls off too fast to follow the atomic
+            scattering factors at high k.
         fk
             Mean atomic scattering factor <f(k)> on the k axis of the polar
-            data, required for bg_model="known". For several elements pass
-            sqrt(<f^2>).
+            data, or a function of k (1/A), required for bg_model="known".
+            For several elements pass sqrt(<f^2>).
         bg_weight
-            Residual weighting of the fit. "k/I" (default) weights by k / I(k),
-            the error in F(k) = k [I(k) - B(k)] / f(k)^2 for B close to I. "k"
-            weights by k. "default" (py4DSTEM) divides by a line that falls
-            with k. All use the low-k taper.
+            Residual weight w(k), always times a sin² taper that rises from 0 at
+            kmin to 1 at kmin + 0.25 1/A to suppress the central-beam tail.
+            "k/I" (default): k / I(k), the error in F(k) = k [I(k) - B(k)] / f(k)
+            for B close to I; I(k) is floored at 1e-3 of its median so empty
+            bins (e.g. a beam stop) cannot dominate. "k": k.
+            "py4dstem": 1 / (k_end - 0.9 k + dk), with k_end the end of the fit range.
 
         Returns
         -------
@@ -540,235 +536,82 @@ class PairDistributionFunction(AutoSerialize):
             Each (N, Nk) float32: fitted background and f(k) = B(k) - c per row.
         """
         k = torch.as_tensor(self.qq, dtype=torch.float64, device=self.device)
-        if kmin is None:
-            kmin = float(k.min())
-        if kmax is None:
-            kmax = float(k.max())
-        k2 = k**2
+        kmin = float(k.min()) if kmin is None else kmin
+        kmax = float(k.max()) if kmax is None else kmax
         fit_mask = (k >= kmin) & (k <= kmax)
-        k2_fit = k2[fit_mask]  # (Nf,)
         k_fit = k[fit_mask]
-        dk = k[1] - k[0]
-        # Residual weights over the fit window (length Nf): a sin^2 taper over the
-        # first 0.25 1/A above kmin suppresses the central-beam tail, and dividing
-        # by a line that falls with k favours high k.
-        taper = torch.sin(0.5 * torch.pi * torch.clamp((k_fit - kmin) / 0.25, 0.0, 1.0)) ** 2
-        taper = torch.where(taper > 1e-4, taper, 0.0)
         Ik = torch.as_tensor(Ik_stack, dtype=torch.float64, device=self.device)
         Ik_fit = Ik[:, fit_mask].clamp(min=1e-10)  # (N, Nf)
-        # residual weights, one row per curve: (N, Nf)
-        if bg_weight == "default":
-            resid_weights = (taper / (k_fit[-1] - 0.9 * k_fit + dk)).expand_as(Ik_fit)
-        elif bg_weight == "k":
-            resid_weights = (taper * k_fit).expand_as(Ik_fit)
-        elif bg_weight == "k/I":
-            resid_weights = taper * k_fit / Ik_fit
-        else:
-            raise ValueError(f"bg_weight must be 'default', 'k' or 'k/I', got {bg_weight!r}")
-        resid_weights = resid_weights / resid_weights.amax(dim=1, keepdim=True)
-        n = Ik_fit.shape[0]  # number of Ik in batch
 
-        if bg_model == "power":
-            return self._fit_bg_power(k, k_fit, Ik_fit, resid_weights, num_power_laws)
+        taper = torch.sin(0.5 * torch.pi * torch.clamp((k_fit - kmin) / 0.25, 0.0, 1.0)) ** 2
+        taper = torch.where(taper > 1e-4, taper, 0.0)
+        if bg_weight == "k/I":
+            floor = 1e-3 * Ik_fit.median(dim=1, keepdim=True).values
+            weights = taper * k_fit / torch.maximum(Ik_fit, floor)
+        elif bg_weight == "k":
+            weights = (taper * k_fit).expand_as(Ik_fit)
+        elif bg_weight == "py4dstem":
+            weights = (taper / (k_fit[-1] - 0.9 * k_fit + (k[1] - k[0]))).expand_as(Ik_fit)
+        else:
+            raise ValueError(f"bg_weight must be 'k/I', 'k' or 'py4dstem', got {bg_weight!r}")
+        weights = weights / weights.amax(dim=1, keepdim=True)  # (N, Nf), one row per curve
+
         if bg_model == "known":
             if fk is None:
                 raise ValueError("bg_model='known' needs fk, the scattering factor on the k axis")
+            fk = fk(np.asarray(self.qq, dtype=float)) if callable(fk) else fk
             f2 = torch.as_tensor(np.asarray(fk), dtype=torch.float64, device=self.device) ** 2
             basis = torch.stack([f2[fit_mask], torch.ones_like(k_fit)], dim=1)  # (Nf, 2)
-            A = basis[None, :, :] * resid_weights[:, :, None]  # (N, Nf, 2)
-            coef = torch.linalg.lstsq(A, (Ik_fit * resid_weights)[:, :, None]).solution[:, :, 0]  # (N, 2)
+            coef = torch.linalg.lstsq(
+                basis[None] * weights[:, :, None], (Ik_fit * weights)[:, :, None]
+            ).solution[:, :, 0]  # (N, 2)
             c = coef[:, 1].clamp(min=0.0)
             # refit the scale alone where the constant was clamped to zero
-            w2f = resid_weights**2 * f2[fit_mask]
+            w2f = weights**2 * f2[fit_mask]
             scale = torch.where(
-                coef[:, 1] < 0,
-                (Ik_fit * w2f).sum(1) / (w2f * f2[fit_mask]).sum(1),
-                coef[:, 0],
+                coef[:, 1] < 0, (Ik_fit * w2f).sum(1) / (w2f * f2[fit_mask]).sum(1), coef[:, 0]
             ).clamp(min=1e-30)
             f = scale[:, None] * f2[None, :]
             return (f + c[:, None]).to(dtype=torch.float32), f.to(dtype=torch.float32)
-        if bg_model != "gaussian":
-            raise ValueError(f"bg_model must be 'gaussian', 'power' or 'known', got {bg_model!r}")
 
-        # Build Jacobian
-        # Initial guesses: constant = min(I), amplitudes = median(I) - min(I), widths = mean(k).
-        c0 = Ik_fit.amin(dim=1)  # (N,)
-        amp = (Ik_fit.median(dim=1).values - c0).clamp(min=1e-10)  # (N,)
-        sig = torch.full((n,), max(float(k.mean()), 1e-3), dtype=torch.float64, device=self.device)
-        init = torch.stack([c0.clamp(min=1e-10), amp, sig, amp, sig], dim=1)  # (N, 5)
-        # exp(theta) = parameters ensures that they remain positive
-        theta = torch.log(init)
-
-        def _rj(theta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            """Batched residual (N, Nf) and analytic Jacobian (N, Nf, 5).
-
-            Model B(k):
-                B(k) = c + i0 * E0 + i1 * E1
-                where:
-                    E0 = exp(-k^2 / (2 s0^2))
-                    E1 = exp(-k^4 / (2 s1^4))
-            """
-            c, i0, s0, i1, s1 = torch.exp(theta).unbind(dim=1)  # each (N,)
-            E0 = torch.exp(
-                torch.clamp(-k2_fit[None, :] / (2.0 * s0[:, None] ** 2), min=-100.0, max=0.0)
-            )
-            E1 = torch.exp(
-                torch.clamp(
-                    -(k2_fit[None, :] ** 2) / (2.0 * s1[:, None] ** 4), min=-100.0, max=0.0
-                )
-            )
-            B = c[:, None] + i0[:, None] * E0 + i1[:, None] * E1
-            w = resid_weights  # (N, Nf) residual weights
-            r = (B - Ik_fit) * w
-            t0 = i0[:, None] * E0
-            t1 = i1[:, None] * E1
-            jac = torch.stack(
-                [
-                    c[:, None] * w,
-                    t0 * w,
-                    t0 * (k2_fit[None, :] / s0[:, None] ** 2) * w,
-                    t1 * w,
-                    t1 * (2.0 * k2_fit[None, :] ** 2 / s1[:, None] ** 4) * w,
-                ],
-                dim=2,
-            )
-            return r, jac
-
-        def _loss(theta: torch.Tensor) -> torch.Tensor:
-            r, _ = _rj(theta)
-            return (r * r).sum(dim=1)  # (N,)
-
-        # Batched Levenberg-Marquardt, replaces scipy.curve_fit.
-        # recompute Jacobian every iteration and take one step, accepting
-        # per-curve where the loss improved. lamba is adapted per-curve
-        # over the course of fitting (decrease on accept toward Gauss-Newton,
-        # increase on reject toward gradient descent). Converged curves simply stop being updated.
-        lam = torch.ones(n, dtype=torch.float64, device=self.device)
-        loss = _loss(theta)
-        eye = 1e-12 * torch.eye(5, dtype=torch.float64, device=self.device)
-        max_log_step = 1.0
-        for _ in range(200):  # outer loop: recompute the Jacobian at the current theta
-            r, jac = _rj(theta)
-            JtJ = torch.einsum("nki,nkj->nij", jac, jac)  # (N, 5, 5)
-            Jtr = torch.einsum("nki,nk->ni", jac, r)  # (N, 5)
-            diag = torch.diagonal(JtJ, dim1=1, dim2=2).clamp(min=1e-12)  # (N, 5)
-            theta_base = theta  # all trial steps start from here this iter
-            prev_loss = loss
-            accepted = torch.zeros(n, dtype=torch.bool, device=self.device)
-            # inner loop: per-curve lambda search. increase damping and retry until
-            # each curve finds a downhill step
-            for _ in range(30):
-                A = JtJ + lam[:, None, None] * torch.diag_embed(diag) + eye
-                delta = torch.linalg.solve(A, Jtr)  # (N, 5)
-                # shrink the step if largest component exceeds max_log_step
-                step_scale = (max_log_step / delta.abs().amax(dim=1).clamp(min=1e-30)).clamp(
-                    max=1.0
-                )
-                theta_trial = theta_base - delta * step_scale[:, None]
-                loss_trial = _loss(theta_trial)
-                # accept improvements per-curve
-                improved = torch.isfinite(loss_trial) & (loss_trial < loss) & (~accepted)
-                theta = torch.where(improved[:, None], theta_trial, theta)
-                loss = torch.where(improved, loss_trial, loss)
-                accepted = accepted | improved
-                # Accepted curves relax lambda (toward Gauss-Newton), curves not accepted tighten it (toward gradient descent).
-                lam = torch.where(
-                    improved,
-                    (lam * 0.3).clamp(min=1e-12),
-                    torch.where(~accepted, (lam * 3.0).clamp(max=1e12), lam),
-                )
-                if bool(accepted.all()):
-                    break
-            if not bool(accepted.any()):
-                break  # no curve found a downhill step -> all converged / stuck
-            # Stop once every curve's relative improvement is negligible.
-            rel = (prev_loss - loss) / (prev_loss + 1e-30)
-            if float(rel.max()) < 1e-9:
-                break
-
-        # Evaluate B(k) over the full k-range (not just k_fit) for every curve
-        with torch.no_grad():
-            c, i0, s0, i1, s1 = torch.exp(theta).unbind(dim=1)
-            E0 = torch.exp(
-                torch.clamp(-k2[None, :] / (2.0 * s0[:, None] ** 2), min=-100.0, max=0.0)
-            )
-            E1 = torch.exp(
-                torch.clamp(-(k2[None, :] ** 2) / (2.0 * s1[:, None] ** 4), min=-100.0, max=0.0)
-            )
-            bg = c[:, None] + i0[:, None] * E0 + i1[:, None] * E1  # (N, Nk)
-            f = (bg - c[:, None]).clamp(min=1e-10 * bg.amax(dim=1, keepdim=True))
-        return bg.to(dtype=torch.float32), f.to(dtype=torch.float32)
-
-    def _fit_bg_power(self, k, k_fit, Ik_fit, resid_weights, num_power_laws):
-        """Power-law background B(k) = c + sum_i a_i (1 + k^2 / s_i^2)^(-p_i),
-        fit by batched Levenberg-Marquardt on log-parameters (all positive)."""
-        if num_power_laws not in (1, 2):
-            raise ValueError("num_power_laws must be 1 or 2")
-        n = Ik_fit.shape[0]
-        k2_fit, k2 = k_fit**2, k**2
-
-        def model(theta, kk2):
-            # theta: (P,) log-parameters [c, a_1, s_1, p_1, (a_2, s_2, p_2)]
-            par = torch.exp(theta)
-            B = par[0] + 0 * kk2
-            for i in range(num_power_laws):
-                a, s, pw = par[1 + 3 * i], par[2 + 3 * i], par[3 + 3 * i]
-                B = B + a * (1.0 + kk2 / s**2) ** (-pw)
-            return B
-
-        def residual(theta, Ik_row, w_row):
-            return (model(theta, k2_fit) - Ik_row) * w_row
-
-        jac_fn = torch.func.vmap(torch.func.jacrev(residual), in_dims=(0, 0, 0))
-        res_fn = torch.func.vmap(residual, in_dims=(0, 0, 0))
-
-        # initial guesses: constant = min(I), a steep term near the central beam and a slower tail
         c0 = Ik_fit.amin(dim=1).clamp(min=1e-10)
-        amp = (Ik_fit[:, 0] - c0).clamp(min=1e-10)
-        cols = [c0]
-        for s0, p0 in [(0.3, 2.0), (1.0, 1.0)][:num_power_laws]:
-            cols += [amp / num_power_laws, torch.full_like(c0, s0), torch.full_like(c0, p0)]
-        theta = torch.log(torch.stack(cols, dim=1))  # (N, P)
-        n_par = theta.shape[1]
+        if bg_model == "power":
+            if num_power_laws not in (1, 2):
+                raise ValueError("num_power_laws must be 1 or 2")
+            amp = (Ik_fit[:, 0] - c0).clamp(min=1e-10)
+            cols = [c0]  # a steep term near the central beam and a slower tail
+            for s0, p0 in [(0.3, 2.0), (1.0, 1.0)][:num_power_laws]:
+                cols += [amp / num_power_laws, torch.full_like(c0, s0), torch.full_like(c0, p0)]
 
-        def loss_fn(th):
-            r = res_fn(th, Ik_fit, resid_weights)
-            return (r * r).sum(dim=1)
+            def model(theta, kk):
+                par = torch.exp(theta)  # [c, a_1, s_1, p_1, (a_2, s_2, p_2)]
+                B = par[0] + 0 * kk
+                for i in range(num_power_laws):
+                    B = B + par[1 + 3 * i] * (1.0 + kk**2 / par[2 + 3 * i] ** 2) ** (-par[3 + 3 * i])
+                return B
 
-        lam = torch.ones(n, dtype=torch.float64, device=self.device)
-        loss = loss_fn(theta)
-        eye = 1e-12 * torch.eye(n_par, dtype=torch.float64, device=self.device)
-        for _ in range(300):
-            r = res_fn(theta, Ik_fit, resid_weights)
-            jac = jac_fn(theta, Ik_fit, resid_weights)  # (N, Nf, P)
-            JtJ = torch.einsum("nki,nkj->nij", jac, jac)
-            Jtr = torch.einsum("nki,nk->ni", jac, r)
-            diag = torch.diagonal(JtJ, dim1=1, dim2=2).clamp(min=1e-12)
-            theta_base, prev_loss = theta, loss
-            accepted = torch.zeros(n, dtype=torch.bool, device=self.device)
-            for _ in range(30):
-                delta = torch.linalg.solve(JtJ + lam[:, None, None] * torch.diag_embed(diag) + eye, Jtr)
-                step = (1.0 / delta.abs().amax(dim=1).clamp(min=1e-30)).clamp(max=1.0)
-                theta_trial = theta_base - delta * step[:, None]
-                loss_trial = loss_fn(theta_trial)
-                improved = torch.isfinite(loss_trial) & (loss_trial < loss) & (~accepted)
-                theta = torch.where(improved[:, None], theta_trial, theta)
-                loss = torch.where(improved, loss_trial, loss)
-                accepted = accepted | improved
-                lam = torch.where(
-                    improved,
-                    (lam * 0.3).clamp(min=1e-12),
-                    torch.where(~accepted, (lam * 3.0).clamp(max=1e12), lam),
-                )
-                if bool(accepted.all()):
-                    break
-            if not bool(accepted.any()):
-                break
-            if float(((prev_loss - loss) / (prev_loss + 1e-30)).max()) < 1e-10:
-                break
+        elif bg_model == "gaussian":
+            amp = (Ik_fit.median(dim=1).values - c0).clamp(min=1e-10)
+            sig = torch.full_like(c0, max(float(k.mean()), 1e-3))
+            cols = [c0, amp, sig, amp, sig]
 
+            def model(theta, kk):
+                c, i0, s0, i1, s1 = torch.exp(theta)
+                E0 = torch.exp(torch.clamp(-(kk**2) / (2.0 * s0**2), min=-100.0, max=0.0))
+                E1 = torch.exp(torch.clamp(-(kk**4) / (2.0 * s1**4), min=-100.0, max=0.0))
+                return c + i0 * E0 + i1 * E1
+
+        else:
+            raise ValueError(f"bg_model must be 'power', 'known' or 'gaussian', got {bg_model!r}")
+
+        theta = _levenberg_marquardt(
+            lambda th, I_row, w_row: (model(th, k_fit) - I_row) * w_row,
+            torch.log(torch.stack(cols, dim=1)),
+            Ik_fit,
+            weights,
+        )
         with torch.no_grad():
-            bg = torch.stack([model(th, k2) for th in theta])  # (N, Nk)
+            bg = torch.stack([model(th, k) for th in theta])  # (N, Nk)
             f = (bg - torch.exp(theta[:, :1])).clamp(min=1e-10 * bg.amax(dim=1, keepdim=True))
         return bg.to(dtype=torch.float32), f.to(dtype=torch.float32)
 
@@ -1100,15 +943,15 @@ class PairDistributionFunction(AutoSerialize):
         k = torch.from_numpy(np.asarray(self.qq).astype(np.float32)).to(device=self.device)
         dk = k[1] - k[0]
         # correct S(k) over the transformed (window) range, which can be wider than the bg fit range
-        k_fit_mask = (k >= self.kmin_window) & (k <= self.kmax_window)
-        k_fit = k[k_fit_mask]
+        k_win_mask = (k >= self.kmin_window) & (k <= self.kmax_window)
+        k_win = k[k_win_mask]
         ka, ra = torch.meshgrid(k, self._r, indexing="ij")
 
         # Restrict r to [0, r_cut] for the correction
         r_mask = (self._r >= 0.0) & (self._r <= r_cut)
         r_short = self._r[r_mask]
-        k_fit_scaled = k_fit * 2 * torch.pi
-        k2d_fit, r2d_fit = torch.meshgrid(k_fit_scaled, r_short, indexing="ij")
+        k_win_scaled = k_win * 2 * torch.pi
+        k2d_win, r2d_win = torch.meshgrid(k_win_scaled, r_short, indexing="ij")
 
         Sk_cor = self.Sk.clone()
         # the window does not change during the iteration
@@ -1127,7 +970,7 @@ class PairDistributionFunction(AutoSerialize):
         for _ in range(max_iter):
             # alpha and beta are the ideal and actual contributions to G(r) in the short-r range
             # from the current S(k) and G(r)
-            alpha, beta = self._compute_alpha_beta(k2d_fit, r2d_fit, G_iter[r_mask], r_short)
+            alpha, beta = self._compute_alpha_beta(k2d_win, r2d_win, G_iter[r_mask], r_short)
             # converge on the S(k) correction magnitude
             if beta_prev is not None:
                 delta = float(torch.max(torch.abs(beta - beta_prev)))
@@ -1135,7 +978,7 @@ class PairDistributionFunction(AutoSerialize):
                     break
             beta_prev = beta.clone()
             # Update S_cor(k) and G_cor
-            Sk_cor[k_fit_mask] = Sk_cor[k_fit_mask] - beta + rho0 * alpha
+            Sk_cor[k_win_mask] = Sk_cor[k_win_mask] - beta + rho0 * alpha
             Fk_win = k * (Sk_cor - 1.0) * wk * 2 * torch.pi
             G_iter = (
                 (2.0 / torch.pi)
@@ -1569,3 +1412,55 @@ class PairDistributionFunction(AutoSerialize):
         if not np.any(m):
             raise ValueError("Requested plot range contains no data.")
         return x[m], y[m]
+
+
+def _levenberg_marquardt(residual, theta, data, weights, max_iter: int = 200, tol: float = 1e-9):
+    """
+    Batched Levenberg-Marquardt. residual(theta_row, data_row, weight_row)
+    returns one curve's weighted residual; theta is (N, P), one parameter row
+    per curve. The Jacobian comes from autodiff. Each curve keeps its own
+    damping, which falls toward Gauss-Newton when a step lowers its loss and
+    rises toward gradient descent when it does not; converged curves stop
+    moving.
+    """
+    res_fn = torch.func.vmap(residual)
+    jac_fn = torch.func.vmap(torch.func.jacrev(residual))
+    n, n_par = theta.shape
+
+    def loss_fn(th):
+        r = res_fn(th, data, weights)
+        return (r * r).sum(dim=1)
+
+    lam = torch.ones(n, dtype=theta.dtype, device=theta.device)
+    loss = loss_fn(theta)
+    eye = 1e-12 * torch.eye(n_par, dtype=theta.dtype, device=theta.device)
+    for _ in range(max_iter):
+        r = res_fn(theta, data, weights)
+        jac = jac_fn(theta, data, weights)  # (N, Nf, P)
+        JtJ = torch.einsum("nki,nkj->nij", jac, jac)
+        Jtr = torch.einsum("nki,nk->ni", jac, r)
+        diag = torch.diagonal(JtJ, dim1=1, dim2=2).clamp(min=1e-12)
+        theta_base, prev_loss = theta, loss
+        accepted = torch.zeros(n, dtype=torch.bool, device=theta.device)
+        for _ in range(30):  # per-curve damping search
+            delta = torch.linalg.solve(JtJ + lam[:, None, None] * torch.diag_embed(diag) + eye, Jtr)
+            # limit the largest log-parameter step to 1
+            step = (1.0 / delta.abs().amax(dim=1).clamp(min=1e-30)).clamp(max=1.0)
+            theta_trial = theta_base - delta * step[:, None]
+            loss_trial = loss_fn(theta_trial)
+            improved = torch.isfinite(loss_trial) & (loss_trial < loss) & (~accepted)
+            theta = torch.where(improved[:, None], theta_trial, theta)
+            loss = torch.where(improved, loss_trial, loss)
+            accepted = accepted | improved
+            lam = torch.where(
+                improved,
+                (lam * 0.3).clamp(min=1e-12),
+                torch.where(~accepted, (lam * 3.0).clamp(max=1e12), lam),
+            )
+            if bool(accepted.all()):
+                break
+        if not bool(accepted.any()):
+            break  # no curve found a downhill step
+        if float(((prev_loss - loss) / (prev_loss + 1e-30)).max()) < tol:
+            break
+    return theta

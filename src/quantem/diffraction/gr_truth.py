@@ -1,5 +1,30 @@
 """
 Adapted from PDFs_3batch by Arthur McCray (renamed 9/23/2026)
+
+Three-body g3(r, r', theta) histograms of atomic structures (PDF3B), for 3D
+cells and for 2D (monolayer / coplanar) structures.
+
+Differences from PDFs_3batch.py
+-------------------------------
+1. Flat-axis detection: a non-periodic axis along which every atom shares the
+   same coordinate is "flat". Centers are no longer trimmed along such an axis
+   (a monolayer loses no neighbors above/below the plane), which previously
+   emptied `center_inds` and crashed on `max([len(i) for i in inds_all])`.
+   For genuinely thick non-periodic axes the trim margin is now measured from
+   the atomic extent rather than the cell, so a thin film in a tall vacuum cell
+   is handled correctly.
+2. Areal density (atoms / A^2) is used when exactly one axis is flat, instead of
+   a volumetric density taken from an arbitrary vacuum-padded cell.
+3. 2D normalization: the coplanar ideal-gas pair measure is
+       4 * pi * sigma^2 * r1 * r2 * dr^2 * dtheta
+   i.e. linear in r and with NO sin(theta) factor. Dividing a 2D PADF by
+   sin(theta) manufactures spurious intensity at 0 and 180 degrees.
+4. `good_vals` now compares the theta bin index against the number of theta
+   bins rather than against the literal value 180 (the original was only
+   correct for dtheta == 1).
+
+The 3D code path is unchanged; a fully periodic or thick non-periodic cell
+behaves exactly as before.
 """
 
 import numpy as np
@@ -37,6 +62,7 @@ class PDF3B(object):
         v=None,
         pbcs=None,
         subpixel_weights=True,
+        flat_tol=1e-6,
     ):
         xp = self._xp
         stime = time.perf_counter()
@@ -62,18 +88,60 @@ class PDF3B(object):
         positions = xp.array(positions_np)
 
         vprint(f"Cell size (A): {bbox_np}")
-        # vprint(f"max dist possible between two points with full pbcs: {np.sqrt(3*(bbox_np.max()/2)**2):.2f} A")
         vprint(f"Using a max radius of {hist_r_max} A")
 
-        ### get center positions that aren't within r_max of a boundary without pbcs
+        ### FIX 1a: identify flat axes -- non-periodic with zero atomic extent.
+        ### A monolayer has no neighbors to lose along such an axis, so every
+        ### atom already has a complete neighborhood and must not be trimmed.
+        flat_axes = [
+            i
+            for i in range(3)
+            if not pbcs_np[i] and np.ptp(positions_np[:, i]) < flat_tol
+        ]
+        self.flat_axes = flat_axes
+        if len(flat_axes) == 1:
+            vprint(
+                f"Detected flat (2D) axis {flat_axes[0]}: using areal density "
+                "and 2D normalization"
+            )
+        elif len(flat_axes) > 1:
+            vprint(
+                f"WARNING: {len(flat_axes)} flat axes {flat_axes} -> structure is "
+                "1D or a single point. Falling back to volumetric normalization, "
+                "which is not correct for this geometry."
+            )
+
+        ### warn if the minimum-image convention is violated in a periodic dim.
+        ### _get_vecs_pbcs and query_ball_tree both require L > 2 * hist_r_max
+        for i, p in enumerate(pbcs_np):
+            if p and bbox_np[i] <= 2 * hist_r_max:
+                vprint(
+                    f"WARNING: periodic axis {i} has L = {bbox_np[i]:.2f} A "
+                    f"<= 2 * hist_r_max = {2 * hist_r_max} A. Minimum-image "
+                    "distances and neighbor counts will be wrong -- tile the "
+                    "cell first, e.g. atoms * (n, m, 1)."
+                )
+
+        ### FIX 1b: get center positions that aren't within r_max of a boundary
+        ### without pbcs. Margins are measured from the atomic extent, not the
+        ### cell, and flat axes are skipped entirely.
         goods = np.ones(len(positions_np)).astype("bool")
         for i, p in enumerate(pbcs_np):
-            if p:
+            if p or i in flat_axes:
                 continue
-            goods *= (positions_np[:, i] > hist_r_max) & (
-                positions_np[:, i] < (bbox_np[i] - hist_r_max)
+            lo = positions_np[:, i].min()
+            hi = positions_np[:, i].max()
+            goods *= (positions_np[:, i] > lo + hist_r_max) & (
+                positions_np[:, i] < hi - hist_r_max
             )
         center_inds = np.where(goods)[0]
+        if len(center_inds) == 0:
+            raise ValueError(
+                "No valid center atoms: every atom lies within hist_r_max of a "
+                "non-periodic boundary. The atomic extent along each finite, "
+                f"non-flat axis must exceed 2 * hist_r_max = {2 * hist_r_max} A. "
+                "Reduce hist_r_max, use a thicker sample, or enable pbcs."
+            )
 
         ### KD tree for getting neighbors, cpu cuz faster
         start_KD = time.perf_counter()
@@ -96,10 +164,18 @@ class PDF3B(object):
         num_bins_theta = hist_theta.shape[0]
         hist_sig = xp.zeros((num_bins_theta, num_bins_r, num_bins_r))
 
-        ### Density
+        ### FIX 2: Density -- areal for a 2D structure, volumetric otherwise
         cell = xp.array(atoms.cell)
-        volume = xp.abs(xp.sum(cell[:, 0] * xp.cross(cell[:, 1], cell[:, 2])))
-        dens = positions.shape[0] / volume
+        if len(flat_axes) == 1:
+            i, j = [k for k in range(3) if k != flat_axes[0]]
+            area = xp.linalg.norm(xp.cross(cell[i], cell[j]))
+            assert area > 0, "in-plane cell area is zero"
+            dens = positions.shape[0] / area  # atoms / A^2
+            vprint(f"Areal density = {float(dens):.4g} atoms / A^2")
+        else:
+            volume = xp.abs(xp.sum(cell[:, 0] * xp.cross(cell[:, 1], cell[:, 2])))
+            assert volume > 0, "cell volume is zero"
+            dens = positions.shape[0] / volume  # atoms / A^3
 
         ### making big arrays that will be filled
         maxinds = max([len(i) for i in inds_all])
@@ -122,34 +198,13 @@ class PDF3B(object):
             weights_full = None
             weights = None
 
-        # ### making big arrays that will be filled
-        # natoms_dens = (4 / 3 * xp.pi * hist_r_max**3) * dens
-        # maxval_n = int(1.25 * natoms_dens**2)
-        # vals = xp.zeros((3, maxval_n * batch_size)).astype("int")
-        # maxinds = max([len(i) for i in inds_all])
-        # inds2 = xp.zeros((batch_size, maxinds)).astype("int")
-        # if subpixel_weights:
-        #     weights_full = xp.empty(maxval_n * batch_size)
-        #     weights = weights_full
-        # else:
-        #     weights_full = None
-        #     weights = None
-
-        # if hist_r_max > 15:
-        #     split_bincount = True
-        #     off_inds = xp.triu_indices(maxinds, k=1)
-        # else:
-        #     split_bincount = False
-        #     off_inds = xp.where(~xp.eye(maxinds, dtype=bool))
-
         vprint(f"Num total atoms in sim = {len(positions)}")
-        if not np.all(pbcs):
-            vprint(f"Num non-edge atoms = {len(center_inds)}")
+        if not np.all(pbcs_np) and len(flat_axes) < 3:
+            vprint(f"Num valid center atoms = {len(center_inds)}")
         if skip != 1:
             vprint(
                 f"Skip = {skip}, so calculating using {len(center_inds_skip)} atoms as centers"
             )
-        # vprint(f'atomic density = {dens:.3} atoms / A^3')
         vprint("Final shape will be: ", hist_sig.shape)
 
         for a0 in range(0, len(center_inds_skip), batch_size):
@@ -200,8 +255,16 @@ class PDF3B(object):
                 r_floor2 = xp.round(r_ind2).astype("int")
                 theta_floor = xp.round(theta_ind).astype("int")
 
-            good_vals = (r_floor1 > 1e-9) & (r_floor2 > 1e-9) & (theta_floor > 0) & (theta_floor < 180)
-            good_inds = xp.where(good_vals)[0]  # Get the actual indices where good_vals is True
+            ### FIX 4: theta_floor is a BIN INDEX, so bound it by the number of
+            ### theta bins. The original compared it against the literal 180,
+            ### which was only correct for dtheta == 1.
+            good_vals = (
+                (r_floor1 > 1e-9)
+                & (r_floor2 > 1e-9)
+                & (theta_floor > 0)
+                & (theta_floor < num_bins_theta - 1)
+            )
+            good_inds = xp.where(good_vals)[0]
             nvals = len(good_inds)
             vals[0, :nvals] = theta_floor[good_inds]
             vals[1, :nvals] = r_floor2[good_inds]
@@ -211,19 +274,6 @@ class PDF3B(object):
                     dtheta_ind[good_inds] + dr_ind2[good_inds] + dr_ind1[good_inds]
                 ) / 3
                 weights = weights_full[:nvals]
-            # nvals = good_vals.sum()
-
-            # print(f"nvals: {nvals}, theta_floor[good_vals].shape: {theta_floor[good_vals].shape}")
-            # print(f"r_floor2[good_vals].shape: {r_floor2[good_vals].shape}, r_floor1[good_vals].shape: {r_floor1[good_vals].shape}")
-
-            # vals[0, :nvals] = theta_floor[good_vals]
-            # vals[1, :nvals] = r_floor2[good_vals]
-            # vals[2, :nvals] = r_floor1[good_vals]
-            # if subpixel_weights:
-            #     weights_full[:nvals] = (
-            #         dtheta_ind[good_vals] + dr_ind2[good_vals] + dr_ind1[good_vals]
-            #     ) / 3
-            #     weights = weights_full[:nvals]
 
             ### Because taking triu, have to do this twice
             ### and doing bincount twice with half indices seems to be ~10% faster than
@@ -234,33 +284,49 @@ class PDF3B(object):
                 weights=weights,
             )
             if split_bincount:
-                vals[[1,2]] = vals[[2,1]]
+                vals[[1, 2]] = vals[[2, 1]]
                 hist_sig += self._bincountdd(
                     vals[:, :nvals],
                     (num_bins_theta, num_bins_r, num_bins_r),
                     weights=weights,
                 )
 
-
         hist_sig /= len(center_inds_skip)
 
+        ### FIX 3: normalization
         gr = hist_sig.copy()
         r1 = hist_r[1:][None, None, ...]
         r2 = hist_r[1:][None, ..., None]
         th = hist_theta[1:-1, None, None]
-        gr[1:-1, 1:, 1:] /= (
-            dens**2
-            * dr**2
-            * 8 # if all off diag indices
-            # * 4 # if triu
-            * xp.pi**2
-            * r1**2
-            * r2**2
-            * xp.sin(xp.deg2rad(th))
-            * np.deg2rad(dtheta)
-        )
+        if len(flat_axes) == 1:
+            ### 2D ideal-gas pair measure:
+            ###   sigma^2 * (2 pi r1 dr) * (2 r2 dr dtheta)
+            ### -> linear in r, and no sin(theta): the out-of-plane solid-angle
+            ### band that produces sin(theta) in 3D does not exist for coplanar
+            ### vectors. The factor 2 folds +/- azimuth into [0, 180].
+            gr[1:-1, 1:, 1:] /= (
+                dens**2
+                * dr**2
+                * 4  # 2 * 2pi, for all off-diagonal (ordered) pairs; use 2 for triu only
+                * xp.pi
+                * r1
+                * r2
+                * np.deg2rad(dtheta)
+            )
+        else:
+            gr[1:-1, 1:, 1:] /= (
+                dens**2
+                * dr**2
+                * 8  # if all off diag indices
+                # * 4 # if triu
+                * xp.pi**2
+                * r1**2
+                * r2**2
+                * xp.sin(xp.deg2rad(th))
+                * np.deg2rad(dtheta)
+            )
 
-        ### required because dividing by sin(theta)
+        ### edge bins are half-width, and bin 0 is excluded by good_vals
         gr[-1] = 0
         gr[0] = 0
         gr[:, 0] = 0
@@ -279,9 +345,6 @@ class PDF3B(object):
         if np.any(pbcs):
             assert xp.all(xp.min(pointslists, axis=1) >= 0)
             assert xp.all(xp.max(pointslists, axis=1) <= bbox)
-        # assert xp.issubdtype(
-        #     pointslists, float
-        # ), f"pointslists type: {pointslists.dtype}"
         dif = pointslists - points[:, None]
         for i, ind in enumerate(pbcs):
             if ind:
