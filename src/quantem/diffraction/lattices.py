@@ -460,16 +460,19 @@ def make_images(
 
 
 def cluster_patterns(atoms, n_patterns, n_px=256, q_max=2.5, r_cluster=None,
-                     voltage=200e3, seed=0, random_orientation=True):
+                     voltage=200e3, seed=0, random_orientation=True, blur_px=0.0):
     """
     Kinematic diffraction patterns of spherical clusters cut from a periodic
     structure, each with a random centre and a random 3D orientation
     (random_clusters, same seed).
 
-    Projected atoms are deposited bilinearly on a grid at 2x Nyquist, Fourier
-    transformed and cropped to q_max. The bilinear kernel is divided out and
-    replaced by the Weickenmeier-Kohl electron scattering factor of each
-    element, so patterns follow f(q).
+    Projected atoms are rendered as sampled Gaussians (sigma 1.5 px, which is
+    band-limited well inside Nyquist, so crystal reflections do not alias) on
+    a grid at 2x Nyquist, Fourier transformed and cropped to q_max. The
+    Gaussian is divided out and replaced by the Weickenmeier-Kohl electron
+    scattering factor of each element, so patterns follow f(q). blur_px is the sigma (pixels) of a
+    Gaussian blur of each intensity pattern, which approximates the partial
+    coherence of the illumination.
 
     Returns
     -------
@@ -484,30 +487,44 @@ def cluster_patterns(atoms, n_patterns, n_px=256, q_max=2.5, r_cluster=None,
     qx = (torch.arange(n_big, dtype=torch.float64) - n_big // 2) * dq
     QX, QY = torch.meshgrid(qx, qx, indexing="ij")
     Q = torch.hypot(QX, QY)
-    bilinear = torch.sinc(QX * pix) ** 2 * torch.sinc(QY * pix) ** 2
+    sigma, half = 1.5, 6  # Gaussian atom width and patch half-width (px)
+    gaussian = torch.exp(-2 * np.pi**2 * (sigma * pix) ** 2 * Q**2)
     crop = slice(n_big // 2 - n_px // 2, n_big // 2 + n_px // 2)
     species = np.unique(atoms.numbers)
     filters = {
         z: (torch.from_numpy(compute_WK_factor(Q.numpy().ravel(), int(z), voltage, include_core=False,
-                                               include_phonon=False).real).reshape(Q.shape) / bilinear)[crop, crop]
+                                               include_phonon=False).real).reshape(Q.shape) / gaussian)[crop, crop]
         for z in species
     }
 
+    offsets = torch.arange(-half, half + 1)
+    n_pad = n_big + 2 * half + 2
+    if blur_px > 0:  # real-space Gaussian kernel, positive, so no ringing from the bright central beam
+        x = torch.arange(-int(np.ceil(4 * blur_px)), int(np.ceil(4 * blur_px)) + 1, dtype=torch.float64)
+        kernel = torch.exp(-(x**2) / (2 * blur_px**2))
+        kernel = (kernel / kernel.sum())[None, None, :]
     patterns = torch.empty((n_patterns, n_px, n_px), dtype=torch.float32)
     for k, (pos, z_atoms) in enumerate(random_clusters(atoms, n_patterns, r_cluster, seed, random_orientation)):
         xy = torch.as_tensor(pos[:, :2] / pix + n_big / 2)
         psi = 0
         for z in species:
             p = xy[torch.as_tensor(z_atoms == z)]
-            i0 = torch.floor(p).long()
-            f = p - i0
-            im = torch.zeros((n_big + 1) * (n_big + 1), dtype=torch.float64)
-            for di, dj, w in [(0, 0, (1 - f[:, 0]) * (1 - f[:, 1])), (0, 1, (1 - f[:, 0]) * f[:, 1]),
-                              (1, 0, f[:, 0] * (1 - f[:, 1])), (1, 1, f[:, 0] * f[:, 1])]:
-                im.index_add_(0, (i0[:, 0] + di) * (n_big + 1) + i0[:, 1] + dj, w)
-            im = im.reshape(n_big + 1, n_big + 1)[:n_big, :n_big]
+            i0 = torch.round(p).long()
+            rows = i0[:, 0, None] + offsets[None, :]  # (Natoms, patch)
+            cols = i0[:, 1, None] + offsets[None, :]
+            wr = torch.exp(-((rows - p[:, 0, None]) ** 2) / (2 * sigma**2))
+            wc = torch.exp(-((cols - p[:, 1, None]) ** 2) / (2 * sigma**2))
+            w = (wr[:, :, None] * wc[:, None, :]).reshape(-1) / (2 * np.pi * sigma**2)
+            idx = ((rows[:, :, None] + half + 1) * n_pad + cols[:, None, :] + half + 1).reshape(-1)
+            im = torch.zeros(n_pad * n_pad, dtype=torch.float64).index_add_(0, idx, w)
+            im = im.reshape(n_pad, n_pad)[half + 1:half + 1 + n_big, half + 1:half + 1 + n_big]
             psi = psi + torch.fft.fftshift(torch.fft.fft2(im))[crop, crop] * filters[z]
-        patterns[k] = torch.abs(psi) ** 2
+        intensity = torch.abs(psi) ** 2
+        if blur_px > 0:
+            pad = kernel.shape[-1] // 2
+            intensity = torch.nn.functional.conv1d(intensity[:, None, :], kernel, padding=pad)[:, 0, :]
+            intensity = torch.nn.functional.conv1d(intensity.T[:, None, :], kernel, padding=pad)[:, 0, :].T
+        patterns[k] = intensity
     return patterns.numpy(), dq
 
 
