@@ -681,7 +681,7 @@ class TestKnownAnswer:
         pdf.Ik = torch.tensor(S - 1, dtype=torch.float32)
         pdf.bg = torch.zeros(len(k))
         pdf.f = torch.ones(len(k))
-        pdf.fit_bg = lambda Ik, kmin=None, kmax=None: (pdf.bg, pdf.f)
+        pdf.fit_bg = lambda Ik, kmin=None, kmax=None, **kwargs: (pdf.bg, pdf.f)
         return pdf, k, S
 
     def test_G_matches_windowed_transform_of_true_S(self):

@@ -430,6 +430,10 @@ class PairDistributionFunction(AutoSerialize):
         Ik: torch.Tensor,
         kmin: float | None = None,
         kmax: float | None = None,
+        bg_model: str = "gaussian",
+        num_power_laws: int = 2,
+        fk: NDArray | None = None,
+        bg_weight: str = "default",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Fit a smooth background B(k) to a radial intensity curve I(k).
@@ -460,6 +464,8 @@ class PairDistributionFunction(AutoSerialize):
             Restrict the fit to k in [kmin, kmax]. The returned B(k) is
             still evaluated over the full k axis. If None, the full k
             range is used.
+        bg_model, num_power_laws, fk, bg_weight
+            Background model and fit weighting, see :meth:`fit_bg_batched`.
 
         Returns
         -------
@@ -471,7 +477,9 @@ class PairDistributionFunction(AutoSerialize):
         """
         # A single curve is just a batch of one
         Ik_row = torch.as_tensor(Ik)[None, :]
-        bg_stack, f_stack = self.fit_bg_batched(Ik_row, kmin=kmin, kmax=kmax)
+        bg_stack, f_stack = self.fit_bg_batched(
+            Ik_row, kmin=kmin, kmax=kmax, bg_model=bg_model, num_power_laws=num_power_laws, fk=fk, bg_weight=bg_weight
+        )
         self.bg, self.f = bg_stack[0], f_stack[0]
         return self.bg, self.f
 
@@ -480,6 +488,10 @@ class PairDistributionFunction(AutoSerialize):
         Ik_stack: torch.Tensor,
         kmin: float | None = None,
         kmax: float | None = None,
+        bg_model: str = "gaussian",
+        num_power_laws: int = 2,
+        fk: NDArray | None = None,
+        bg_weight: str = "default",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fit B(k) for a stack of N radial curves at once (vectorized LM).
 
@@ -500,6 +512,26 @@ class PairDistributionFunction(AutoSerialize):
             (N, Nk) radial means, one row per curve.
         kmin, kmax
             Fit range.
+        bg_model
+            "gaussian": B(k) = c + i0 exp(-k^2 / 2 s0^2) + i1 exp(-k^4 / 2 s1^4),
+            the py4DSTEM model.
+            "power": B(k) = c + sum_i a_i (1 + k^2 / s_i^2)^(-p_i), with
+            num_power_laws (1 or 2) terms. Every parameter is positive, so the
+            single-scattering term f(k) = B(k) - c is positive and decreases
+            monotonically, and it falls off as a power of k like the atomic
+            scattering factors rather than exponentially.
+            "known": B(k) = N fk(k)^2 + c, the standard normalization by the
+            composition-averaged scattering factor, for a known composition.
+            Only N >= 0 and c >= 0 are fit (weighted linear least squares).
+        fk
+            Mean atomic scattering factor <f(k)> on the k axis of the polar
+            data, required for bg_model="known". For several elements pass
+            sqrt(<f^2>).
+        bg_weight
+            Residual weighting of the fit. "default" (py4DSTEM) divides by a line
+            that falls with k. "k" weights by k. "k/I" weights by k / I(k), the
+            error in F(k) = k [I(k) - B(k)] / f(k)^2 for B close to I. All use
+            the low-k taper.
 
         Returns
         -------
@@ -520,10 +552,41 @@ class PairDistributionFunction(AutoSerialize):
         # first 0.25 1/A above kmin suppresses the central-beam tail, and dividing
         # by a line that falls with k favours high k.
         taper = torch.sin(0.5 * torch.pi * torch.clamp((k_fit - kmin) / 0.25, 0.0, 1.0)) ** 2
-        resid_weights = torch.where(taper > 1e-4, taper, 0.0) / (k_fit[-1] - 0.9 * k_fit + dk)
+        taper = torch.where(taper > 1e-4, taper, 0.0)
         Ik = torch.as_tensor(Ik_stack, dtype=torch.float64, device=self.device)
         Ik_fit = Ik[:, fit_mask].clamp(min=1e-10)  # (N, Nf)
+        if bg_weight == "default":
+            resid_weights = taper / (k_fit[-1] - 0.9 * k_fit + dk)
+        elif bg_weight == "k":
+            resid_weights = taper * k_fit
+        elif bg_weight == "k/I":  # one curve's weights, shared by the batch
+            resid_weights = taper * k_fit / Ik_fit.mean(dim=0)
+        else:
+            raise ValueError(f"bg_weight must be 'default', 'k' or 'k/I', got {bg_weight!r}")
+        resid_weights = resid_weights / resid_weights.max()
         n = Ik_fit.shape[0]  # number of Ik in batch
+
+        if bg_model == "power":
+            return self._fit_bg_power(k, k_fit, Ik_fit, resid_weights, num_power_laws)
+        if bg_model == "known":
+            if fk is None:
+                raise ValueError("bg_model='known' needs fk, the scattering factor on the k axis")
+            f2 = torch.as_tensor(np.asarray(fk), dtype=torch.float64, device=self.device) ** 2
+            A = torch.stack([f2[fit_mask], torch.ones_like(k_fit)], dim=1) * resid_weights[:, None]
+            coef = torch.linalg.lstsq(A, (Ik_fit * resid_weights[None, :]).T).solution  # (2, N)
+            scale = coef[0].clamp(min=1e-30)
+            c = coef[1].clamp(min=0.0)
+            # refit the scale alone where the constant was clamped to zero
+            refit = coef[1] < 0
+            scale = torch.where(
+                refit,
+                (Ik_fit * resid_weights**2 * f2[fit_mask]).sum(1) / (resid_weights**2 * f2[fit_mask] ** 2).sum(),
+                scale,
+            )
+            f = scale[:, None] * f2[None, :]
+            return (f + c[:, None]).to(dtype=torch.float32), f.to(dtype=torch.float32)
+        if bg_model != "gaussian":
+            raise ValueError(f"bg_model must be 'gaussian', 'power' or 'known', got {bg_model!r}")
 
         # Build Jacobian
         # Initial guesses: constant = min(I), amplitudes = median(I) - min(I), widths = mean(k).
@@ -634,6 +697,79 @@ class PairDistributionFunction(AutoSerialize):
             f = (bg - c[:, None]).clamp(min=1e-10 * bg.amax(dim=1, keepdim=True))
         return bg.to(dtype=torch.float32), f.to(dtype=torch.float32)
 
+    def _fit_bg_power(self, k, k_fit, Ik_fit, resid_weights, num_power_laws):
+        """Power-law background B(k) = c + sum_i a_i (1 + k^2 / s_i^2)^(-p_i),
+        fit by batched Levenberg-Marquardt on log-parameters (all positive)."""
+        if num_power_laws not in (1, 2):
+            raise ValueError("num_power_laws must be 1 or 2")
+        n = Ik_fit.shape[0]
+        k2_fit, k2 = k_fit**2, k**2
+
+        def model(theta, kk2):
+            # theta: (P,) log-parameters [c, a_1, s_1, p_1, (a_2, s_2, p_2)]
+            par = torch.exp(theta)
+            B = par[0] + 0 * kk2
+            for i in range(num_power_laws):
+                a, s, pw = par[1 + 3 * i], par[2 + 3 * i], par[3 + 3 * i]
+                B = B + a * (1.0 + kk2 / s**2) ** (-pw)
+            return B
+
+        def residual(theta, Ik_row):
+            return (model(theta, k2_fit) - Ik_row) * resid_weights
+
+        jac_fn = torch.func.vmap(torch.func.jacrev(residual), in_dims=(0, 0))
+        res_fn = torch.func.vmap(residual, in_dims=(0, 0))
+
+        # initial guesses: constant = min(I), a steep term near the central beam and a slower tail
+        c0 = Ik_fit.amin(dim=1).clamp(min=1e-10)
+        amp = (Ik_fit[:, 0] - c0).clamp(min=1e-10)
+        cols = [c0]
+        for s0, p0 in [(0.3, 2.0), (1.0, 1.0)][:num_power_laws]:
+            cols += [amp / num_power_laws, torch.full_like(c0, s0), torch.full_like(c0, p0)]
+        theta = torch.log(torch.stack(cols, dim=1))  # (N, P)
+        n_par = theta.shape[1]
+
+        def loss_fn(th):
+            r = res_fn(th, Ik_fit)
+            return (r * r).sum(dim=1)
+
+        lam = torch.ones(n, dtype=torch.float64, device=self.device)
+        loss = loss_fn(theta)
+        eye = 1e-12 * torch.eye(n_par, dtype=torch.float64, device=self.device)
+        for _ in range(300):
+            r = res_fn(theta, Ik_fit)
+            jac = jac_fn(theta, Ik_fit)  # (N, Nf, P)
+            JtJ = torch.einsum("nki,nkj->nij", jac, jac)
+            Jtr = torch.einsum("nki,nk->ni", jac, r)
+            diag = torch.diagonal(JtJ, dim1=1, dim2=2).clamp(min=1e-12)
+            theta_base, prev_loss = theta, loss
+            accepted = torch.zeros(n, dtype=torch.bool, device=self.device)
+            for _ in range(30):
+                delta = torch.linalg.solve(JtJ + lam[:, None, None] * torch.diag_embed(diag) + eye, Jtr)
+                step = (1.0 / delta.abs().amax(dim=1).clamp(min=1e-30)).clamp(max=1.0)
+                theta_trial = theta_base - delta * step[:, None]
+                loss_trial = loss_fn(theta_trial)
+                improved = torch.isfinite(loss_trial) & (loss_trial < loss) & (~accepted)
+                theta = torch.where(improved[:, None], theta_trial, theta)
+                loss = torch.where(improved, loss_trial, loss)
+                accepted = accepted | improved
+                lam = torch.where(
+                    improved,
+                    (lam * 0.3).clamp(min=1e-12),
+                    torch.where(~accepted, (lam * 3.0).clamp(max=1e12), lam),
+                )
+                if bool(accepted.all()):
+                    break
+            if not bool(accepted.any()):
+                break
+            if float(((prev_loss - loss) / (prev_loss + 1e-30)).max()) < 1e-10:
+                break
+
+        with torch.no_grad():
+            bg = torch.stack([model(th, k2) for th in theta])  # (N, Nk)
+            f = (bg - torch.exp(theta[:, :1])).clamp(min=1e-10 * bg.amax(dim=1, keepdim=True))
+        return bg.to(dtype=torch.float32), f.to(dtype=torch.float32)
+
     def calculate_Gr(
         self,
         k_min_fit: float | None = None,
@@ -650,6 +786,10 @@ class PairDistributionFunction(AutoSerialize):
         r_cut: float = 0.8,
         max_iter: int = 6,
         returnval: bool = False,
+        bg_model: str = "gaussian",
+        num_power_laws: int = 2,
+        fk: NDArray | None = None,
+        bg_weight: str = "default",
     ) -> list[NDArray] | None:
         """
         Calculate the reduced pair distribution function G(r) from a 4D-STEM dataset.
@@ -710,6 +850,10 @@ class PairDistributionFunction(AutoSerialize):
             :meth:`damp_origin_oscillations`.
         returnval : bool, optional
             If True, return ``[r, G(r)]`` as numpy arrays.
+        bg_model, num_power_laws, fk, bg_weight : optional
+            Background model: "gaussian" (default), "power" with 1 or 2 power
+            laws, or "known" with the scattering factor fk; see
+            :meth:`fit_bg_batched`. bg_weight sets the fit weighting.
 
         Returns
         -------
@@ -758,7 +902,8 @@ class PairDistributionFunction(AutoSerialize):
         else:
             Ik = self.calculate_radial_mean(mask_realspace=mask_bool, returnval=True)
         # always refit the background fit bc it is cheap
-        bg, f = self.fit_bg(Ik, self.kmin_fit, self.kmax_fit)
+        bg, f = self.fit_bg(Ik, self.kmin_fit, self.kmax_fit, bg_model=bg_model, num_power_laws=num_power_laws, fk=fk,
+                            bg_weight=bg_weight)
         # prevent division by near-zero values which cause NaNs at high k
         f_safe = torch.clamp(f, min=1e-10 * f.max())
 
@@ -815,6 +960,25 @@ class PairDistributionFunction(AutoSerialize):
             )
             return [to_numpy(self._r), to_numpy(Gr)]
         return None
+
+    def windowed_model_pdf(self, r_model: NDArray, g_model: NDArray, density: float) -> NDArray:
+        """
+        g(r) of a model after the same k range and window as the last
+        calculate_Gr, on self.r, for comparison with the measured PDF:
+        G(r) = 4 pi r rho0 [g(r) - 1] -> F(k) -> windowed F(k) -> G(r).
+
+        r_model, g_model : uniform r grid (Angstroms) and model g(r).
+        density : number density rho0 (atoms / A^3).
+        """
+        r_m = torch.as_tensor(np.asarray(r_model), dtype=torch.float64)
+        G_m = 4 * np.pi * r_m * density * (torch.as_tensor(np.asarray(g_model), dtype=torch.float64) - 1)
+        k = torch.as_tensor(np.asarray(self.qq), dtype=torch.float64)
+        dr, dk = float(r_m[1] - r_m[0]), float(k[1] - k[0])
+        F = torch.sin(2 * np.pi * torch.outer(k, r_m)) @ G_m * dr  # F(Q), Q = 2 pi k
+        w = self._k_window(k.float(), self.kmin_window, self.kmax_window).double()
+        r = torch.as_tensor(np.asarray(self.r), dtype=torch.float64)
+        G = (2 / np.pi) * (torch.sin(2 * np.pi * torch.outer(r, k)) @ (F * w)) * 2 * np.pi * dk
+        return (1 + G / (4 * np.pi * torch.clamp(r, min=1e-6) * density)).numpy()
 
     def calculate_gr(
         self,
