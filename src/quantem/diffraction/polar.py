@@ -35,7 +35,7 @@ class PairDistributionFunction(AutoSerialize):
 
     - polar transform of the diffraction patterns
     - azimuthal averaging to obtain I(k)
-    - parametric background fit B(k) (Gaussian model in k² and k⁴)
+    - parametric background fit B(k) (by default a constant plus a power law)
     - reduced structure factor F(k) = 2π · k · [S(k) − 1]
     - windowed sine transform of F(k) to recover the reduced PDF G(r)
     - optional low-r correction of S(k) for a known density (Kaplow 1965 /
@@ -430,29 +430,29 @@ class PairDistributionFunction(AutoSerialize):
         Ik: torch.Tensor,
         kmin: float | None = None,
         kmax: float | None = None,
-        bg_model: str = "gaussian",
-        num_power_laws: int = 2,
+        bg_model: str = "power",
+        num_power_laws: int = 1,
         fk: NDArray | None = None,
-        bg_weight: str = "default",
+        bg_weight: str = "k/I",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Fit a smooth background B(k) to a radial intensity curve I(k).
 
-        The background model is a constant plus two monotonically decaying
-        terms (adopted from py4DSTEM):
+        The default background model is a constant plus a power law,
 
-            B(k) = c
-                 + i0 * exp(-k^2 / (2 s0^2))
-                 + i1 * exp(-k^4 / (2 s1^4))
+            B(k) = c + a * (1 + k^2 / s^2)^(-p),
 
-        B(k) is later subtracted from I(k) to isolate the diffuse signal, and
-        f(k) = B(k) - c is used as the denominator in the structure factor
-        S(k) = 1 + [I(k) − B(k)] / f(k).
+        with every parameter positive, so f(k) = B(k) - c is positive and
+        decreases monotonically. B(k) is later subtracted from I(k) to isolate
+        the diffuse signal, and f(k) is used as the denominator in the
+        structure factor S(k) = 1 + [I(k) − B(k)] / f(k). A second power law,
+        the py4DSTEM Gaussian model, or tabulated scattering factors can be
+        chosen with bg_model (see :meth:`fit_bg_batched`).
 
-        The five parameters are fit by weighted least squares over k in [kmin, kmax].
-        Each residual is weighted by a sin² low-k taper that downweights the central
-        beam, divided by a linear factor that falls with k so that higher k counts
-        more (see :meth:`fit_bg_batched`). This is the single-curve convenience over
+        The parameters are fit by weighted least squares over k in [kmin, kmax].
+        By default each residual is weighted by k / I(k), the error in F(k), times
+        a sin² low-k taper that downweights the central beam. This is the
+        single-curve convenience over
         :meth:`fit_bg_batched`, which holds the torch-native Levenberg-Marquardt solver.
 
         Parameters
@@ -488,10 +488,10 @@ class PairDistributionFunction(AutoSerialize):
         Ik_stack: torch.Tensor,
         kmin: float | None = None,
         kmax: float | None = None,
-        bg_model: str = "gaussian",
-        num_power_laws: int = 2,
+        bg_model: str = "power",
+        num_power_laws: int = 1,
         fk: NDArray | None = None,
-        bg_weight: str = "default",
+        bg_weight: str = "k/I",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Fit B(k) for a stack of N radial curves at once (vectorized LM).
 
@@ -514,8 +514,9 @@ class PairDistributionFunction(AutoSerialize):
             Fit range.
         bg_model
             "gaussian": B(k) = c + i0 exp(-k^2 / 2 s0^2) + i1 exp(-k^4 / 2 s1^4),
-            the py4DSTEM model.
-            "power": B(k) = c + sum_i a_i (1 + k^2 / s_i^2)^(-p_i), with
+            the py4DSTEM model, which falls off too fast to follow the atomic
+            scattering factors at high k.
+            "power" (default): B(k) = c + sum_i a_i (1 + k^2 / s_i^2)^(-p_i), with
             num_power_laws (1 or 2) terms. Every parameter is positive, so the
             single-scattering term f(k) = B(k) - c is positive and decreases
             monotonically, and it falls off as a power of k like the atomic
@@ -528,10 +529,10 @@ class PairDistributionFunction(AutoSerialize):
             data, required for bg_model="known". For several elements pass
             sqrt(<f^2>).
         bg_weight
-            Residual weighting of the fit. "default" (py4DSTEM) divides by a line
-            that falls with k. "k" weights by k. "k/I" weights by k / I(k), the
-            error in F(k) = k [I(k) - B(k)] / f(k)^2 for B close to I. All use
-            the low-k taper.
+            Residual weighting of the fit. "k/I" (default) weights by k / I(k),
+            the error in F(k) = k [I(k) - B(k)] / f(k)^2 for B close to I. "k"
+            weights by k. "default" (py4DSTEM) divides by a line that falls
+            with k. All use the low-k taper.
 
         Returns
         -------
@@ -555,15 +556,16 @@ class PairDistributionFunction(AutoSerialize):
         taper = torch.where(taper > 1e-4, taper, 0.0)
         Ik = torch.as_tensor(Ik_stack, dtype=torch.float64, device=self.device)
         Ik_fit = Ik[:, fit_mask].clamp(min=1e-10)  # (N, Nf)
+        # residual weights, one row per curve: (N, Nf)
         if bg_weight == "default":
-            resid_weights = taper / (k_fit[-1] - 0.9 * k_fit + dk)
+            resid_weights = (taper / (k_fit[-1] - 0.9 * k_fit + dk)).expand_as(Ik_fit)
         elif bg_weight == "k":
-            resid_weights = taper * k_fit
-        elif bg_weight == "k/I":  # one curve's weights, shared by the batch
-            resid_weights = taper * k_fit / Ik_fit.mean(dim=0)
+            resid_weights = (taper * k_fit).expand_as(Ik_fit)
+        elif bg_weight == "k/I":
+            resid_weights = taper * k_fit / Ik_fit
         else:
             raise ValueError(f"bg_weight must be 'default', 'k' or 'k/I', got {bg_weight!r}")
-        resid_weights = resid_weights / resid_weights.max()
+        resid_weights = resid_weights / resid_weights.amax(dim=1, keepdim=True)
         n = Ik_fit.shape[0]  # number of Ik in batch
 
         if bg_model == "power":
@@ -572,17 +574,17 @@ class PairDistributionFunction(AutoSerialize):
             if fk is None:
                 raise ValueError("bg_model='known' needs fk, the scattering factor on the k axis")
             f2 = torch.as_tensor(np.asarray(fk), dtype=torch.float64, device=self.device) ** 2
-            A = torch.stack([f2[fit_mask], torch.ones_like(k_fit)], dim=1) * resid_weights[:, None]
-            coef = torch.linalg.lstsq(A, (Ik_fit * resid_weights[None, :]).T).solution  # (2, N)
-            scale = coef[0].clamp(min=1e-30)
-            c = coef[1].clamp(min=0.0)
+            basis = torch.stack([f2[fit_mask], torch.ones_like(k_fit)], dim=1)  # (Nf, 2)
+            A = basis[None, :, :] * resid_weights[:, :, None]  # (N, Nf, 2)
+            coef = torch.linalg.lstsq(A, (Ik_fit * resid_weights)[:, :, None]).solution[:, :, 0]  # (N, 2)
+            c = coef[:, 1].clamp(min=0.0)
             # refit the scale alone where the constant was clamped to zero
-            refit = coef[1] < 0
+            w2f = resid_weights**2 * f2[fit_mask]
             scale = torch.where(
-                refit,
-                (Ik_fit * resid_weights**2 * f2[fit_mask]).sum(1) / (resid_weights**2 * f2[fit_mask] ** 2).sum(),
-                scale,
-            )
+                coef[:, 1] < 0,
+                (Ik_fit * w2f).sum(1) / (w2f * f2[fit_mask]).sum(1),
+                coef[:, 0],
+            ).clamp(min=1e-30)
             f = scale[:, None] * f2[None, :]
             return (f + c[:, None]).to(dtype=torch.float32), f.to(dtype=torch.float32)
         if bg_model != "gaussian":
@@ -616,7 +618,7 @@ class PairDistributionFunction(AutoSerialize):
                 )
             )
             B = c[:, None] + i0[:, None] * E0 + i1[:, None] * E1
-            w = resid_weights[None, :]  # residual weights, broadcast over the batch
+            w = resid_weights  # (N, Nf) residual weights
             r = (B - Ik_fit) * w
             t0 = i0[:, None] * E0
             t1 = i1[:, None] * E1
@@ -714,11 +716,11 @@ class PairDistributionFunction(AutoSerialize):
                 B = B + a * (1.0 + kk2 / s**2) ** (-pw)
             return B
 
-        def residual(theta, Ik_row):
-            return (model(theta, k2_fit) - Ik_row) * resid_weights
+        def residual(theta, Ik_row, w_row):
+            return (model(theta, k2_fit) - Ik_row) * w_row
 
-        jac_fn = torch.func.vmap(torch.func.jacrev(residual), in_dims=(0, 0))
-        res_fn = torch.func.vmap(residual, in_dims=(0, 0))
+        jac_fn = torch.func.vmap(torch.func.jacrev(residual), in_dims=(0, 0, 0))
+        res_fn = torch.func.vmap(residual, in_dims=(0, 0, 0))
 
         # initial guesses: constant = min(I), a steep term near the central beam and a slower tail
         c0 = Ik_fit.amin(dim=1).clamp(min=1e-10)
@@ -730,15 +732,15 @@ class PairDistributionFunction(AutoSerialize):
         n_par = theta.shape[1]
 
         def loss_fn(th):
-            r = res_fn(th, Ik_fit)
+            r = res_fn(th, Ik_fit, resid_weights)
             return (r * r).sum(dim=1)
 
         lam = torch.ones(n, dtype=torch.float64, device=self.device)
         loss = loss_fn(theta)
         eye = 1e-12 * torch.eye(n_par, dtype=torch.float64, device=self.device)
         for _ in range(300):
-            r = res_fn(theta, Ik_fit)
-            jac = jac_fn(theta, Ik_fit)  # (N, Nf, P)
+            r = res_fn(theta, Ik_fit, resid_weights)
+            jac = jac_fn(theta, Ik_fit, resid_weights)  # (N, Nf, P)
             JtJ = torch.einsum("nki,nkj->nij", jac, jac)
             Jtr = torch.einsum("nki,nk->ni", jac, r)
             diag = torch.diagonal(JtJ, dim1=1, dim2=2).clamp(min=1e-12)
@@ -786,10 +788,10 @@ class PairDistributionFunction(AutoSerialize):
         r_cut: float = 0.8,
         max_iter: int = 6,
         returnval: bool = False,
-        bg_model: str = "gaussian",
-        num_power_laws: int = 2,
+        bg_model: str = "power",
+        num_power_laws: int = 1,
         fk: NDArray | None = None,
-        bg_weight: str = "default",
+        bg_weight: str = "k/I",
     ) -> list[NDArray] | None:
         """
         Calculate the reduced pair distribution function G(r) from a 4D-STEM dataset.
@@ -851,8 +853,8 @@ class PairDistributionFunction(AutoSerialize):
         returnval : bool, optional
             If True, return ``[r, G(r)]`` as numpy arrays.
         bg_model, num_power_laws, fk, bg_weight : optional
-            Background model: "gaussian" (default), "power" with 1 or 2 power
-            laws, or "known" with the scattering factor fk; see
+            Background model: "power" with 1 (default) or 2 power laws,
+            "gaussian", or "known" with the scattering factor fk; see
             :meth:`fit_bg_batched`. bg_weight sets the fit weighting.
 
         Returns
@@ -960,25 +962,6 @@ class PairDistributionFunction(AutoSerialize):
             )
             return [to_numpy(self._r), to_numpy(Gr)]
         return None
-
-    def windowed_model_pdf(self, r_model: NDArray, g_model: NDArray, density: float) -> NDArray:
-        """
-        g(r) of a model after the same k range and window as the last
-        calculate_Gr, on self.r, for comparison with the measured PDF:
-        G(r) = 4 pi r rho0 [g(r) - 1] -> F(k) -> windowed F(k) -> G(r).
-
-        r_model, g_model : uniform r grid (Angstroms) and model g(r).
-        density : number density rho0 (atoms / A^3).
-        """
-        r_m = torch.as_tensor(np.asarray(r_model), dtype=torch.float64)
-        G_m = 4 * np.pi * r_m * density * (torch.as_tensor(np.asarray(g_model), dtype=torch.float64) - 1)
-        k = torch.as_tensor(np.asarray(self.qq), dtype=torch.float64)
-        dr, dk = float(r_m[1] - r_m[0]), float(k[1] - k[0])
-        F = torch.sin(2 * np.pi * torch.outer(k, r_m)) @ G_m * dr  # F(Q), Q = 2 pi k
-        w = self._k_window(k.float(), self.kmin_window, self.kmax_window).double()
-        r = torch.as_tensor(np.asarray(self.r), dtype=torch.float64)
-        G = (2 / np.pi) * (torch.sin(2 * np.pi * torch.outer(r, k)) @ (F * w)) * 2 * np.pi * dk
-        return (1 + G / (4 * np.pi * torch.clamp(r, min=1e-6) * density)).numpy()
 
     def calculate_gr(
         self,
@@ -1116,7 +1099,8 @@ class PairDistributionFunction(AutoSerialize):
 
         k = torch.from_numpy(np.asarray(self.qq).astype(np.float32)).to(device=self.device)
         dk = k[1] - k[0]
-        k_fit_mask = (k >= self.kmin_fit) & (k <= self.kmax_window)
+        # correct S(k) over the transformed (window) range, which can be wider than the bg fit range
+        k_fit_mask = (k >= self.kmin_window) & (k <= self.kmax_window)
         k_fit = k[k_fit_mask]
         ka, ra = torch.meshgrid(k, self._r, indexing="ij")
 
