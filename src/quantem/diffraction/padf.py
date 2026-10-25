@@ -45,6 +45,7 @@ class PairAngleDistributionFunction(AutoSerialize):
                  r_min: float = 0.0,
                  r_max: float = 20.0,
                  r_step: float = 0.02,
+                 l_taper: bool = False,
                  ):
         super().__init__()
 
@@ -57,14 +58,14 @@ class PairAngleDistributionFunction(AutoSerialize):
         self.polar_rescaled = self.rescale_intensity(self.polar, rho=rho, fq=fq)
 
         self.ang_corr = ang_corr if ang_corr is not None else self.compute_avg_angular_correlation(self.polar_rescaled)
-        self.ang_corr_corrected = self.subtract_angular_mean(self.ang_corr)
+        self.ang_corr_corrected = self.subtract_angular_median(self.ang_corr)
         self.Bl_mats = Bl_mats if Bl_mats is not None else self.extract_Bl_matrices(self.ang_corr_corrected, l_max=l_max)
         # radial q calibration of the polar dataset: bin i sits at q_min + i * dq
         dq = float(np.asarray(self.polar.sampling)[3])
         q_min = float(np.asarray(self.polar.origin)[3])
         self.real_Bl_mats = self.transform_to_real_space(self.Bl_mats[0], self.Bl_mats[1], dq=dq, q_min=q_min,
                                                          r_min=r_min, r_max=r_max, r_step=r_step)
-        self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20) # TODO: determine atoms in beam
+        self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20, l_taper=l_taper) # TODO: determine atoms in beam
     
     @staticmethod
     def rescale_intensity(data: Polar4dstem | Dataset4dstem | None = None,
@@ -146,6 +147,16 @@ class PairAngleDistributionFunction(AutoSerialize):
         polynomials.
         """
         return C_avg - C_avg.mean(dim=0, keepdim=True)
+
+    @staticmethod
+    def subtract_angular_median(C_avg: torch.Tensor):
+        """
+        Subtract the theta-median from each (q, q') ring of the angular
+        correlation. Unlike the mean, the median is not pulled up by the
+        self-correlation peak at theta = 0. The offset only changes B_0, so
+        the PADF (l >= 2) is the same as with subtract_angular_mean.
+        """
+        return C_avg - C_avg.median(dim=0, keepdim=True).values
 
     def extract_Bl_matrices(self, C_avg, l_max=40, sv_cutoff=0.05, sin_weight=True,
                             theta_exclude=0.0):
@@ -240,7 +251,7 @@ class PairAngleDistributionFunction(AutoSerialize):
         
         return real_Bl
 
-    def reconstruct_PADF(self, real_Bl, l_values, Na, per_theta=True):
+    def reconstruct_PADF(self, real_Bl, l_values, Na, per_theta=True, l_taper=False):
         """
         Reconstruct the pair-angle distribution function from B_l(r, r')
         For each theta:
@@ -254,8 +265,13 @@ class PairAngleDistributionFunction(AutoSerialize):
             The Legendre sum is the real-space correlation C(r, r', cos theta)
             (pypadf paper eq. 10). If True, multiply by |sin theta| to return a
             quantity proportional to Theta(r, r', theta) (pypadf paper eq. 11).
+        l_taper : bool
+            Weight each order by order_taper(l, l_max), which suppresses the
+            ringing in theta from truncating the Legendre sum at l_max.
         """
         padf = torch.zeros((real_Bl.shape[1], real_Bl.shape[2], 180), dtype=torch.float64)
+        l_values = np.asarray(l_values).astype(int)
+        weights = order_taper(l_values, l_values[-1] + 2) if l_taper else np.ones(len(l_values))
         theta = np.linspace(0, np.pi, 180)
         self.theta = theta
         self.theta_deg = np.degrees(theta)
@@ -267,7 +283,7 @@ class PairAngleDistributionFunction(AutoSerialize):
             coeffs = np.zeros(chosen_l_values[-1] + 1)
             coeffs[chosen_l_values[l]] = 1
             Pl = torch.tensor(legval(cos_theta, coeffs))
-            Bl = real_Bl[l + 1] # skipping l = 0
+            Bl = real_Bl[l + 1] * weights[l + 1] # skipping l = 0
             padf += Bl[:, :, np.newaxis] * Pl[np.newaxis, np.newaxis, :]
 
         padf *= 2 * torch.pi * Na
@@ -441,45 +457,87 @@ class PairAngleDistributionFunction(AutoSerialize):
     def simple_plot(
         self,
         padf=None,
-        r_display_power: int = 2,
+        r_display_power: int = 1,
         r_max_display: float | None = None,
+        r_fixed: float | None = None,
         theta_marks=None,
-        title: str | None = None,
-        figsize: tuple[float, float] = (6, 4.5),
+        r_marks=None,
+        title=None,
+        axsize: tuple[float, float] = (4.5, 3.5),
         returnfig: bool = False,
     ):
         """
-        Plot the r = r' diagonal of the PADF as a 2D map, r on the x-axis and
-        theta on the y-axis, weighted by r^(2 * r_display_power) for display.
+        Map of the PADF against theta (y-axis) and r (x-axis): the r = r'
+        diagonal Theta(r, r, theta), or Theta(r_fixed, r', theta) when r_fixed
+        is given. The display is weighted by r^(2 * r_display_power), or by
+        (r_fixed r')^r_display_power for a fixed-r slice.
 
-        padf : (Nr, Nr, Ntheta) array or None
-            Volume on the same (r, theta) grid, e.g. a model g3; defaults to self.padf.
-        theta_marks : sequence of float or None
-            Angles (degrees) marked with dotted lines.
-        Color limits are symmetric, from the largest |value| at 15-165 deg.
+        padf : (Nr, Nr, Ntheta) array, or a list of them, or None
+            Volumes on the same (r, theta) grid, e.g. a model PADF, drawn in
+            separate panels; defaults to self.padf.
+        theta_marks, r_marks : sequence of float or None
+            Angles (degrees) and radii (Angstroms) marked with dotted lines.
+        Each panel has symmetric color limits from its largest |value| at
+        15-165 deg and r <= r_max_display.
         """
-        vol = self.padf if padf is None else padf
-        vol = vol.numpy() if isinstance(vol, torch.Tensor) else np.asarray(vol)
+        vols = [self.padf] if padf is None else (list(padf) if isinstance(padf, (list, tuple)) else [padf])
+        titles = title if isinstance(title, (list, tuple)) else [title] * len(vols)
         r = np.asarray(self.r)
         theta_deg = np.asarray(self.theta_deg)
         rs = r <= (r.max() if r_max_display is None else r_max_display)
-
-        # padf[i, i, k] for every distance i and angle k -> (Nr, Ntheta)
-        diag = np.einsum("iik->ik", vol)[rs] * (r[rs] ** (2 * r_display_power))[:, None]
         interior = (theta_deg > 15) & (theta_deg < 165)
-        vmax = np.abs(diag[:, interior]).max()
 
+        fig, axs = plt.subplots(1, len(vols), figsize=(axsize[0] * len(vols), axsize[1]),
+                                squeeze=False, constrained_layout=True)
+        for ax, vol, t in zip(axs[0], vols, titles):
+            vol = vol.numpy() if isinstance(vol, torch.Tensor) else np.asarray(vol)
+            if r_fixed is None:
+                m = np.einsum("iik->ik", vol)[rs] * (r[rs] ** (2 * r_display_power))[:, None]
+                xlabel, label = "r = r' (Å)", rf"$\Theta(r, r, \theta) \cdot r^{{{2 * r_display_power}}}$"
+            else:
+                i0 = int(np.argmin(np.abs(r - r_fixed)))
+                m = vol[i0][rs] * ((r[i0] * r[rs]) ** r_display_power)[:, None]
+                xlabel, label = f"r' (Å), r = {r[i0]:.2f} Å", rf"$\Theta(r, r', \theta) \cdot (r r')^{{{r_display_power}}}$"
+            vmax = np.abs(m[:, interior]).max()
+            im = ax.pcolormesh(r[rs], theta_deg, m.T, cmap="RdBu_r", vmin=-vmax, vmax=vmax,
+                               shading="auto")
+            for th in theta_marks or []:
+                ax.axhline(th, color="k", ls=":", lw=1)
+            for rm in r_marks or []:
+                ax.axvline(rm, color="k", ls=":", lw=1)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(r"$\theta$ (deg)")
+            ax.set_yticks(np.arange(0, 181, 45))
+            fig.colorbar(im, ax=ax, label=label)
+            if t is not None:
+                ax.set_title(t)
+        if returnfig:
+            return fig, axs[0]
+        plt.show()
+
+    def plot_angular_correlation(
+        self,
+        q: float,
+        figsize: tuple[float, float] = (5, 3.5),
+        returnfig: bool = False,
+    ):
+        """
+        Median-subtracted angular correlation C(dphi, q, q') at the radial bin
+        nearest q (1/Angstroms), against q' (x-axis) and dphi (y-axis).
+        """
+        C = self.ang_corr_corrected.numpy()
+        q_axis = float(np.asarray(self.polar.origin)[3]) + np.arange(C.shape[1]) * float(np.asarray(self.polar.sampling)[3])
+        iq = int(np.argmin(np.abs(q_axis - q)))
+        dphi = np.arange(C.shape[0]) * 360.0 / C.shape[0]
+        M = C[:, iq, :]
+        vmax = np.quantile(np.abs(M), 0.995)
         fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-        im = ax.pcolormesh(r[rs], theta_deg, diag.T, cmap="RdBu_r", vmin=-vmax, vmax=vmax,
-                           shading="auto")
-        for t in theta_marks or []:
-            ax.axhline(t, color="k", ls=":", lw=1)
-        ax.set_xlabel("r = r' (Å)")
-        ax.set_ylabel(r"$\theta$ (deg)")
-        ax.set_yticks(np.arange(0, 181, 45))
-        fig.colorbar(im, ax=ax, label=rf"$\Theta(r, r, \theta) \cdot r^{{{2 * r_display_power}}}$")
-        if title is not None:
-            ax.set_title(title)
+        im = ax.pcolormesh(q_axis, dphi, M, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
+        ax.set_xlabel("q' (1/Å)")
+        ax.set_ylabel(r"$\Delta\phi$ (deg)")
+        ax.set_yticks(np.arange(0, 361, 90))
+        ax.set_title(f"q = {q_axis[iq]:.3f} 1/Å")
+        fig.colorbar(im, ax=ax, label=r"$C(\Delta\phi, q, q')$")
         if returnfig:
             return fig, ax
         plt.show()
@@ -529,6 +587,11 @@ def bandlimit_volume(
     return out.numpy()
 
 
+def order_taper(orders, order_max):
+    """cos^2 taper of harmonic orders, 1 at order 0 and 0 at order_max."""
+    return np.cos(0.5 * np.pi * np.asarray(orders, dtype=np.float64) / order_max) ** 2
+
+
 def _bandlimit_order(Gl: torch.Tensor, l: int, r, q) -> torch.Tensor:
     """Order-l spherical Bessel transform of Gl(r, r') to the q points and back."""
     r = np.asarray(r, dtype=np.float64)
@@ -574,6 +637,7 @@ def padf_from_clusters(
     theta_deg: NDArray,
     q: NDArray | None = None,
     l_max: int = 40,
+    l_taper: bool = False,
 ) -> NDArray:
     """
     PADF of atomic models: the angular correlation of all interatomic vectors
@@ -600,6 +664,8 @@ def padf_from_clusters(
         band-limited to them, as bandlimit_volume does.
     l_max : int
         Even orders l = 0, 2, ..., < l_max.
+    l_taper : bool
+        Weight each order by order_taper(l, l_max), as reconstruct_PADF does.
 
     Returns
     -------
@@ -636,5 +702,7 @@ def padf_from_clusters(
         if l == 0:
             continue
         C = Cl[k] if q is None else _bandlimit_order(Cl[k], l, r, q)
+        if l_taper:
+            C = C * float(order_taper(l, l_max))
         out += C[:, :, None] * torch.special.legendre_polynomial_p(torch.cos(theta), l)[None, None, :]
     return (out * torch.abs(torch.sin(theta))[None, None, :]).numpy()

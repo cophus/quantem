@@ -34,6 +34,8 @@ import numpy as np
 import torch
 from scipy.special import jv
 
+from quantem.diffraction.padf import order_taper
+
 
 class PairAngleDistributionFunction2D:
     """
@@ -127,13 +129,15 @@ class PairAngleDistributionFunction2D:
             K = jv(n, arg) * w[None, :]
             self.Cn_r[n] = K @ self.Cn_q[n] @ K.T
 
-    def reconstruct(self, n_theta: int = 360, include_n0: bool = False):
+    def reconstruct(self, n_theta: int = 360, include_n0: bool = False, n_taper: bool = False):
         """
         Reconstruct Theta(r, r', dtheta) on n_theta angles over [0, 360).
 
         include_n0 : keep the isotropic n = 0 term (a dtheta-independent
         offset containing the uncorrelated background); excluded by
         default, matching the 3D pipeline's l = 0 handling.
+        n_taper : weight each harmonic by order_taper(n, n_max + 1), which
+        suppresses the ringing in dtheta from truncating the sum at n_max.
 
         Returns
         -------
@@ -143,8 +147,9 @@ class PairAngleDistributionFunction2D:
         theta = 2.0 * np.pi * np.arange(n_theta) / n_theta
         n0 = 0 if include_n0 else 1
         n_vals = np.arange(n0, self.n_max + 1)
+        w = order_taper(n_vals, self.n_max + 1) if n_taper else np.ones(n_vals.size)
         # Hermitian sum: C_{-n} = conj(C_n) -> 2 Re for n > 0
-        E = np.exp(1j * np.outer(n_vals, theta))  # (Nn, n_theta)
+        E = np.exp(1j * np.outer(n_vals, theta)) * w[:, None]  # (Nn, n_theta)
         padf = 2.0 * np.real(np.einsum("nij,nt->ijt", self.Cn_r[n0:], E))
         if include_n0:
             padf -= np.real(self.Cn_r[0])[:, :, None]  # counted twice above
@@ -153,9 +158,8 @@ class PairAngleDistributionFunction2D:
 
     def plot_diagonal(self, r_max_display: float = 8.0, n_theta: int = 360,
                       theta_max: float = 360.0, r_display_power: int = 1,
-                      title: str | None = None,
-                      figsize: tuple[float, float] = (5.4, 3.6),
-                      returnfig: bool = False, padf=None):
+                      title=None, axsize: tuple[float, float] = (5.4, 3.6),
+                      returnfig: bool = False, padf=None, n_taper: bool = False):
         """
         Map of the r = r' diagonal vs relative angle, weighted by
         r^r_display_power (r^1 by default), zero-centered RdBu_r.
@@ -165,37 +169,41 @@ class PairAngleDistributionFunction2D:
         from interior angles and r <= 0.92 * r_max_display, so edge
         artifacts do not compress the scale. padf: an (Nr, Nr, Ntheta)
         volume on this r grid and angles 360 k / Ntheta (e.g. a model from
-        padf2d_from_clusters) to plot instead of this reconstruction.
+        padf2d_from_clusters), or a list of them drawn in separate panels,
+        to plot instead of this reconstruction.
         """
         if padf is None:
-            theta_deg, padf = self.reconstruct(n_theta=n_theta)
+            vols = [self.reconstruct(n_theta=n_theta, n_taper=n_taper)[1]]
         else:
-            theta_deg = 360.0 * np.arange(padf.shape[2]) / padf.shape[2]
+            vols = list(padf) if isinstance(padf, (list, tuple)) else [padf]
+        titles = title if isinstance(title, (list, tuple)) else [title] * len(vols)
         r = self.r
         rs = r <= r_max_display
-        ts = theta_deg <= theta_max + 1e-9
-        diag = np.einsum("iik->ik", padf)[rs][:, ts]
-        disp = (diag * (r[rs] ** r_display_power)[:, None]).T
-        interior = (theta_deg[ts] % 180 > 15) & (theta_deg[ts] % 180 < 165)
         r_inner = r[rs] <= 0.92 * r_max_display
-        vmax = np.quantile(np.abs(disp[np.ix_(interior, r_inner)]), 0.999)
 
-        fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
-        im = ax.pcolormesh(r[rs], theta_deg[ts], disp, cmap="RdBu_r",
-                           vmin=-vmax, vmax=vmax, shading="auto")
-        ax.set_xlabel("r = r' (Å)")
-        ax.set_ylabel("$\\Delta\\theta$ (deg)")
-        ax.set_yticks(np.arange(0, theta_max + 1, 45))
-        fig.colorbar(im, ax=ax, label=f"$\\Theta_{{2D}} \\cdot r^{{{r_display_power}}}$")
-        if title is not None:
-            ax.set_title(title, fontsize=10)
+        fig, axs = plt.subplots(1, len(vols), figsize=(axsize[0] * len(vols), axsize[1]),
+                                squeeze=False, constrained_layout=True)
+        for ax, vol, t in zip(axs[0], vols, titles):
+            theta_deg = 360.0 * np.arange(vol.shape[2]) / vol.shape[2]
+            ts = theta_deg <= theta_max + 1e-9
+            disp = (np.einsum("iik->ik", vol)[rs][:, ts] * (r[rs] ** r_display_power)[:, None]).T
+            interior = (theta_deg[ts] % 180 > 15) & (theta_deg[ts] % 180 < 165)
+            vmax = np.quantile(np.abs(disp[np.ix_(interior, r_inner)]), 0.999)
+            im = ax.pcolormesh(r[rs], theta_deg[ts], disp, cmap="RdBu_r",
+                               vmin=-vmax, vmax=vmax, shading="auto")
+            ax.set_xlabel("r = r' (Å)")
+            ax.set_ylabel("$\\Delta\\theta$ (deg)")
+            ax.set_yticks(np.arange(0, theta_max + 1, 45))
+            fig.colorbar(im, ax=ax, label=f"$\\Theta_{{2D}} \\cdot r^{{{r_display_power}}}$")
+            if t is not None:
+                ax.set_title(t, fontsize=10)
         if returnfig:
-            return fig, ax
+            return fig, axs[0]
         plt.show()
 
 
 def padf2d_from_clusters(clusters_xy, r, n_max: int = 60, n_theta: int = 360,
-                         q=None, q_taper: float = 0.25):
+                         q=None, q_taper: float = 0.25, n_taper: bool = False):
     """
     2D PADF of atomic models: the angular correlation of all in-plane
     interatomic vectors within each cluster (two-, three- and four-body
@@ -208,6 +216,8 @@ def padf2d_from_clusters(clusters_xy, r, n_max: int = 60, n_theta: int = 360,
     q : (Nq,) array or None
         Measured q values. If given, each C_n is band-limited to them with
         the same q_taper as the class (order-n Hankel transform and back).
+    n_taper : bool
+        Weight each harmonic by order_taper(n, n_max + 1), as reconstruct does.
 
     Returns
     -------
@@ -252,5 +262,7 @@ def padf2d_from_clusters(clusters_xy, r, n_max: int = 60, n_theta: int = 360,
 
     theta = 2.0 * np.pi * torch.arange(n_theta, dtype=torch.float64) / n_theta
     E = torch.polar(torch.ones(n_max, n_theta, dtype=torch.float64), n_vals[:, None] * theta[None, :])
+    if n_taper:
+        E = E * torch.from_numpy(order_taper(n_vals.numpy(), n_max + 1))[:, None]
     padf = 2.0 * torch.real(torch.einsum("nij,nt->ijt", Cn, E))
     return np.degrees(theta.numpy()), padf.numpy()

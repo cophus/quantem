@@ -460,7 +460,7 @@ def make_images(
 
 
 def cluster_patterns(atoms, n_patterns, n_px=256, q_max=2.5, r_cluster=None,
-                     voltage=200e3, seed=0):
+                     voltage=200e3, seed=0, random_orientation=True):
     """
     Kinematic diffraction patterns of spherical clusters cut from a periodic
     structure, each with a random centre and a random 3D orientation
@@ -494,7 +494,7 @@ def cluster_patterns(atoms, n_patterns, n_px=256, q_max=2.5, r_cluster=None,
     }
 
     patterns = torch.empty((n_patterns, n_px, n_px), dtype=torch.float32)
-    for k, (pos, z_atoms) in enumerate(random_clusters(atoms, n_patterns, r_cluster, seed)):
+    for k, (pos, z_atoms) in enumerate(random_clusters(atoms, n_patterns, r_cluster, seed, random_orientation)):
         xy = torch.as_tensor(pos[:, :2] / pix + n_big / 2)
         psi = 0
         for z in species:
@@ -511,11 +511,13 @@ def cluster_patterns(atoms, n_patterns, n_px=256, q_max=2.5, r_cluster=None,
     return patterns.numpy(), dq
 
 
-def random_clusters(atoms, n_clusters, r_cluster=None, seed=0):
+def random_clusters(atoms, n_clusters, r_cluster=None, seed=0, random_orientation=True):
     """
     Yield (positions, atomic numbers) of spherical clusters cut from a periodic
     structure, each with a random centre and rotated to a random orientation
-    (the beam is along z). The same seed gives the clusters of cluster_patterns.
+    (the beam is along z). With random_orientation=False the cell axes are
+    kept, so the beam is along the cell's z axis. The same seed gives the
+    clusters of cluster_patterns.
     Clusters use the minimum image about their centre, so r_cluster is capped
     at half the shortest cell length and no atom appears twice.
     """
@@ -535,4 +537,5 @@ def random_clusters(atoms, n_clusters, r_cluster=None, seed=0):
         d = pos0 - torch.rand(3, generator=gen, dtype=torch.float64) * cell
         d -= cell * torch.round(d / cell)  # minimum image about the centre
         keep = torch.linalg.norm(d, dim=1) <= r_cluster
-        yield (d[keep] @ rot.T).numpy(), atoms.numbers[keep.numpy()]
+        pos = d[keep] @ rot.T if random_orientation else d[keep]
+        yield pos.numpy(), atoms.numbers[keep.numpy()]
