@@ -16,8 +16,8 @@ Measured effects in the forward model, each with parameters fitted to the data:
 - crystal: orientation (indexed from the off-row disks and their Bragg lines,
   ``fit_orientation``), incident tilt (2D), thickness, optionally the top
   and bottom surface profiles (``add_surfaces``), a thickness per column, and
-  a composition field c(x, z) mixing in a second phase on the same lattice
-  (``set_composition``, e.g. AlN in GaN for an AlGaN layer);
+  the composition of a second phase on the same lattice, which follows the
+  strain it causes (``set_composition``, e.g. AlN in GaN for an AlGaN layer);
 - probe: aperture radius and edge, a non-uniform illumination across the
   aperture (radial profile with first and second angular harmonics), and the
   probe aberrations as ray displacements (defocus, two-fold astigmatism,
@@ -28,7 +28,8 @@ Measured effects in the forward model, each with parameters fitted to the data:
   crystal can);
 - background: per pattern, linear in the Bragg intensity, two diffuse halos
   around the disks (the Bragg pattern blurred: thermal diffuse scattering
-  follows the beams) and a smooth radial term;
+  follows the beams) and a smooth radial term, all with non-negative
+  coefficients;
 - noise: weights from the two independent half sets of the scan (even and odd
   lines along the feature), counting noise plus a multiplicative floor for
   the specimen texture the model cannot describe.
@@ -86,7 +87,9 @@ _SCALES = dict(
     background=1.0,
     aberrations=1e-3,
     surface=0.1,
-    composition=10.0,
+    debye_waller=10.0,
+    absorption=10.0,
+    vegard=100.0,
 )
 
 
@@ -97,6 +100,26 @@ def _interp(t: torch.Tensor, nodes: torch.Tensor, values: torch.Tensor) -> torch
     i = u.floor().long()
     f = u - i
     return values[..., i] * (1 - f) + values[..., i + 1] * f
+
+
+def _nnls(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Non-negative least squares for a few basis functions, batched: A (P, K, K) normal
+    matrices, b (P, K). The solution is the unconstrained one on the subset of the basis
+    with all coefficients positive that lowers the residual most (2^K subsets)."""
+    K = b.shape[-1]
+    masks = torch.tensor(
+        [[(s >> k) & 1 for k in range(K)] for s in range(2**K)], dtype=A.dtype, device=A.device
+    )
+    eye = torch.eye(K, dtype=A.dtype, device=A.device)
+    As = (
+        A[None] * (masks[:, None, :, None] * masks[:, None, None, :])
+        + eye * (1 - masks)[:, None, None, :]
+    )
+    x = torch.linalg.solve(As, (b[None] * masks[:, None])[..., None])[..., 0]
+    gain = (x * b[None]).sum(-1)
+    gain = torch.where((x >= 0).all(-1), gain, torch.full_like(gain, -torch.inf))
+    best = gain.argmax(0)
+    return x.gather(0, best[None, :, None].expand(1, *b.shape))[0]
 
 
 def _rotation(axis, angle: float) -> np.ndarray:
@@ -151,9 +174,12 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
     ``rot_z`` rotation of the crystal about the beam (rad), ``q_scale`` (2,)
     detector scale along and across the row, ``alpha`` aperture radius (1/A),
     ``edge`` aperture edge width (1/A), ``illum`` (5, n) log amplitude of the
-    illumination across the aperture (radial profiles of the harmonics 1, cos,
-    sin, cos 2, sin 2 of the azimuth), ``background`` (n,) log of the radial
-    background, ``aberrations`` (C1, A1 along, A1 diagonal, all in A, and C3
+    illumination across the aperture (radial profiles from the center to the
+    edge of the harmonics 1, cos, sin, cos 2, sin 2 of the azimuth), ``background`` (n,) log of the radial
+    background, ``debye_waller`` (a change Delta B of the Debye-Waller factor, A^2,
+    on the elastic structure factors) and ``absorption`` (a scale of the absorptive ones):
+    the physical way to correct the structure factors of ``set_crystal``, ``aberrations``
+    (C1, A1 along, A1 diagonal, all in A, and C3
     in mm), and with ``add_surfaces`` the ``surface`` (2, n) heights of the
     top and bottom surfaces (A).
     """
@@ -326,6 +352,7 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
         crystal.calculate_dynamical_structure_factors(self.energy, k_max=k_max)
         self.crystal = crystal
         self.g_hkl = tuple(int(v) for v in g_hkl)
+        self.k_max_dyn = float(k_max)
         return self
 
     # ------------------------------------------------------------- orientation
@@ -572,6 +599,8 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
             illum=torch.zeros(5, cfg["n_illum"], **f64),
             background=torch.full((cfg["n_background"],), -6.0, **f64),
             aberrations=torch.zeros(4, **f64),
+            debye_waller=torch.tensor(0.0, **f64),
+            absorption=torch.tensor(1.0, **f64),
         )
         for k, v in p0.items():
             if k in self.params and tuple(v.shape) == tuple(self.params[k].shape):
@@ -579,8 +608,8 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
         if "surface" in p0:
             self.add_surfaces(p0["surface"].shape[1])
             self.params["surface"] = p0["surface"].detach().clone()
-        if "composition" in p0 and tuple(p0["composition"].shape) == tuple(cfg["strain_shape"]):
-            self.params["composition"] = p0["composition"].detach().clone()
+        if "vegard" in p0:
+            self.params["vegard"] = p0["vegard"].detach().clone()
         return self
 
     def _build(self, verbose: bool = False) -> None:
@@ -607,8 +636,18 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
         hkl = torch.cat([b, row])
         _, ui = np.unique(hkl.numpy(), axis=0, return_index=True)
         hkl = hkl[np.sort(ui)]
-        U, u0i, _ = _coupling_matrix(cr, hkl, relativistic_gamma(self.energy))
+        # elastic and absorptive parts of the coupling (the absorptive part and the Debye-Waller
+        # factor of the elastic part can be refined: ``absorption``, ``debye_waller``)
+        gamma = relativistic_gamma(self.energy)
+        k_dyn = getattr(self, "k_max_dyn", 3.2)
+        cr.calculate_dynamical_structure_factors(
+            self.energy, k_max=k_dyn, include_core=False, include_phonon=False
+        )
+        U_el, _, _ = _coupling_matrix(cr, hkl, gamma)
+        cr.calculate_dynamical_structure_factors(self.energy, k_max=k_dyn)
+        U, u0i, _ = _coupling_matrix(cr, hkl, gamma)
         g_cryst = hkl.to(torch.float64) @ cr.lat_recip
+        g_diff2 = ((g_cryst[:, None, :] - g_cryst[None, :, :]) ** 2).sum(-1)
         # data
         stack = dict(all=self.patterns.array, even=self.even.array, odd=self.odd.array)
         pos = slice(None) if cfg["positions"] is None else slice(*cfg["positions"])
@@ -662,6 +701,9 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
             hkl=hkl,
             U=U.to(torch.complex64).to(dev),
             U_cpu=U,
+            U_el=U_el.to(torch.complex64).to(dev),
+            U_abs=(U - U_el).to(torch.complex64).to(dev),
+            g_diff2=g_diff2.to(torch.float32).to(dev),
             u0i=float(u0i),
             g_cryst=g_cryst,
             R=torch.as_tensor(R, dtype=torch.float64),
@@ -689,7 +731,7 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
             z_nodes=z_nodes,
             x_nodes=x_nodes,
             wx=_hat(x_sim, x_nodes).T.contiguous(),
-            illum_r=torch.linspace(0, 1.15, cfg["n_illum"], dtype=torch.float64),
+            illum_r=torch.linspace(0, 1, cfg["n_illum"], dtype=torch.float64),
             bg_q=torch.linspace(0, cfg["q_max"], cfg["n_background"], dtype=torch.float64),
             D={k: torch.as_tensor(v.reshape(n_pos, -1)[:, union], **f32) for k, v in D.items()},
             shape=(H, W),
@@ -753,24 +795,43 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
         """Expected weighted residual of pure noise (the residual is reported in these units)."""
         return self._model()["noise"]
 
+    def illumination_profile(self, n: int = 221) -> tuple[np.ndarray, np.ndarray]:
+        """Azimuthal mean of the illumination intensity (aperture edge included) against the
+        incident angle (mrad), out to 1.1 times the aperture radius."""
+        p, m = self.params, self._model()
+        a = float(p["alpha"])
+        r = torch.linspace(0, 1.1 * a, n, dtype=torch.float64)[:, None]
+        th = torch.linspace(0, 2 * np.pi, 72, dtype=torch.float64)[None, :-1]
+        L, nodes = p["illum"].detach(), m["illum_r"]
+        harmonics = (1, torch.cos(th), torch.sin(th), torch.cos(2 * th), torch.sin(2 * th))
+        logA = sum(_interp(r / a, nodes, L[i]) * h for i, h in enumerate(harmonics))
+        amp = torch.sigmoid((a - r) / float(p["edge"])) * torch.exp(logA)
+        return 1e3 * self.wavelength * r[:, 0].numpy(), (amp**2).mean(1).numpy()
+
     def set_composition(
-        self, crystal_alt: Crystal, k_max: float = 3.2, start: float = 0.02
+        self, crystal_alt: Crystal, vegard: float, k_max: float = 3.2
     ) -> "DepthStrainCBED":
-        """A second phase mixed in by a composition field c(x, z) in [0, 1] on the strain grid.
+        """A second phase on the same lattice, with the composition that follows the strain.
 
         The structure matrix of a slice becomes (1 - c) U + c U_alt (virtual crystal), with
         U_alt the absorptive structure factors of ``crystal_alt`` on the lattice of the crystal of
         ``set_crystal`` (lattice changes are the strain), e.g. AlN at the GaN lattice: c is then the
-        Al fraction of AlGaN. The mean absorption changes with c as well. The field starts at
-        ``start`` (> 0: at the bound c = 0 the fit has no gradient).
+        Al fraction of AlGaN. The mean absorption changes with c as well. The composition causes
+        the strain (lattice mismatch), so it is not a field of its own: c = strain / ``vegard``,
+        clamped to [0, 1], with ``vegard`` (parameter ``vegard``, fitted like the others; this is
+        its start) the strain per unit fraction of the second phase.
         """
         crystal_alt.calculate_dynamical_structure_factors(self.energy, k_max=k_max)
         self.crystal_alt = crystal_alt
         self._model()
         self._set_alt()
-        if "composition" not in self.params:
-            self.params["composition"] = torch.full_like(self.params["strain"], float(start))
+        self.params["vegard"] = torch.tensor(float(vegard), dtype=torch.float64)
         return self
+
+    @staticmethod
+    def _composition(p: dict) -> torch.Tensor | None:
+        """Composition nodes (``set_composition``): the strain over ``vegard``."""
+        return p["strain"] / p["vegard"] if "vegard" in p else None
 
     def _set_alt(self) -> None:
         m = self._m
@@ -784,7 +845,7 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
 
     def add_surfaces(self, n_nodes: int = 8) -> "DepthStrainCBED":
         """Top and bottom surface heights (A) on ``n_nodes`` positions along x: a thickness per
-        column, and the strain field shifted in z with the top surface."""
+        column. The strain nodes stay at their depths; slices beyond them take the nearest nodes."""
         m = self._model()
         m["s_nodes"] = torch.linspace(-560.0, 560.0, n_nodes, dtype=torch.float64)
         self.params["surface"] = torch.zeros(2, n_nodes, dtype=torch.float64)
@@ -824,8 +885,21 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
         h = (bot - top) / S
         h0 = h.mean()
         k0 = 1 / self.wavelength
-        diag = (2 * k0 * s).to(torch.float32).to(dev).to(torch.complex64) + 1j * m["u0i"]
-        A = m["U"][None] + torch.diag_embed(diag)
+        U = m["U"]
+        a_abs = p.get("absorption")
+        dB = p.get("debye_waller")
+        if a_abs is not None and dB is not None:
+            # a change Delta B of the Debye-Waller factor on the elastic part,
+            # exp(-Delta B |g - h|^2 / 4), and a scale of the absorptive part and mean absorption
+            dw = torch.exp(-dB.to(torch.float32).to(dev) * m["g_diff2"] / 4)
+            a32 = a_abs.to(torch.float32).to(dev)
+            U = m["U_el"] * dw + m["U_abs"] * a32
+            u0i = (m["u0i"] * a32).to(torch.complex64)
+        else:
+            u0i = torch.tensor(m["u0i"], dtype=torch.complex64, device=dev)
+        iu = torch.tensor(1j, dtype=torch.complex64, device=dev)
+        diag = (2 * k0 * s).to(torch.float32).to(dev).to(torch.complex64) + iu * u0i
+        A = U[None] + torch.diag_embed(diag)
         coef = torch.tensor(0.5j * np.pi * self.wavelength, dtype=torch.complex64, device=dev)
         E_half = torch.linalg.matrix_exp(
             coef * h0.to(torch.float32).to(dev).to(torch.complex64) * A
@@ -847,10 +921,11 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
         ph = (2 * np.pi) * (h[None, :, None] * eps[:, :, None]) * G[None, None, :, 0]
         ph = ph.to(torch.float32).to(dev)
         phase = torch.polar(torch.ones_like(ph), ph)[:, :, None, :]
-        if "composition" in p:
+        comp = self._composition(p)
+        if comp is not None:
             # the change of the structure matrix with composition, at the slice midpoints: one
             # matrix per slice and column, the same for every incident direction
-            c = torch.einsum("kcz,zc->kc", Wz, p["composition"] @ m["wx"]).clamp(0.0, 1.0)
+            c = torch.einsum("kcz,zc->kc", Wz, comp @ m["wx"]).clamp(0.0, 1.0)
             cc = (h[None, :] * c).to(torch.float32).to(dev).to(torch.complex64)
             nb = m["dU"].shape[0]
             X = (2 * coef * cc.reshape(-1)[:, None, None] * m["dU"][None]).contiguous()
@@ -859,7 +934,7 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
         for k in range(S):
             Ek = E_full if k < S - 1 else E_half
             v = phi * phase[k]
-            if "composition" in p:
+            if comp is not None:
                 v = torch.einsum("cij,ctj->cti", Cmat[k], v)
             phi = (Ek @ v[..., None])[..., 0]
         out = torch.zeros(len(xs), m["nT"] ** 2, A.shape[-1], dtype=torch.complex64, device=dev)
@@ -939,8 +1014,6 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
         data: str | None = None,
         reg: float = 0.0,
         surface_reg: float = 0.0,
-        composition_reg: float = 0.0,
-        composition_l1: float = 0.0,
     ):
         m = self._model()
         Bk = self._basis(p, self._render(p, self._propagate(p)))
@@ -950,16 +1023,12 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
         A = torch.einsum("kpj,lpj->pkl", wb, wb)
         b = torch.einsum("kpj,pj->pk", wb, wd)
         ridge = 1e-6 * torch.diag_embed(torch.diagonal(A, dim1=1, dim2=2))
-        coef = torch.linalg.solve(A + ridge, b[..., None])[..., 0]
+        coef = _nnls(A + ridge, b)
         M = torch.einsum("pk,kpj->pj", coef, Bk)
         res = ((w * M - wd) ** 2).sum()
         pen = torch.zeros((), dtype=torch.float64)
         if reg > 0:
             pen = pen + reg * self._tv(p["strain"])
-        if composition_reg > 0 and "composition" in p:
-            pen = pen + composition_reg * self._tv(p["composition"])
-        if composition_l1 > 0 and "composition" in p:
-            pen = pen + composition_l1 * p["composition"].clamp(0.0, 1.0).mean()
         if surface_reg > 0 and "surface" in p:
             pen = pen + surface_reg * (torch.diff(p["surface"], n=2, dim=1) ** 2).mean()
         pen = pen.to(torch.float32).to(m["dev"])
@@ -1006,8 +1075,6 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
         lr: float = 0.01,
         reg: float = 0.0,
         surface_reg: float = 0.0,
-        composition_reg: float = 0.0,
-        composition_l1: float = 0.0,
         optimizer: dict | None = None,
         scheduler: dict | None = None,
         duty: float = 1.0,
@@ -1017,9 +1084,7 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
 
         ``optimizer`` and ``scheduler`` are ``OptimizerMixin`` dicts (default
         Adam with learning rate ``lr`` and cosine annealing). ``reg`` is the TV
-        weight on the strain nodes (as in ``DepthStrain``), ``composition_reg`` on the
-        composition nodes (``set_composition``) and ``composition_l1`` an L1 penalty on
-        them (most of the crystal is the first phase), ``surface_reg`` a
+        weight on the strain nodes (as in ``DepthStrain``), ``surface_reg`` a
         curvature penalty on the surface profiles, and ``duty`` < 1 pauses after
         every step so that the GPU is busy only that fraction of the time. The
         residual is reported in units of ``noise``.
@@ -1041,8 +1106,6 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
                     q,
                     reg=reg,
                     surface_reg=surface_reg,
-                    composition_reg=composition_reg,
-                    composition_l1=composition_l1,
                 )
                 self.history.append(float(aux["residual"].detach()) / m["noise"])
                 self._step(loss, t0, duty)
@@ -1319,20 +1382,10 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
         """The strain field d u_x / d z (x along g) inside the foil (between the surfaces of this
         fit), and further fields on the same axes: ``panels`` maps titles to None (this fit), node
         values on the grid of this fit, or callables f(z, x) (A). ``key="composition"`` shows the
-        composition field (``set_composition``) instead."""
+        composition (``set_composition``) instead."""
         m = self._model()
         zn, xn = m["z_nodes"].numpy(), m["x_nodes"].numpy()
-        z = np.linspace(zn[0], zn[-1], 221)[:, None]
         x = np.linspace(xn[0], xn[-1], 401)[None, :]
-        Wz = _hat(torch.as_tensor(z.ravel()), m["z_nodes"]).numpy()
-        Wx = _hat(torch.as_tensor(x.ravel()), m["x_nodes"]).numpy()
-        own = Wz @ self.params[key].numpy() @ Wx.T
-        if key == "composition":
-            own = np.clip(own, 0, 1)
-            scale, cmap, vmin, vmax, label = 1.0, "magma", 0.0, 1.0, "composition c"
-        else:
-            scale, cmap, vmin, vmax = 1e3, "RdBu_r", -strain_range, strain_range
-            label = r"$\partial u_x/\partial z$ ($10^{-3}$)"
         t = float(self.params["thickness"])
         xx = torch.as_tensor(x.ravel())
         if "surface" in self.params:
@@ -1340,6 +1393,19 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
             bot = t + (_hat(xx, m["s_nodes"]) @ self.params["surface"][1]).numpy()
         else:
             top, bot = np.zeros(x.size), np.full(x.size, t)
+        # the whole foil; beyond the nodes the field is that of the nearest nodes, as in the model
+        z0, z1 = min(zn[0], top.min()), max(zn[-1], bot.max())
+        z = np.linspace(z0, z1, 221)[:, None]
+        Wz = _hat(torch.as_tensor(z.ravel()), m["z_nodes"]).numpy()
+        Wx = _hat(torch.as_tensor(x.ravel()), m["x_nodes"]).numpy()
+        nodes = self._composition(self.params) if key == "composition" else self.params[key]
+        own = Wz @ nodes.detach().numpy() @ Wx.T
+        if key == "composition":
+            own = np.clip(own, 0, 1)
+            scale, cmap, vmin, vmax, label = 1.0, "magma", 0.0, 1.0, "composition c"
+        else:
+            scale, cmap, vmin, vmax = 1e3, "RdBu_r", -strain_range, strain_range
+            label = r"$\partial u_x/\partial z$ ($10^{-3}$)"
         outside = (z < top[None, :]) | (z > bot[None, :])  # no crystal, no data
         panels = panels or {"this fit": None}
         n = len(panels)
@@ -1347,7 +1413,7 @@ class DepthStrainCBED(AutoSerialize, OptimizerMixin):
             n, 1, figsize=figsize or (8, 3.3 * n + 0.6), sharex=True, layout="constrained"
         )
         axs = np.atleast_1d(axs)
-        ext = [xn[0] / 10, xn[-1] / 10, zn[-1] / 10, zn[0] / 10]
+        ext = [xn[0] / 10, xn[-1] / 10, z1 / 10, z0 / 10]
         for ax, (title, f) in zip(axs, panels.items()):
             if f is None:
                 field = own

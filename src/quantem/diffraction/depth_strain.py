@@ -80,6 +80,8 @@ _SCALES = dict(
     semiconvergence=100.0,
     u_elastic=10.0,
     u_absorptive=10.0,
+    debye_waller=10.0,
+    absorption=10.0,
 )
 
 
@@ -912,6 +914,8 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
             semiconvergence=torch.tensor(float(semiconvergence), **f64),
             u_elastic=torch.ones(min(int(structure_factor_orders), int(order.max())), **f64),
             u_absorptive=torch.ones(min(int(structure_factor_orders), int(order.max())), **f64),
+            debye_waller=torch.tensor(0.0, **f64),
+            absorption=torch.tensor(1.0, **f64),
         )
         self.loss_history = []
         self._set_weights()
@@ -961,11 +965,22 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         return self
 
     def _coupling(self, p: dict) -> torch.Tensor:
-        """Coupling matrix U_(n-m): elastic and absorptive parts, each scaled per order |n - m|
-        by ``u_elastic`` and ``u_absorptive`` (1 = the structure factors of ``set_crystal``)."""
+        """Coupling matrix U_(n-m): elastic and absorptive parts.
+
+        Two physical corrections act on every coupling: ``debye_waller``, a change of the
+        Debye-Waller factor (Delta B in A^2) that multiplies the elastic part by
+        exp(-Delta B |g_(n-m)|^2 / 4), and ``absorption``, a scale of the absorptive part (and of
+        the mean absorption). On top, ``u_elastic`` and ``u_absorptive`` scale each order |n - m|
+        separately (effective structure factors; 1 = the factors of ``set_crystal``), which a
+        prior can hold near 1 (``set_structure_factor_prior``).
+        """
         m = self.model
         if "U_el" not in m or "u_elastic" not in p:
             return m["U"]
+        dB = p.get("debye_waller", torch.zeros((), dtype=torch.float64))
+        a_abs = p.get("absorption", torch.ones((), dtype=torch.float64))
+        g_order = m["order"].to(torch.float64) * self.g
+        dw = torch.exp(-dB * g_order**2 / 4)
         rest = torch.ones(
             int(m["order"].max()) + 1 - p["u_elastic"].numel(),
             dtype=p["u_elastic"].dtype,
@@ -973,7 +988,7 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         )
         s_el = torch.cat([rest[:1], p["u_elastic"], rest[1:]])[m["order"]]
         s_abs = torch.cat([rest[:1], p["u_absorptive"], rest[1:]])[m["order"]]
-        return m["U_el"] * s_el + m["U_abs"] * s_abs
+        return m["U_el"] * (s_el * dw) + m["U_abs"] * (s_abs * a_abs)
 
     def _strain_field(self, p: dict, h: torch.Tensor) -> torch.Tensor:
         """eps at the slice midpoints of every simulated column, (n_slices, n_columns)."""
@@ -988,7 +1003,8 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
         ns = m["n_slices"]
         h = p["thickness"] / ns
         K, gn = m["K"], m["gn"]
-        diag = -gn[None, :] * (gn[None, :] + 2 * K[:, None]) + 1j * m["u0_imag"]
+        a_abs = p.get("absorption", torch.ones((), dtype=torch.float64))
+        diag = -gn[None, :] * (gn[None, :] + 2 * K[:, None]) + 1j * m["u0_imag"] * a_abs
         A = self._coupling(p)[None] + torch.diag_embed(diag)
         e_half = torch.linalg.matrix_exp((0.5j * np.pi * self.wavelength) * h * A)
         e_full = e_half @ e_half
@@ -1072,7 +1088,35 @@ class DepthStrain(AutoSerialize, OptimizerMixin):
                 penalty = reg * torch.sqrt(dz**2 + dx**2 + 1e-12).mean()
             else:
                 raise ValueError("reg_type is 'l2', 'l1' or 'tv'")
-        return residual + penalty, dict(residual=residual, penalty=penalty, scale=scale)
+        prior = torch.zeros((), dtype=residual.dtype, device=residual.device)
+        sf = m.get("sf_prior")
+        if sf is not None and "u_elastic" in p:
+            w, s_el, s_abs = sf
+            prior = w * (
+                (((p["u_elastic"] - 1) / s_el) ** 2).sum()
+                + (((p["u_absorptive"] - 1) / s_abs) ** 2).sum()
+            )
+        return residual + penalty + prior, dict(
+            residual=residual, penalty=penalty, prior=prior, scale=scale
+        )
+
+    def set_structure_factor_prior(
+        self, weight: float, sigma_elastic: float = 0.05, sigma_absorptive: float = 0.3
+    ) -> "DepthStrain":
+        """Gaussian prior on the per-order structure-factor scales: ``weight`` times the sum of
+        ((u - 1) / sigma)^2 over ``u_elastic`` and ``u_absorptive``, added to the loss.
+
+        With ``weight`` equal to the weighted residual per data point at the noise level, this is
+        the prior of a chi-square fit; while model errors dominate the residual such a prior is
+        weak, and the weak orders follow the model errors (use ``debye_waller`` and ``absorption``
+        instead, or a larger weight). ``weight=0`` removes it.
+        """
+        if self.model is None:
+            raise RuntimeError("set_model first")
+        self.model["sf_prior"] = (
+            None if weight <= 0 else (float(weight), float(sigma_elastic), float(sigma_absorptive))
+        )
+        return self
 
     # ---------------------------------------------------------------------- fit
 
