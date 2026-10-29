@@ -34,7 +34,7 @@ import numpy as np
 import torch
 from scipy.special import jv
 
-from quantem.diffraction.padf import order_taper
+from quantem.diffraction.padf import _per_panel, order_taper
 
 
 class PairAngleDistributionFunction2D:
@@ -158,52 +158,65 @@ class PairAngleDistributionFunction2D:
 
     def plot_diagonal(self, r_max_display: float | None = None, n_theta: int = 360,
                       theta_max: float = 360.0, r_display_power: float = 0.5,
-                      title=None, axsize: tuple[float, float] = (5, 3.6),
+                      title=None, axsize: tuple[float, float] = (4.5, 3.5),
                       returnfig: bool = False, padf=None, n_taper: bool = False,
-                      subtract_median: bool = True):
+                      subtract_median: bool = True, r_fixed=None):
         """
-        Map of the r = r' diagonal vs relative angle, weighted for display by
-        (r r')^r_display_power as in PairAngleDistributionFunction.simple_plot
-        (r^1 on the diagonal by default), zero-centered RdBu_r.
-        theta_max = 180 shows the folded view (sufficient for
-        Friedel-symmetric data); 360 shows the full relative angle
-        available when odd harmonics are present. Color limits are set
-        from interior angles and r <= 0.92 * r_max_display, so edge
-        artifacts do not compress the scale. padf: an (Nr, Nr, Ntheta)
-        volume on this r grid and angles 360 k / Ntheta (e.g. a model from
-        padf2d_from_clusters), or a list of them drawn in separate panels,
-        to plot instead of this reconstruction. subtract_median subtracts,
-        for display, the median over the interior angles at each r: the
-        self-correlation bands at 0 and 180 deg otherwise offset every
-        interior angle (the 2D measure has no sin(theta) factor to suppress
-        them).
+        Maps against relative angle (y-axis, 0 to theta_max) and r (x-axis),
+        one panel per volume in a single row: the r = r' diagonal, or
+        Theta(r_fixed, r', dtheta) when r_fixed is given (one value or one per
+        panel). The display is weighted by (r r')^r_display_power, as in
+        PairAngleDistributionFunction.simple_plot (r^1 on the diagonal by
+        default), zero-centered RdBu_r. theta_max = 180 shows the folded view
+        (sufficient for Friedel-symmetric data); 360 shows the full relative
+        angle available when odd harmonics are present. Color limits are set
+        from interior angles and r <= 0.92 * r_max_display, so edge artifacts
+        do not compress the scale.
+
+        padf: an (Nr, Nr, Ntheta) volume on this r grid and angles 360 k / Ntheta
+        (e.g. a model from padf2d_from_clusters), or a list of them, to plot
+        instead of this reconstruction. subtract_median subtracts, for display,
+        the median over the interior angles at each r: the self-correlation
+        bands at 0 and 180 deg otherwise offset every interior angle (the 2D
+        measure has no sin(theta) factor to suppress them).
         """
         if padf is None:
             vols = [self.reconstruct(n_theta=n_theta, n_taper=n_taper)[1]]
         else:
             vols = list(padf) if isinstance(padf, (list, tuple)) else [padf]
-        titles = title if isinstance(title, (list, tuple)) else [title] * len(vols)
+        n = len(vols)
+        titles = _per_panel(title, n)
+        r_fixeds = list(r_fixed) if isinstance(r_fixed, (list, tuple)) else [r_fixed] * n
         r = self.r
         r_max_display = r.max() if r_max_display is None else r_max_display
         rs = r <= r_max_display
         r_inner = r[rs] <= 0.92 * r_max_display
 
-        fig, axs = plt.subplots(1, len(vols), figsize=(axsize[0] * len(vols), axsize[1]),
+        fig, axs = plt.subplots(1, n, figsize=(axsize[0] * n, axsize[1]),
                                 squeeze=False, constrained_layout=True)
-        for ax, vol, t in zip(axs[0], vols, titles):
+        for ax, vol, t, r0 in zip(axs[0], vols, titles, r_fixeds):
             theta_deg = 360.0 * np.arange(vol.shape[2]) / vol.shape[2]
             ts = theta_deg <= theta_max + 1e-9
-            disp = (np.einsum("iik->ik", vol)[rs][:, ts] * (r[rs] ** (2 * r_display_power))[:, None]).T
+            if r0 is None:
+                m = np.einsum("iik->ik", vol)[rs][:, ts] * (r[rs] ** (2 * r_display_power))[:, None]
+                xlabel, label = "r = r' (Å)", f"$\\Theta_{{2D}} \\cdot r^{{{2 * r_display_power:g}}}$"
+            else:
+                i0 = int(np.argmin(np.abs(r - r0)))
+                m = vol[i0][rs][:, ts] * ((r[i0] * r[rs]) ** r_display_power)[:, None]
+                xlabel = f"r' (Å), r = {r[i0]:.2f} Å"
+                label = f"$\\Theta_{{2D}} \\cdot (r r')^{{{r_display_power:g}}}$"
+            disp = m.T
             interior = (theta_deg[ts] % 180 > 15) & (theta_deg[ts] % 180 < 165)
             if subtract_median:
                 disp = disp - np.median(disp[interior], axis=0, keepdims=True)
             vmax = np.quantile(np.abs(disp[np.ix_(interior, r_inner)]), 0.999)
             im = ax.pcolormesh(r[rs], theta_deg[ts], disp, cmap="RdBu_r",
                                vmin=-vmax, vmax=vmax, shading="auto")
-            ax.set_xlabel("r = r' (Å)")
+            ax.set_xlabel(xlabel)
             ax.set_ylabel("$\\Delta\\theta$ (deg)")
-            ax.set_yticks(np.arange(0, theta_max + 1, 45))
-            fig.colorbar(im, ax=ax, label=f"$\\Theta_{{2D}} \\cdot r^{{{2 * r_display_power:g}}}$")
+            ax.set_ylim(0, theta_max)
+            ax.set_yticks(np.arange(0, theta_max + 1, 30 if theta_max <= 180 else 60))
+            fig.colorbar(im, ax=ax, label=label)
             if t is not None:
                 ax.set_title(t, fontsize=10)
         if returnfig:

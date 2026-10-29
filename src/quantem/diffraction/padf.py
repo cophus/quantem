@@ -426,7 +426,8 @@ class PairAngleDistributionFunction(AutoSerialize):
             cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto",
         )
         ax_g3.set_ylabel("$\\theta$ (deg)")
-        ax_g3.set_yticks(np.arange(0, 181, 45))
+        ax_g3.set_ylim(0, 180)
+        ax_g3.set_yticks(np.arange(0, 181, 30))
         fig.colorbar(im, ax=[ax_g3, ax_g2], label="3-body correlation", pad=0.02)
 
         if markers is not None:
@@ -463,7 +464,7 @@ class PairAngleDistributionFunction(AutoSerialize):
         padf=None,
         r_display_power: int = 1,
         r_max_display: float | None = None,
-        r_fixed: float | None = None,
+        r_fixed=None,
         theta_marks=None,
         r_marks=None,
         title=None,
@@ -471,47 +472,53 @@ class PairAngleDistributionFunction(AutoSerialize):
         returnfig: bool = False,
     ):
         """
-        Map of the PADF against theta (y-axis) and r (x-axis): the r = r'
-        diagonal Theta(r, r, theta), or Theta(r_fixed, r', theta) when r_fixed
-        is given. The display is weighted by r^(2 * r_display_power), or by
-        (r_fixed r')^r_display_power for a fixed-r slice.
+        Maps of the PADF against theta (y-axis, 0 to 180 deg) and r (x-axis),
+        one panel per volume in a single row: the r = r' diagonal
+        Theta(r, r, theta), or Theta(r_fixed, r', theta) when r_fixed is given.
+        The display is weighted by (r r')^r_display_power.
 
         padf : (Nr, Nr, Ntheta) array, or a list of them, or None
-            Volumes on the same (r, theta) grid, e.g. a model PADF, drawn in
-            separate panels; defaults to self.padf.
-        theta_marks, r_marks : sequence of float or None
+            Volumes on the same (r, theta) grid, e.g. a model PADF; defaults to self.padf.
+        r_fixed : float, list of float (one per panel) or None
+            Fixed first radius (Angstroms) for each panel.
+        theta_marks, r_marks : sequence of float, list of them (one per panel) or None
             Angles (degrees) and radii (Angstroms) marked with dotted lines.
+        title : str or list of str (one per panel)
         Each panel has symmetric color limits from its largest |value| at
         15-165 deg and r <= r_max_display.
         """
         vols = [self.padf] if padf is None else (list(padf) if isinstance(padf, (list, tuple)) else [padf])
-        titles = title if isinstance(title, (list, tuple)) else [title] * len(vols)
+        n = len(vols)
+        titles = _per_panel(title, n)
+        r_fixeds = list(r_fixed) if isinstance(r_fixed, (list, tuple)) else [r_fixed] * n
+        theta_markss = _per_panel(theta_marks, n, nested=True)
+        r_markss = _per_panel(r_marks, n, nested=True)
         r = np.asarray(self.r)
         theta_deg = np.asarray(self.theta_deg)
         rs = r <= (r.max() if r_max_display is None else r_max_display)
         interior = (theta_deg > 15) & (theta_deg < 165)
 
-        fig, axs = plt.subplots(1, len(vols), figsize=(axsize[0] * len(vols), axsize[1]),
-                                squeeze=False, constrained_layout=True)
-        for ax, vol, t in zip(axs[0], vols, titles):
+        fig, axs = plt.subplots(1, n, figsize=(axsize[0] * n, axsize[1]), squeeze=False, constrained_layout=True)
+        for ax, vol, t, r0, t_marks, rm_marks in zip(axs[0], vols, titles, r_fixeds, theta_markss, r_markss):
             vol = vol.numpy() if isinstance(vol, torch.Tensor) else np.asarray(vol)
-            if r_fixed is None:
+            if r0 is None:
                 m = np.einsum("iik->ik", vol)[rs] * (r[rs] ** (2 * r_display_power))[:, None]
                 xlabel, label = "r = r' (Å)", rf"$\Theta(r, r, \theta) \cdot r^{{{2 * r_display_power}}}$"
             else:
-                i0 = int(np.argmin(np.abs(r - r_fixed)))
+                i0 = int(np.argmin(np.abs(r - r0)))
                 m = vol[i0][rs] * ((r[i0] * r[rs]) ** r_display_power)[:, None]
                 xlabel, label = f"r' (Å), r = {r[i0]:.2f} Å", rf"$\Theta(r, r', \theta) \cdot (r r')^{{{r_display_power}}}$"
             vmax = np.abs(m[:, interior]).max()
             im = ax.pcolormesh(r[rs], theta_deg, m.T, cmap="RdBu_r", vmin=-vmax, vmax=vmax,
                                shading="auto")
-            for th in theta_marks or []:
+            for th in t_marks or []:
                 ax.axhline(th, color="k", ls=":", lw=1)
-            for rm in r_marks or []:
+            for rm in rm_marks or []:
                 ax.axvline(rm, color="k", ls=":", lw=1)
             ax.set_xlabel(xlabel)
             ax.set_ylabel(r"$\theta$ (deg)")
-            ax.set_yticks(np.arange(0, 181, 45))
+            ax.set_ylim(0, 180)
+            ax.set_yticks(np.arange(0, 181, 30))
             fig.colorbar(im, ax=ax, label=label)
             if t is not None:
                 ax.set_title(t)
@@ -539,7 +546,8 @@ class PairAngleDistributionFunction(AutoSerialize):
         im = ax.pcolormesh(q_axis, dphi, M, cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto")
         ax.set_xlabel("q' (1/Å)")
         ax.set_ylabel(r"$\Delta\phi$ (deg)")
-        ax.set_yticks(np.arange(0, 361, 90))
+        ax.set_ylim(0, 360)
+        ax.set_yticks(np.arange(0, 361, 60))
         ax.set_title(f"q = {q_axis[iq]:.3f} 1/Å")
         fig.colorbar(im, ax=ax, label=r"$C(\Delta\phi, q, q')$")
         if returnfig:
@@ -708,3 +716,13 @@ def padf_from_clusters(
             C = C * float(order_taper(l, int(l_values[-1]) + 2))  # same as reconstruct_PADF
         out += C[:, :, None] * torch.special.legendre_polynomial_p(torch.cos(theta), l)[None, None, :]
     return (out * torch.abs(torch.sin(theta))[None, None, :]).numpy()
+
+
+def _per_panel(value, n, nested=False):
+    """One entry per panel: a list with one item per panel is used as is,
+    anything else is repeated. With nested=True only a list of lists (or
+    Nones) counts as per panel, so a flat list of marks is shared."""
+    if isinstance(value, (list, tuple)) and len(value) == n:
+        if not nested or all(v is None or isinstance(v, (list, tuple, np.ndarray)) for v in value):
+            return list(value)
+    return [value] * n

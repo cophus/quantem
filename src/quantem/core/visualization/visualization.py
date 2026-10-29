@@ -680,6 +680,8 @@ def show_1d(
     xlabel: str | Sequence[str] | None = None,
     ylabel: str | Sequence[str] | None = None,
     log_y: bool | Sequence[bool] = False,
+    xlim: tuple[float, float] | None = None,
+    xticks: ArrayLike | None = None,
     colors: Sequence[str] | None = None,
     figax: tuple[Any, Any] | None = None,
     axsize: tuple[float, float] = (5, 3),
@@ -707,6 +709,10 @@ def show_1d(
         Axis labels.
     log_y : bool or sequence of bool, default=False
         Whether to use a logarithmic vertical axis.
+    xlim : tuple, optional
+        Horizontal axis limits, shared by all panels.
+    xticks : array-like, optional
+        Horizontal tick positions, shared by all panels.
     colors : sequence of str, optional
         Line colors, cycled over the curves of each panel. Defaults to ``viz.colors.set``.
     figax : tuple, optional
@@ -811,6 +817,10 @@ def show_1d(
             ax.plot(coords, y, color=colors[k % len(colors)], label=label, **kwargs)
         if logy:
             ax.set_yscale("log")
+        if xlim is not None:
+            ax.set_xlim(xlim)
+        if xticks is not None:
+            ax.set_xticks(xticks)
         if ttl is not None:
             ax.set_title(ttl)
         if xl is not None:
