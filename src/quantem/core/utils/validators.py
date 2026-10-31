@@ -590,16 +590,22 @@ def validate_aberration_coefficients(value: dict):
     def set_aberrations(params):
         """Standardize aberration coefficients."""
 
+        def scalar(value):
+            # a tensor stays a tensor, so a gradient can reach the coefficient through it
+            if hasattr(value, "requires_grad") and value.requires_grad:
+                return value.reshape(())
+            return float(value)
+
         def process_polar_params(p: dict):
             for symbol, value in p.items():
                 if value is None:
                     continue
                 elif symbol in POLAR_SYMBOLS:
-                    polar_parameters[symbol] = float(value)
+                    polar_parameters[symbol] = scalar(value)
                 elif symbol == "defocus":
-                    polar_parameters["C10"] = -float(value)
+                    polar_parameters["C10"] = -scalar(value)
                 elif symbol in POLAR_ALIASES:
-                    polar_parameters[POLAR_ALIASES[symbol]] = float(value)
+                    polar_parameters[POLAR_ALIASES[symbol]] = scalar(value)
 
         # Start only with explicitly passed aberrations
         polar_parameters = {}

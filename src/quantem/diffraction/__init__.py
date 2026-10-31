@@ -1,3 +1,4 @@
+from quantem.diffraction.polar import PairDistributionFunction as PairDistributionFunction
 from quantem.diffraction.bragg_vectors import BraggVectors as BraggVectors
 from quantem.diffraction.crystal import Crystal as Crystal
 from quantem.diffraction.crystal_map import CrystalMap as CrystalMap
@@ -7,6 +8,6 @@ from quantem.diffraction.reverse_monte_carlo import ReverseMonteCarlo as Reverse
 from quantem.diffraction.strain import StrainMap as StrainMap
 from quantem.diffraction import bloch as bloch
 from quantem.diffraction import calibration as calibration
-from quantem.diffraction import rotations as rotations
+from quantem.diffraction import crystal_rotations as crystal_rotations
 from quantem.diffraction import digital_dark_field as digital_dark_field
 from quantem.diffraction import illumination as illumination

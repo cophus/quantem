@@ -460,12 +460,12 @@ class AutoSerialize:
             self._serialize_container(value, subgroup, skip_names, skip_types, compressors)
 
         elif isinstance(value, set):
-            # Convert set to list for serialization, store type info
+            # Serialize the items as a list, then mark the group as a set: the list writer
+            # records its own container type, which would otherwise load the set as a list
             subgroup = group.require_group(name)
-            subgroup.attrs["_container_type"] = "set"
-            # Convert set items to list and serialize
             list_value = list(value)
             self._serialize_container(list_value, subgroup, skip_names, skip_types, compressors)
+            subgroup.attrs["_container_type"] = "set"
 
         elif hasattr(value, "bit_generator"):
             # NumPy random generator - save state through bit_generator
@@ -1050,6 +1050,11 @@ class AutoSerialize:
 
         elif ctype == "set":
             # Convert back from list to set
+            if (
+                group.attrs.get("_sequence_encoding") == "ndarray"
+                and "values" in group.array_keys()
+            ):
+                return set(AutoSerialize._read_array_np(group, "values").tolist())
             items = []
             for i in range(
                 max(
