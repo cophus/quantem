@@ -22,6 +22,7 @@ on OrientationMap works there exactly as before.
 from __future__ import annotations
 
 import numpy as np
+import torch
 
 from quantem.core.io.serialize import AutoSerialize
 from quantem.diffraction.crystal import Crystal
@@ -66,6 +67,8 @@ class CrystalMap(AutoSerialize):
         The phase decision, populated by :meth:`fit`.
     dynamical : dict or None
         The last :meth:`refine_dynamical` result.
+    pattern_fit : dict or None
+        Score of every crystal from the last :meth:`fit_pattern_scores`.
     """
 
     _token = object()
@@ -111,6 +114,7 @@ class CrystalMap(AutoSerialize):
         self.orientation_maps = orientation_maps
         self.phases: PhaseMap | None = None
         self.dynamical: dict | None = None
+        self.pattern_fit: dict | None = None
         self.metadata: dict = {}
         self.k_max = _common_k_max([om.crystal for om in orientation_maps], k_max)
 
@@ -718,6 +722,104 @@ class CrystalMap(AutoSerialize):
         for i, n in enumerate(self.names):
             out[n] = float((ph == i).mean())
         return out
+
+    def pattern_scores(self, positions=None, progress_bar: bool = True, **kwargs) -> np.ndarray:
+        """Pattern score of every crystal, from the best of its matches at each position.
+
+        See :meth:`OrientationMap.pattern_score`: 1 is a perfect match of
+        positions and relative intensities, and comparing crystals position
+        by position shows which structure explains a pattern and by how much.
+
+        Parameters
+        ----------
+        positions : list of (int, int) | np.ndarray | None
+            Positions to score; None scores every matched position.
+        progress_bar : bool, default=True
+            Show a progress bar per crystal and match.
+        **kwargs
+            Passed to :meth:`OrientationMap.pattern_score`, e.g.
+            `sigma_excitation`.
+
+        Returns
+        -------
+        np.ndarray
+            (R, C, n_crystals) scores; NaN where a crystal was not matched.
+        """
+        scores = [
+            np.fmax.reduce(
+                [
+                    om.pattern_score(
+                        positions=positions, match=m, progress_bar=progress_bar, **kwargs
+                    )
+                    for m in range(om.quats.shape[2])
+                ]
+            )
+            for om in self.orientation_maps
+        ]
+        return np.stack(scores, axis=2)
+
+    def fit_pattern_scores(
+        self, positions=None, progress_bar: bool = True, **kwargs
+    ) -> "CrystalMap":
+        """Decide phase and orientation by how well each crystal explains the intensities.
+
+        Every match of every crystal is scored with
+        :meth:`OrientationMap.pattern_score`, and the matches of each crystal
+        are re-ranked by that score (:meth:`OrientationMap.rank_matches`),
+        so the orientation maps show the orientation that explains the
+        intensities best. The crystal with the highest score wins every
+        scored position, and the reliability is its lead over the runner-up
+        crystal, in score units. The decision replaces any earlier one, and
+        positions left unscored are unindexed.
+
+        Parameters
+        ----------
+        positions : list of (int, int) | np.ndarray | None
+            Positions to score; None scores every matched position.
+        progress_bar : bool, default=True
+            Show a progress bar per crystal and match.
+        **kwargs
+            Passed to :meth:`OrientationMap.pattern_score`, e.g.
+            `sigma_excitation`.
+
+        Returns
+        -------
+        CrystalMap
+            Self. :attr:`phases` holds the decision (`phase_index`,
+            `reliability`, and `cost_best` as one minus the winning score),
+            and :attr:`pattern_fit` the (R, C, n_crystals) "score" of the
+            best match of every crystal.
+        """
+        R, C = self.shape
+        n = len(self.orientation_maps)
+        # a new decision: positions left unscored are unindexed
+        self.phases = PhaseMap.from_orientation_maps(self.orientation_maps)
+        cands = self.phases.candidates
+        score = np.full((R, C, n), np.nan)
+        cost = torch.full((R, C, len(cands)), torch.nan, dtype=torch.float64)
+        for i, om in enumerate(self.orientation_maps):
+            s = np.stack(
+                [
+                    om.pattern_score(
+                        positions=positions, match=m, progress_bar=progress_bar, **kwargs
+                    )
+                    for m in range(om.quats.shape[2])
+                ],
+                axis=2,
+            )
+            order = np.argsort(-np.nan_to_num(s, nan=-np.inf), axis=-1, kind="stable")
+            om.rank_matches(s)
+            s = np.take_along_axis(s, order, axis=-1)
+            score[..., i] = s[..., 0]
+            for f, (j, m) in enumerate(cands):
+                if j == i:
+                    cost[..., f] = torch.as_tensor(1 - s[..., m])
+        winner = torch.as_tensor(np.nan_to_num(score, nan=-np.inf).argmax(axis=-1))
+        self.phases.apply_dynamical(
+            {"cost": cost, "phase_index": winner, "metadata": {"pattern_scores": True}}
+        )
+        self.pattern_fit = {"score": score}
+        return self
 
     # ------------------------------------------------------------------
     # plotting

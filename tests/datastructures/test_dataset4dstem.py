@@ -166,3 +166,22 @@ class TestProbePositions:
         dataset = self._dataset(sampling=(2.0, 3.0, 0.1, 0.1), units=["A", "nm", "A^-1", "A^-1"])
         with pytest.raises(ValueError, match="must share a unit"):
             dataset.probe_positions()
+
+
+def test_correlative_filter_averages_within_a_grain_only():
+    """Two grains with different spots: noise drops inside each, and the boundary stays sharp."""
+    rng = np.random.default_rng(0)
+    q = np.arange(32) - 15.5
+    spots = [
+        np.exp(-((q[:, None] - a) ** 2 + (q[None, :] - b) ** 2) / 2) for a, b in ((8, 0), (0, 8))
+    ]
+    truth = np.zeros((8, 8, 32, 32), dtype=np.float32)
+    truth[:, :4], truth[:, 4:] = spots[0], spots[1]
+    noisy = truth + rng.normal(0, 0.03, truth.shape).astype(np.float32)
+    dataset = Dataset4dstem.from_array(noisy, sampling=(1, 1, 0.1, 0.1))
+    filtered = dataset.correlative_filter(radius=2, sigma_q=1.0, edge=2, progress_bar=False)
+    error, error_noisy = np.abs(filtered.array - truth), np.abs(noisy - truth)
+    assert error.mean() < 0.5 * error_noisy.mean()
+    # the column next to the boundary keeps its own grain: almost none of the other spot leaks in
+    leak = (filtered.array[:, 3] * spots[1]).sum(axis=(-2, -1)) / (spots[1] ** 2).sum()
+    assert np.abs(leak).max() < 0.05

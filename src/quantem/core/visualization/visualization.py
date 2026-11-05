@@ -64,11 +64,12 @@ def _show_2d_array(
     scalebar: ScalebarInputCell = None,
     cmap: str | colors.Colormap = "gray",
     chroma_boost: float = 1.0,
-    cbar: bool = False,
+    cbar: bool | dict = False,
     title: str | None = None,
     figax: tuple[Any, Any] | None = None,
     figsize: tuple[int, int] = (8, 8),
     show_ticks: bool = False,
+    cbar_space: bool = False,
     **kwargs: Any,
 ) -> tuple[Any, Any]:
     """Render a single 2D array (real or complex) with optional colorbar/scalebar.
@@ -87,8 +88,10 @@ def _show_2d_array(
         Colormap to use for real data or amplitude of complex data.
     chroma_boost : float, default=1.0
         Factor to boost color saturation when displaying complex data.
-    cbar : bool, default=False
-        Whether to add a colorbar to the plot.
+    cbar : bool or dict, default=False
+        Whether to add a colorbar to the plot. A dict adds one with options:
+        ``"end_labels"``, a (low, high) pair of strings written at the ends
+        of the bar, e.g. ``("O3", "O1")``.
     title : str, optional
         Title for the plot.
     figax : tuple, optional
@@ -97,6 +100,9 @@ def _show_2d_array(
         Figure size in inches, used only if figax is None.
     show_ticks : bool, default=False
         Whether to show axis ticks and labels.
+    cbar_space : bool, default=False
+        Without a colorbar, leave its space empty, so that the panel is the
+        size of its neighbours that have one.
 
     **kwargs : dict
         Additional keyword arguments passed to the plotting functions.
@@ -160,12 +166,18 @@ def _show_2d_array(
         # Convert cmap to Colormap if it's a string
         cmap_obj = mpl.colormaps.get_cmap(cmap) if isinstance(cmap, str) else cmap
         cb_abs = add_cbar_to_ax(fig, ax_cb_abs, norm_obj, cmap_obj)
+        if isinstance(cbar, dict) and cbar.get("end_labels") is not None:
+            low, high = cbar["end_labels"]
+            cb_abs.ax.text(0, -0.01, low, transform=cb_abs.ax.transAxes, va="top")
+            cb_abs.ax.text(0, 1.01, high, transform=cb_abs.ax.transAxes, va="bottom")
 
         if is_complex:
             ax_cb_angle = divider.append_axes("right", size="5%", pad="15%")
             add_arg_cbar_to_ax(fig, ax_cb_angle, chroma_boost=chroma_boost)
             cb_abs.set_label("abs", rotation=0, ha="center", va="bottom")
             cb_abs.ax.yaxis.set_label_coords(0.5, -0.07)
+    elif cbar_space:
+        make_axes_locatable(ax).append_axes("right", size="5%", pad="2.5%").axis("off")
 
     if scalebar_config is not None:
         add_scalebar_to_ax(
@@ -422,7 +434,7 @@ def _normalize_show_args_to_grid(
     norm: Show2dNormInput = None,
     scalebar: Show2dScalebarInput = None,
     cmap: CmapType | Sequence[CmapType] | Sequence[Sequence[CmapType]] = "gray",
-    cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
+    cbar: bool | dict | Sequence[bool | dict] | Sequence[Sequence[bool | dict]] = False,
     title: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
     chroma_boost: float | Sequence[float] = 1.0,
     show_ticks: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
@@ -460,7 +472,7 @@ def show_2d(
     norm: Show2dNormInput = None,
     scalebar: Show2dScalebarInput = None,
     cmap: CmapType | Sequence[CmapType] | Sequence[Sequence[CmapType]] = "gray",
-    cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
+    cbar: bool | dict | Sequence[bool | dict] | Sequence[Sequence[bool | dict]] = False,
     title: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
     figax: tuple[Any, Any] | None = None,
     axsize: tuple[int, int] = (4, 4),
@@ -489,8 +501,11 @@ def show_2d(
     cmap : str or Colormap, default="gray"
         Colormap to use for real data or amplitude of complex data.
         Common choices: ``"gray"``, ``"viridis"``, ``"turbo"``, ``"inferno"``, ``"magma"``.
-    cbar : bool, default=False
-        Whether to add a colorbar to the plot.
+    cbar : bool or dict, default=False
+        Whether to add a colorbar to the plot. A dict such as
+        ``{"end_labels": ("O3", "O1")}`` also writes labels at the low and
+        high ends of the bar. Panels without a colorbar keep the size of
+        those with one.
     title : str, optional
         Title for the plot.
     figax : tuple, optional
@@ -615,12 +630,15 @@ def show_2d(
             figsize = kwargs.pop("figsize", (axsize[0] * ncols, axsize[1] * nrows))
             fig, axs = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
 
+        # panels without a colorbar keep the size of those with one
+        cbar_space = any(a["cbar"] for row in normalized_args for a in row)
         for i, row in enumerate(grid):
             for j, array in enumerate(row):
                 figax_local = (fig, axs[i][j])
                 _show_2d_array(
                     array,
                     figax=figax_local,
+                    cbar_space=cbar_space,
                     **normalized_args[i][j],
                     **kwargs,
                 )

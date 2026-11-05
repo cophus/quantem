@@ -4,6 +4,8 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import copy
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
@@ -174,6 +176,22 @@ def test_crystal_map_plots_smoke(two_phase):
     fig, axs = cm.plot_matches([(0, 0)], phase="Ti alpha")
     assert axs.shape == (1, 1)
     plt.close("all")
+
+
+def test_fit_pattern_scores_ranks_matches(two_phase):
+    cm = copy.deepcopy(two_phase)
+    cm.match_orientations(num_matches=2, progress_bar=False)
+    om = cm[0]
+    om.quats[0, 0] = om.quats[0, 0].flip(0)  # the better match second
+    cm.fit_pattern_scores(progress_bar=False)
+    s0, s1 = (om.pattern_score(match=m, progress_bar=False) for m in (0, 1))
+    assert (s0[:, :-1] >= s1[:, :-1]).all()
+    ph = cm.phase_index
+    assert (ph[:, :3] == 0).all() and (ph[:, 3:-1] == 1).all() and (ph[:, -1] == -1).all()
+    s = cm.pattern_fit["score"][:, :-1]
+    np.testing.assert_allclose(
+        cm.phases.reliability.numpy()[:, :-1], np.abs(s[..., 0] - s[..., 1])
+    )
 
 
 def test_refine_overrides_name_known_crystals(two_phase):

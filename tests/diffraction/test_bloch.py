@@ -5,6 +5,7 @@ from functools import lru_cache
 import numpy as np
 import pytest
 import torch
+from ase import Atoms
 from ase.build import bulk
 
 from quantem.core.datastructures.vector import Vector
@@ -769,6 +770,19 @@ def test_mean_absorption_and_forbidden_beam():
     total = inten_np[0].sum(dim=1).numpy()
     assert np.allclose(total, np.exp(-2 * np.pi * u0 * z.numpy() / k0), rtol=1e-8)
 
+    # partial order: both sites hold Fe and Ni, at different occupancies, so
+    # the cell is not body centred and its superlattice beam 100 is allowed
+    atoms = Atoms(
+        "FeNiFeNi",
+        scaled_positions=[[0, 0, 0], [0, 0, 0], [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]],
+        cell=[3.0, 3.0, 3.0],
+        pbc=True,
+    )
+    atoms.set_array("occupancy", np.array([0.75, 0.25, 0.25, 0.75]))
+    xtl = Crystal.from_ase(atoms, verbose=False).calculate_structure_factors(k_max=1.0)
+    xtl.calculate_dynamical_structure_factors(200e3, k_max=1.0)
+    assert [1, 0, 0] in bloch._beam_universe(xtl)[0].tolist()
+
 
 def test_fourier_ring_matches_quadrature():
     """The harmonic propagation of the centered precession ring reproduces a
@@ -868,6 +882,14 @@ def test_refine_dynamical_reported_cost_reproducible():
         cost, _, _, _ = bloch._dynamical_cost(inten[:, :, 1:], g_xy[1:], qxy, im, 0.05, 0.25, 0.02)
         t_idx = int(np.argmin(np.abs(np.arange(300, 600, 50.0) - float(res["thickness"][0, i]))))
         assert np.isclose(float(cost[0, t_idx]), float(res["cost"][0, i, 0]), rtol=1e-6, atol=1e-9)
+
+    # two simulated beams inside one measured disk add up to its intensity
+    qxy = torch.tensor([[0.0, 0.0], [0.5, 0.0], [0.0, 0.5]], dtype=torch.float64)
+    im = torch.tensor([9.0, 2.0, 2.0], dtype=torch.float64) ** 0.5
+    sq = torch.tensor([[0.5, 0.0], [0.51, 0.0], [0.0, 0.5]], dtype=torch.float64)
+    inten = torch.tensor([[[1.0, 1.0, 2.0]]], dtype=torch.float64)
+    cost, _, _, _ = bloch._dynamical_cost(inten, sq, qxy, im, 0.05, 0.5)
+    assert float(cost[0, 0]) < 1e-9, "beams sharing a disk must be summed"
 
 
 def test_image_cost_radial_background():

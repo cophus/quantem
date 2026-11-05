@@ -1033,6 +1033,114 @@ class Dataset4dstem(Dataset4d):
         # Initialize empty virtual images dict (will be populated by regenerate_virtual_images)
         new_dataset._virtual_images = {}
 
+    def correlative_filter(
+        self,
+        radius: int = 4,
+        sigma: float = 0.3,
+        sigma_q: float = 3.0,
+        edge: int = 12,
+        progress_bar: bool = True,
+    ) -> "Dataset4dstem":
+        """Average every pattern with its scan neighbours, weighted by how similar they are.
+
+        Lee et al., arXiv:2601.17262. For the comparison each pattern is
+        blurred by `sigma_q` pixels, weighted by |q|^2 to suppress the
+        direct beam, with `edge` pixels at the detector edge left out, then
+        mean-subtracted and normalized. Every pattern is averaged with the
+        neighbours within `radius` probe positions, with weights
+        exp(-d^2 / (2 sigma^2)), where d is the distance between the
+        normalized patterns (d^2 = 2 - 2 times their correlation), and with
+        weight 1 for itself. Neighbours across a grain boundary differ by
+        far more than sigma and drop out, so boundaries stay sharp.
+
+        Parameters
+        ----------
+        radius : int, default=4
+            Neighbourhood radius in probe positions.
+        sigma : float, default=0.3
+            Width of the similarity weight. 0.3 gives neighbours that
+            correlate at 0.95 a weight of 0.8, at 0.85 a weight of 0.2, and
+            below 0.7 almost none, close to the clipped ramp of Lee et al.
+        sigma_q : float, default=3.0
+            Blur in pixels of the patterns compared.
+        edge : int, default=12
+            Detector-edge pixels left out of the comparison.
+        progress_bar : bool, default=True
+            Show a progress bar over the neighbour offsets.
+
+        Returns
+        -------
+        Dataset4dstem
+            The filtered dataset with the same calibration. Its metadata
+            "correlative_filter" records the parameters.
+        """
+        import torch.nn.functional as F
+        from tqdm import tqdm
+
+        R, C, Qx, Qy = self.shape
+        data = torch.as_tensor(np.asarray(self.array), dtype=torch.float32)
+        # comparison patterns: blurred, |q|^2 weighted, every second pixel
+        n = int(np.ceil(3 * sigma_q))
+        g = torch.exp(-0.5 * (torch.arange(-n, n + 1, dtype=torch.float32) / sigma_q) ** 2)
+        g = g / g.sum()
+        qx = torch.arange(Qx, dtype=torch.float32) - (Qx - 1) / 2
+        qy = torch.arange(Qy, dtype=torch.float32) - (Qy - 1) / 2
+        w = qx[:, None] ** 2 + qy[None, :] ** 2
+        if edge > 0:
+            w[:edge], w[-edge:], w[:, :edge], w[:, -edge:] = 0, 0, 0, 0
+        w = w[::2, ::2]
+        feat = torch.empty((R, C, w.numel()), dtype=torch.float32)
+        for r0 in range(0, R, 8):
+            x = data[r0 : r0 + 8].reshape(-1, 1, Qx, Qy)
+            x = F.conv2d(F.pad(x, (n, n, 0, 0), mode="reflect"), g.view(1, 1, 1, -1))
+            x = F.conv2d(F.pad(x, (0, 0, n, n), mode="reflect"), g.view(1, 1, -1, 1))
+            x = x[:, 0, ::2, ::2]
+            x = (x - (x * w).sum(dim=(1, 2), keepdim=True) / w.sum()) * w
+            norm = torch.linalg.norm(x.reshape(x.shape[0], -1), dim=1)
+            feat[r0 : r0 + 8] = (
+                x.reshape(x.shape[0], -1) / norm.clamp_min(1e-12)[:, None]
+            ).reshape(-1, C, w.numel())
+
+        def correlation(dr, dc):
+            # correlation of every position with its neighbour at (dr, dc)
+            a = (slice(max(0, -dr), R - max(0, dr)), slice(max(0, -dc), C - max(0, dc)))
+            b = (slice(max(0, dr), R - max(0, -dr)), slice(max(0, dc), C - max(0, -dc)))
+            corr = torch.cat(
+                [
+                    (feat[a][i : i + 8] * feat[b][i : i + 8]).sum(dim=-1)
+                    for i in range(0, a[0].stop - a[0].start, 8)
+                ]
+            )
+            return a, b, corr
+
+        rr, cc = np.meshgrid(
+            np.arange(-radius, radius + 1), np.arange(-radius, radius + 1), indexing="ij"
+        )
+        keep = (rr**2 + cc**2 <= (radius + 0.5) ** 2) & ((rr != 0) | (cc != 0))
+        out = data.clone()
+        weight_sum = torch.ones((R, C), dtype=torch.float32)
+        for dr, dc in tqdm(
+            list(zip(rr[keep], cc[keep])), desc="correlative filter", disable=not progress_bar
+        ):
+            a, b, corr = correlation(int(dr), int(dc))
+            wgt = torch.exp(-(2 - 2 * corr) / (2 * sigma**2))
+            out[a].addcmul_(wgt[..., None, None], data[b])
+            weight_sum[a] += wgt
+        out /= weight_sum[..., None, None]
+
+        filtered = Dataset4dstem.from_array(
+            out.numpy(),
+            name=self.name,
+            origin=self.origin,
+            sampling=self.sampling,
+            units=self.units,
+            signal_units=self.signal_units,
+        )
+        filtered.metadata["correlative_filter"] = dict(
+            radius=int(radius), sigma=float(sigma), sigma_q=float(sigma_q), edge=int(edge)
+        )
+        return filtered
+
     def median_filter_masked_pixels(self, mask: np.ndarray, kernel_width: int = 3):
         """
         This function fixes a datacube where the same pixels are consistently

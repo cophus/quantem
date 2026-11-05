@@ -158,11 +158,11 @@ def _primitive_lattice_mask(crystal: Crystal, g: torch.Tensor) -> torch.Tensor:
 
         from quantem.diffraction.crystal import _spglib_raises
 
-        cell = (
-            crystal.lat_real.numpy(),
-            crystal.positions_frac.numpy(),
-            crystal.numbers.numpy(),
-        )
+        # a site is its species and occupancy: partially ordered sublattices
+        # that hold the same species are not lattice translations of each other
+        species = np.column_stack((crystal.numbers.numpy(), crystal.occupancy.numpy()))
+        kinds = np.unique(species.round(6), axis=0, return_inverse=True)[1].ravel()
+        cell = (crystal.lat_real.numpy(), crystal.positions_frac.numpy(), kinds + 1)
         try:
             with _spglib_raises():
                 prim = spglib.standardize_cell(cell, to_primitive=True, no_idealize=True)
@@ -699,7 +699,7 @@ def _bloch_solve(
     phase = torch.exp(
         2j * np.pi * gam[:, None, :] * t_thick.to(torch.complex128)[None, :, None]
     )  # (B, T, nb)
-    psi = torch.einsum("bij,btj,bj->bti", C, phase, psi0)
+    psi = (phase * psi0[:, None, :]) @ C.transpose(1, 2)
     return torch.abs(psi) ** 2
 
 
@@ -2517,11 +2517,14 @@ def _dynamical_cost(inten, sq, qxy, im, delta, power: float, min_sim_rel: float 
     thickness). Both sides are compared as I ** power; the power is applied
     here, after any illumination averaging, never before it. Pairing is by
     position (within delta); the position residuals themselves do not
-    enter, they belong to the deformation fit. Unpaired simulated beams
-    weaker than min_sim_rel times the strongest simulated beam (a
-    visibility mask on the RAW intensities, so it is defined for power =
-    0 as well) are ignored: they are the beams a detector would not see,
-    and with power < 1 they would otherwise dominate the unpaired term."""
+    enter, they belong to the deformation fit. Simulated beams paired with
+    the same measured disk, e.g. from several Laue layers, are summed as raw
+    intensities before the power, as the detector sums them. Unpaired
+    simulated beams weaker than min_sim_rel times the strongest simulated
+    beam (a visibility mask on the RAW intensities, so it is defined for
+    power = 0 as well) are ignored: they are the beams a detector would not
+    see, and with power < 1 they would otherwise dominate the unpaired
+    term."""
     d = torch.cdist(sq, qxy)
     d_min, j_min = d.min(dim=1)
     pair = d_min < delta
@@ -2529,13 +2532,16 @@ def _dynamical_cost(inten, sq, qxy, im, delta, power: float, min_sim_rel: float 
         return None, pair, j_min, d_min
     visible = inten > min_sim_rel * inten.amax(dim=2, keepdim=True)
     si = inten.clamp_min(0) ** power
-    a = si[:, :, pair]
-    b = im[j_min[pair]][None, None, :]
+    disks, slot = torch.unique(j_min[pair], return_inverse=True)
+    summed = inten.new_zeros(inten.shape[:2] + disks.shape)
+    summed.index_add_(2, slot, inten[:, :, pair].clamp_min(0))
+    a = summed**power
+    b = im[disks][None, None, :]
     w = ((a * b).sum(dim=2) / (a * a).sum(dim=2).clamp_min(1e-12)).clamp_min(0)[:, :, None]
     c_paired = (b - w * a).abs().sum(dim=2)
     c_unpaired_sim = 0.5 * w[:, :, 0] * (si[:, :, ~pair] * visible[:, :, ~pair]).sum(dim=2)
     matched = torch.zeros(im.shape[0], dtype=torch.bool)
-    matched[j_min[pair]] = True
+    matched[disks] = True
     # the measured direct beam is not a diffracted intensity: leave it out
     # of the unexplained-measured term and of the normalization
     direct = torch.linalg.norm(qxy, dim=1) < delta

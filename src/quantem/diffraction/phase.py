@@ -159,6 +159,7 @@ class PhaseMap(AutoSerialize):
         weight_unmatched_sim: float = 0.5,
         weight_overprediction: float = 1.0,
         min_sim_intensity_rel: float = 0.02,
+        detection_limit: bool = True,
         k_max: float | None = None,
         min_number_peaks: int | None = None,
         min_diffracted_peaks: int = 2,
@@ -205,6 +206,15 @@ class PhaseMap(AutoSerialize):
             maximum are dropped before comparison: kinematically weak spots
             are frequently unobservable and should not penalize a phase whose
             structure factors happen to include many of them.
+        detection_limit : bool, default=True
+            A simulated beam with no measured partner counts against a
+            candidate in proportion to how visible it should have been. The
+            pattern is scaled to the disks it pairs with, and an unpaired
+            beam at x times the weakest disk measured at that position is
+            weighted by x^2 / (1 + x^2): beams well above the detection
+            limit count in full, and weaker ones fade smoothly as a power
+            law. Otherwise a dense pattern pays for spots too weak to
+            detect, and sparse templates win whatever the data show.
         k_max : float | None
             Restrict the comparison below this scattering vector
             (1/Angstroms).
@@ -258,6 +268,7 @@ class PhaseMap(AutoSerialize):
             weight_unmatched_sim=float(weight_unmatched_sim),
             weight_overprediction=float(weight_overprediction),
             min_sim_intensity_rel=float(min_sim_intensity_rel),
+            detection_limit=bool(detection_limit),
             k_max=k_max,
             min_number_peaks=int(min_number_peaks),
             min_diffracted_peaks=int(min_diffracted_peaks),
@@ -306,6 +317,9 @@ class PhaseMap(AutoSerialize):
             if k_max is not None:
                 keep = torch.linalg.norm(qxy, dim=1) <= k_max
                 qxy, im = qxy[keep], im[keep]
+            raw = im.clone()
+            diffracted_peak = torch.linalg.norm(qxy, dim=1) > null_k_min
+            weakest = float(raw[diffracted_peak].min()) if diffracted_peak.any() else 0.0
             im = im**power_intensity
             n_exp = im.shape[0]
             int_total = float(im.sum())
@@ -335,8 +349,14 @@ class PhaseMap(AutoSerialize):
                     j_min[pair].numpy(),
                     (si[pair] * (1 - frac)).numpy(),
                 )
+                visible = torch.ones_like(si)
+                if detection_limit and bool(pair.any()):
+                    disks = torch.unique(j_min[pair])
+                    scale = raw[disks].sum() / s_raw[pair].sum().clamp_min(1e-30)
+                    x2 = (scale * s_raw / max(weakest, 1e-30)) ** 2
+                    visible = x2 / (1 + x2)
                 unpaired_sim[f] = weight_unmatched_sim * (
-                    float(si[~pair].sum()) + float((si[pair] * frac).sum())
+                    float((si[~pair] * visible[~pair]).sum()) + float((si[pair] * frac).sum())
                 )
 
             im_np = im.numpy()
@@ -512,6 +532,7 @@ class PhaseMap(AutoSerialize):
         shade_gamma: float = 1.0,
         majority_filter: int = 0,
         reliability_range: tuple[float, float] | None = None,
+        crop: tuple[slice, slice] | None = None,
         scalebar: dict | str | None = "auto",
         figax=None,
     ):
@@ -553,11 +574,15 @@ class PhaseMap(AutoSerialize):
         reliability_range : tuple | None
             Backwards-compatible shortcut: setting it selects
             ``shade_by="reliability"`` with this range.
+        crop : (slice, slice) | None
+            Rows and columns of the scan to show, for example the bounding
+            box of a particle, so the map matches other cropped maps.
         scalebar : dict | "auto" | None
             Real-space scale bar. "auto" (the default) takes the scan step
             and units carried from the dataset by the orientation maps; a
             dict such as {"sampling": 30, "units": "A"} overrides it, and
-            None draws no bar.
+            None draws no bar. The dict may also set "length", "loc",
+            "width_px", "pad_px" and "color".
         figax : (fig, ax) | None
             Existing axes to draw into.
 
@@ -574,6 +599,7 @@ class PhaseMap(AutoSerialize):
         if isinstance(scalebar, str):
             scalebar = self.orientation_maps[0].scan_scalebar if scalebar == "auto" else None
         import matplotlib.pyplot as plt
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
 
         from quantem.core.visualization.visualization_utils import add_scalebar_to_ax
         from quantem.diffraction.orientation_visualization import phase_color_cycle
@@ -619,9 +645,11 @@ class PhaseMap(AutoSerialize):
             phase = _majority_filter(phase, int(majority_filter))
             alpha = alpha * (phase >= 0)
         rgb = phase_colors[np.where(phase >= 0, phase, 0)] * alpha[..., None]
+        if crop is not None:
+            rgb = rgb[crop]
 
         if figax is None:
-            fig, ax = plt.subplots(figsize=(9, 4.5))
+            fig, ax = plt.subplots(figsize=(4, 4))
         else:
             fig, ax = figax
         ax.imshow(rgb, interpolation="nearest")
@@ -634,30 +662,33 @@ class PhaseMap(AutoSerialize):
                 sampling=scalebar.get("sampling", 1.0),
                 length_units=scalebar.get("length", None),
                 units=scalebar.get("units", "pixels"),
-                width_px=rgb.shape[0] / 40,
-                pad_px=rgb.shape[0] / 80,
+                width_px=scalebar.get("width_px", rgb.shape[0] / 40),
+                pad_px=scalebar.get("pad_px", rgb.shape[0] / 80),
                 color=scalebar.get("color", "white"),
-                loc="lower right",
+                loc=scalebar.get("loc", "lower right"),
             )
         handles = [
             plt.Line2D([0], [0], marker="s", ls="", color=c, label=n)
             for c, n in zip(phase_colors, self.names)
         ]
         ax.legend(handles=handles, loc="upper left", fontsize=8)
-        # stacked reliability colorbars, black -> phase color
-        from matplotlib.cm import ScalarMappable
-        from matplotlib.colors import LinearSegmentedColormap, Normalize
-
+        # brightness key: one strip per phase, black -> phase color, in one
+        # frame, in the space show_2d gives a colorbar so that the panels match
         n_ph = len(phase_colors)
-        for k, color in enumerate(phase_colors):
-            cmap_k = LinearSegmentedColormap.from_list(
-                f"rel{k}", [(0, 0, 0), tuple(color)], gamma=shade_gamma
-            )
-            cax = ax.inset_axes([1.02 + 0.025 * k, 0.05, 0.025, 0.9])
-            cb = fig.colorbar(ScalarMappable(norm=Normalize(lo, hi), cmap=cmap_k), cax=cax)
-            if k < n_ph - 1:
-                cb.set_ticks([])
-            else:
-                cb.set_ticks([lo, hi])
-                cb.set_label(cbar_label, fontsize=9)
+        ramp = np.linspace(0.0, 1.0, 256) ** shade_gamma
+        cax = make_axes_locatable(ax).append_axes("right", size="5%", pad="2.5%")
+        cax.imshow(
+            ramp[:, None, None] * phase_colors[None],
+            origin="lower",
+            aspect="auto",
+            extent=(0, n_ph, lo, hi),
+            interpolation="nearest",
+        )
+        for k in range(1, n_ph):
+            cax.axvline(k, color="black", lw=0.8)
+        cax.set_xticks([])
+        cax.yaxis.tick_right()
+        cax.yaxis.set_label_position("right")
+        cax.set_yticks([lo, hi])
+        cax.set_ylabel(cbar_label, fontsize=9)
         return fig, ax

@@ -118,6 +118,15 @@ class TestShow2DMain:
         assert axs.shape == (2, 2)
         plt.close(fig)
 
+    def test_show_2d_colorbar_end_labels_and_equal_panels(self, sample_arrays):
+        fig, axs = show_2d(sample_arrays[:2], cbar=[{"end_labels": ("O3", "O1")}, False])
+        fig.canvas.draw()
+        texts = {t.get_text() for ax in fig.axes for t in ax.texts}
+        assert {"O3", "O1"} <= texts
+        widths = [ax.get_window_extent().width for ax in axs]
+        assert np.isclose(widths[0], widths[1]), widths
+        plt.close(fig)
+
     def test_show_2d_with_combine_images(self, sample_arrays, mock_fig_ax):
         # Convert arrays to float type and ensure proper shape handling
         sample_arrays = [arr.astype(float) for arr in sample_arrays]
