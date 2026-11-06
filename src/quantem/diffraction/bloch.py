@@ -454,7 +454,8 @@ def refine_thickness(
     oms = phase_map.orientation_maps
     fit_md = phase_map.metadata.get("fit") if hasattr(phase_map, "metadata") else None
     pair_distance = inherit(pair_distance, "pair_distance", fit_md)
-    power_intensity = inherit(power_intensity, "power_intensity", fit_md)
+    plan_md = phase_map.orientation_maps[0].metadata.get("plan")
+    power_intensity = inherit(power_intensity, "power_intensity", plan_md)
     min_number_peaks = int(inherit(min_number_peaks, "min_number_peaks", fit_md))
     if min_number_peaks < 3:
         raise ValueError(
@@ -2718,11 +2719,11 @@ def refine_dynamical(
         peak are paired; inherited from the phase fit.
     power_intensity : float | None
         Intensities are compared as I ** power_intensity; inherited from
-        the phase fit.
+        the matching plan.
     min_sim_intensity_rel : float | None
         Unpaired simulated beams weaker than this fraction of the
         strongest simulated beam do not count against a candidate (the
-        detector would not have seen them). Inherited from the phase fit.
+        detector would not have seen them); None takes 0.02.
     sg_max : float, default=0.1
         Excitation error cutoff (1/Angstroms) of the Bloch beam list,
         widened by the tilt search range and the illumination.
@@ -2838,8 +2839,9 @@ def refine_dynamical(
     fit_md = phase_map.metadata.get("fit") if hasattr(phase_map, "metadata") else None
     om_md = oms[0].metadata if hasattr(oms[0], "metadata") else None
     pair_distance = inherit(pair_distance, "pair_distance", fit_md)
-    power_intensity = inherit(power_intensity, "power_intensity", fit_md)
-    min_sim_intensity_rel = inherit(min_sim_intensity_rel, "min_sim_intensity_rel", fit_md)
+    plan_md = phase_map.orientation_maps[0].metadata.get("plan")
+    power_intensity = inherit(power_intensity, "power_intensity", plan_md)
+    min_sim_intensity_rel = 0.02 if min_sim_intensity_rel is None else min_sim_intensity_rel
     min_number_peaks = int(inherit(min_number_peaks, "min_number_peaks", fit_md))
     if min_number_peaks < 3:
         raise ValueError(

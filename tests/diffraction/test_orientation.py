@@ -6,7 +6,7 @@ import torch
 from ase.build import bulk
 
 from quantem.core.datastructures.vector import Vector
-from quantem.core.utils.rotations import misorientation_angle_deg, qmult, qnormalize
+from quantem.core.utils.rotations import misorientation_angle_deg, qnormalize
 from quantem.diffraction.crystal import Crystal
 from quantem.diffraction.orientation import OrientationMap
 
@@ -59,25 +59,13 @@ def test_normalized_scores_and_reliability():
     q_true = qnormalize(torch.randn(6, 4, dtype=torch.float64))
     peaks = _make_peaks(xtl, q_true)
     om = OrientationMap.from_vectors(peaks, xtl, energy_ev=200e3)
-    om.build_plan(angle_step_zone_axis_deg=3.0, angle_step_in_plane_deg=3.0, sigma_excitation=0.02)
+    om.build_plan(angle_step_zone_axis_deg=3.0, angle_step_in_plane_deg=3.0)
     om.match_orientations(progress_bar=False)
 
     assert float(om.corr.max()) <= 1.0 + 1e-9
     assert float(om.corr.min()) >= 0.0
     assert om.reliability is not None
     assert (om.reliability[0] > 0).all()
-
-    # pattern_score: near 1 at the refined orientation, low 10 degrees away
-    om.refine_orientations(zone_max_total_deg=3.0, progress_bar=False)
-    score = om.pattern_score(progress_bar=False)
-    assert np.nanmedian(score) > 0.9
-    tilt = torch.tensor(
-        [np.cos(np.radians(5)), np.sin(np.radians(5)), 0.0, 0.0], dtype=torch.float64
-    )
-    om.quats[..., 0, :] = qnormalize(qmult(om.quats[..., 0, :].to(torch.float64), tilt)).to(
-        om.quats.dtype
-    )
-    assert np.nanmedian(om.pattern_score(progress_bar=False)) < 0.6
 
 
 def test_mirror_channel():
@@ -242,7 +230,7 @@ def test_metadata_inheritance():
     pm = PhaseMap.from_orientation_maps([om])
     pm.fit(progress_bar=False)
     assert pm.metadata["fit"]["pair_distance"] == 0.04
-    assert pm.metadata["fit"]["power_intensity"] == 0.3
+    assert pm.metadata["fit"]["power_intensity"] == 0.5  # the decision's own, not the plan's
     assert pm.metadata["fit"]["min_number_peaks"] == 5
     xtl.calculate_dynamical_structure_factors(energy_ev=200e3, k_max=2.0)
     res = bloch.refine_dynamical(

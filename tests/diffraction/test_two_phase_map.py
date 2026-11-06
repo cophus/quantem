@@ -192,6 +192,24 @@ def test_dynamical_update_is_local_and_examples_are_spread():
     changed[0, 0] = False
     assert not changed.any()
     assert (cm.phases.metadata["kinematical"]["phase_index"].numpy() == before).all()
+    # the per-crystal costs follow the refinement, and stay kinematical elsewhere
+    gap = cm.phases.cost_gap("Ti alpha", "Ti beta")
+    assert np.isclose(gap[0, 0], -0.8) and (gap[1:, :4] > 0).all()
+
+    # a position continues the nearest grain, whichever crystal won beside it
+    where = np.zeros((R, C), dtype=bool)
+    where[1, 3] = where[1, 4] = True
+    angle, crystal = cm.phases.nearest_grain(where, ~where)
+    assert crystal[1, 3] == 0 and crystal[1, 4] == 1 and (crystal == -1).sum() == R * C - 2
+    assert angle[1, 3] < 0.5 and angle[1, 4] < 0.5, angle[where]
+    listed = cm.phases.nearest_grain([(1, 3), (1, 4)], np.ones((R, C), dtype=bool))[1]
+    assert listed[1, 3] == 0 and listed[1, 4] == 1 and (listed == -1).sum() == R * C - 2
+    om = cm.orientation_maps[0]
+    saved = om.quats[1, 3].clone()
+    tilt = torch.tensor([np.cos(np.radians(10)), np.sin(np.radians(10)), 0.0, 0.0])
+    om.quats[1, 3] = qmult(om.quats[1, 3].to(tilt.dtype), tilt).to(om.quats.dtype)
+    assert 15 < cm.phases.nearest_grain(where, ~where)[0][1, 3] < 25
+    om.quats[1, 3] = saved
 
     picks = cm.example_positions(phase="Ti beta", num=3, min_distance=3)
     assert all(cm.phase_index[p] == 1 for p in picks)

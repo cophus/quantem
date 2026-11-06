@@ -12,10 +12,18 @@ extends Diebold et al., Microsc. Microanal. 31, ozaf019 (2025):
 
 normalized by the total measured intensity. Unpaired experimental intensity
 appears in the first term (its prediction is zero); unpaired simulated
-intensity is charged in full. The best subset answers orientation/phase
+intensity is charged in proportion to how visible it should have been, so a
+beam too weak to detect costs nothing and there is no sharp intensity cutoff.
+The best subset answers orientation/phase
 ambiguity directly: one orientation, two orientations of one phase, or two
-phases, whichever explains the pattern best. Reliability is the cost gap
-between the best models with and without the winning phase.
+phases. The phase is the crystal that explains the pattern best on its own, and
+reliability is its lead over the runner-up, so both follow from the same costs
+as any comparison of two crystals.
+
+A cost of 1 is the cost of predicting nothing, so a position at or above it is
+unexplained whichever crystal won. The explained share measures the best model
+from positions alone: the share of the measured signal on disks that have a
+beam of the model.
 """
 
 from __future__ import annotations
@@ -27,8 +35,11 @@ import torch
 from tqdm import tqdm
 
 from quantem.core.io.serialize import AutoSerialize
+from quantem.core.utils.rotations import misorientation_angle_deg
 from quantem.core.utils.utils import inherit
 from quantem.diffraction.orientation import OrientationMap, position_mask
+
+UNEXPLAINED_COLOR = (0.3, 0.3, 0.3)  # positions no better than no model
 
 
 def _majority_filter(phase: np.ndarray, radius: int) -> np.ndarray:
@@ -114,6 +125,9 @@ class PhaseMap(AutoSerialize):
         self.phase_weights: torch.Tensor | None = None  # (R, C, F) per candidate
         self.crystal_weights: torch.Tensor | None = None  # (R, C, n_crystals)
         self.cost_best: torch.Tensor | None = None
+        self.crystal_cost: torch.Tensor | None = None  # (R, C, n_crystals)
+        self.explained: torch.Tensor | None = None
+        self.crystal_explained: torch.Tensor | None = None  # (R, C, n_crystals)
         self.phase_index: torch.Tensor | None = None
         self.reliability: torch.Tensor | None = None
         self.diffracted_intensity: torch.Tensor | None = None
@@ -153,13 +167,12 @@ class PhaseMap(AutoSerialize):
         self,
         positions=None,
         pair_distance: float | None = None,
-        power_intensity: float | None = None,
+        power_intensity: float = 0.5,
+        sigma_excitation: float = 0.01,
         max_patterns: int = 2,
         complexity_penalty: float = 0.02,
         weight_unmatched_sim: float = 0.5,
         weight_overprediction: float = 1.0,
-        min_sim_intensity_rel: float = 0.02,
-        detection_limit: bool = True,
         k_max: float | None = None,
         min_number_peaks: int | None = None,
         min_diffracted_peaks: int = 2,
@@ -169,9 +182,11 @@ class PhaseMap(AutoSerialize):
         """Score all candidate subsets at every probe position.
 
         Parameters left as None inherit the values the orientation
-        matching used (its plan kernel, intensity power and peak minimum),
-        so the phase decision compares the same peaks the same way; the
-        resolved values are recorded in `metadata['fit']`.
+        matching used (its plan kernel and peak minimum), so the phase
+        decision compares the same peaks; the resolved values are recorded
+        in `metadata['fit']`. The intensity power and excitation width are
+        the fit's own: matching tolerates orientation errors with a wide
+        width, while the decision compares the beams a pattern should show.
 
         Parameters
         ----------
@@ -183,9 +198,13 @@ class PhaseMap(AutoSerialize):
         pair_distance : float | None
             Pairing distance delta (1/Angstroms) between simulated and
             measured peaks; inherits the plan's correlation kernel.
-        power_intensity : float | None
-            Intensities are raised to this power before comparison;
-            inherits the plan's value.
+        power_intensity : float, default=0.5
+            Intensities are raised to this power before comparison. 0.5
+            stabilizes the Poisson variance of the disk intensities.
+        sigma_excitation : float, default=0.01
+            Excitation error width (1/Angstroms) of the simulated patterns.
+            0.01 excites about as many beams as a measured pattern shows,
+            where a matching plan's wider width excites about twice as many.
         max_patterns : int, default=2
             Maximum number of candidate patterns fit simultaneously.
         complexity_penalty : float, default=0.02
@@ -193,6 +212,11 @@ class PhaseMap(AutoSerialize):
             two-pattern fit must be to beat a single-pattern fit.
         weight_unmatched_sim : float, default=0.5
             Cost weight of simulated intensity with no experimental partner.
+            The pattern is scaled to the disks it pairs with, and an unpaired
+            beam at x times the weakest disk measured at that position is
+            further weighted by x^2 / (1 + x^2): beams well above the
+            detection limit count in full, and weaker ones fade as a power
+            law, so a dense pattern does not pay for spots too weak to see.
         weight_overprediction : float, default=1.0
             Cost weight of predicted intensity in excess of the measured
             value on paired peaks. Unexplained measured intensity always
@@ -201,20 +225,6 @@ class PhaseMap(AutoSerialize):
             non-precession data with strong dynamical scattering, lowering
             this weight makes the decision coverage-driven and removes the
             bias toward sparse templates.
-        min_sim_intensity_rel : float, default=0.02
-            Simulated reflections weaker than this fraction of the pattern
-            maximum are dropped before comparison: kinematically weak spots
-            are frequently unobservable and should not penalize a phase whose
-            structure factors happen to include many of them.
-        detection_limit : bool, default=True
-            A simulated beam with no measured partner counts against a
-            candidate in proportion to how visible it should have been. The
-            pattern is scaled to the disks it pairs with, and an unpaired
-            beam at x times the weakest disk measured at that position is
-            weighted by x^2 / (1 + x^2): beams well above the detection
-            limit count in full, and weaker ones fade smoothly as a power
-            law. Otherwise a dense pattern pays for spots too weak to
-            detect, and sparse templates win whatever the data show.
         k_max : float | None
             Restrict the comparison below this scattering vector
             (1/Angstroms).
@@ -239,15 +249,26 @@ class PhaseMap(AutoSerialize):
         PhaseMap
             Self, with these (R, C, ...) results:
 
-            - `phase_index`: winning crystal, -1 where unindexed (not fit,
-              rejected by the null hypothesis, or no candidate weight).
+            - `phase_index`: the crystal with the lowest `crystal_cost`, -1
+              where unindexed (not fit, rejected by the null hypothesis, or no
+              candidate weight). A model of two crystals is a better fit, not
+              a decision between them.
             - `phase_weights`: (R, C, F) non-negative weight of every
               candidate in the best model, F = len(`candidates`).
             - `crystal_weights`: (R, C, n_crystals) those weights summed per
               crystal and normalized to sum to one, zero where unindexed.
             - `cost_best`: cost of the best model, NaN where not fit.
-            - `reliability`: cost gap to the best model without the winning
-              crystal, NaN where not fit or no such model exists.
+            - `crystal_cost`: (R, C, n_crystals) cost of the best model using
+              only that crystal, NaN where not fit; see :meth:`cost_gap`.
+            - `explained`: share of the measured diffracted signal, in the
+              compared intensities, on disks within `pair_distance` of a beam
+              of the best model, NaN where not fit. It uses no simulated
+              intensity.
+            - `crystal_explained`: (R, C, n_crystals) the same share for every
+              crystal, whether it won or not, from all of its matched
+              orientations, NaN where not fit.
+            - `reliability`: `crystal_cost` of the runner-up minus that of the
+              winner, NaN where not fit or there is no runner-up.
             - `diffracted_intensity`, `num_diffracted`: measured intensity
               and number of peaks beyond `null_k_min`.
         """
@@ -257,18 +278,16 @@ class PhaseMap(AutoSerialize):
         plan_md = oms[0].metadata.get("plan")
         match_md = oms[0].metadata.get("match")
         pair_distance = inherit(pair_distance, "pair_distance", plan_md)
-        power_intensity = inherit(power_intensity, "power_intensity", plan_md)
         min_number_peaks = inherit(min_number_peaks, "min_number_peaks", match_md)
         self.metadata["fit"] = dict(
             positions=None if positions is None else "subset",
             pair_distance=float(pair_distance),
             power_intensity=float(power_intensity),
+            sigma_excitation=float(sigma_excitation),
             max_patterns=int(max_patterns),
             complexity_penalty=float(complexity_penalty),
             weight_unmatched_sim=float(weight_unmatched_sim),
             weight_overprediction=float(weight_overprediction),
-            min_sim_intensity_rel=float(min_sim_intensity_rel),
-            detection_limit=bool(detection_limit),
             k_max=k_max,
             min_number_peaks=int(min_number_peaks),
             min_diffracted_peaks=int(min_diffracted_peaks),
@@ -277,6 +296,7 @@ class PhaseMap(AutoSerialize):
         peaks = oms[0].peaks
         R, C = peaks.shape[0], peaks.shape[1]
         cands = self.candidates
+        by_crystal = [[f for f, (i, _) in enumerate(cands) if i == n] for n in range(len(oms))]
         F = len(cands)
         delta = pair_distance
 
@@ -286,8 +306,10 @@ class PhaseMap(AutoSerialize):
         subsets = [s for n in range(1, max_patterns + 1) for s in combinations(range(F), n)]
 
         cost_best = torch.full((R, C), torch.nan, dtype=torch.float64)
+        crystal_cost = torch.full((R, C, len(oms)), torch.nan, dtype=torch.float64)
         weights_out = torch.zeros((R, C, F), dtype=torch.float64)
-        reliability = torch.full((R, C), torch.nan, dtype=torch.float64)
+        explained = torch.full((R, C), torch.nan, dtype=torch.float64)
+        crystal_explained = torch.full((R, C, len(oms)), torch.nan, dtype=torch.float64)
         diffracted = torch.zeros((R, C), dtype=torch.float64)
         num_diffracted = torch.zeros((R, C), dtype=torch.long)
 
@@ -327,20 +349,22 @@ class PhaseMap(AutoSerialize):
             # per-candidate predicted intensity on each experimental peak,
             # and unpaired simulated intensity
             pred = np.zeros((n_exp, F))
+            on_beam = np.zeros((n_exp, F), dtype=bool)
             unpaired_sim = np.zeros(F)
             for f, (i_om, m) in enumerate(cands):
                 om = oms[i_om]
                 if om.corr[rx, ry, m] <= 0:
                     continue
-                sim = om.generate_pattern(rx, ry, match=m, k_max=k_max)
+                sim = om.generate_pattern(
+                    rx, ry, match=m, k_max=k_max, sigma_excitation=sigma_excitation
+                )
                 sq = torch.stack((sim["qx"], sim["qy"]), dim=1)
                 s_raw = sim["intensity"]
                 if sq.shape[0] == 0:
                     continue
-                vis = s_raw > min_sim_intensity_rel * s_raw.max()
-                sq, s_raw = sq[vis], s_raw[vis]
                 si = s_raw**power_intensity
                 d = torch.cdist(sq, qxy)
+                on_beam[:, f] = (d.min(dim=0).values < delta).numpy()
                 d_min, j_min = d.min(dim=1)
                 pair = d_min < delta
                 frac = (d_min[pair] / delta).clamp(0, 1)
@@ -350,7 +374,7 @@ class PhaseMap(AutoSerialize):
                     (si[pair] * (1 - frac)).numpy(),
                 )
                 visible = torch.ones_like(si)
-                if detection_limit and bool(pair.any()):
+                if bool(pair.any()):
                     disks = torch.unique(j_min[pair])
                     scale = raw[disks].sum() / s_raw[pair].sum().clamp_min(1e-30)
                     x2 = (scale * s_raw / max(weakest, 1e-30)) ** 2
@@ -381,37 +405,154 @@ class PhaseMap(AutoSerialize):
             cost_best[rx, ry] = c_best
             for f, w in zip(cols_best, w_best):
                 weights_out[rx, ry, f] = w
-
-            # reliability: cost gap to the best model containing NO candidate
-            # of the dominant crystal (candidates of one crystal can be
-            # near-duplicates, e.g. after residual re-matching)
-            f_dom = cols_best[int(np.argmax(w_best))]
-            i_dom = cands[f_dom][0]
-            others = [c for c, s, _, _ in results if all(cands[f][0] != i_dom for f in s)]
-            reliability[rx, ry] = (min(others) - c_best) if others else torch.nan
+            signal = im_np * diffracted_peak.numpy()
+            total = max(signal.sum(), 1e-12)
+            landed = on_beam[:, [f for f, w in zip(cols_best, w_best) if w > 0]].any(axis=1)
+            explained[rx, ry] = (signal * landed).sum() / total
+            for i, mine in enumerate(by_crystal):
+                landed = on_beam[:, mine].any(axis=1)
+                crystal_explained[rx, ry, i] = (signal * landed).sum() / total
+            # best model of each crystal; results are sorted by cost
+            for c, s, _, _ in reversed(results):
+                members = {cands[f][0] for f in s}
+                if len(members) == 1:
+                    crystal_cost[rx, ry, members.pop()] = c
 
         self.cost_best = cost_best
+        self.crystal_cost = crystal_cost
+        self.explained = explained
+        self.crystal_explained = crystal_explained
         self.diffracted_intensity = diffracted
         self.num_diffracted = num_diffracted
         self.phase_weights = weights_out
-        self.reliability = reliability
 
-        # dominant phase: candidate weights summed per crystal
+        # candidate weights summed per crystal
         n_maps = len(oms)
         w_phase = torch.zeros((R, C, n_maps), dtype=torch.float64)
         for f, (i_om, _) in enumerate(cands):
             w_phase[..., i_om] += weights_out[..., f]
-        # argmax over all-zero weights returns 0, which would label every
-        # position that was never fit, or whose best model has no weight
-        # (NNLS returns all zeros when no candidate overlaps the peaks), as
-        # the first phase; mark them instead
+        # the crystal with the lowest cost on its own wins. Weights of different
+        # crystals are not comparable, so they cannot decide a two-crystal model.
+        ordered = crystal_cost.nan_to_num(nan=torch.inf).sort(dim=-1)
+        self.phase_index = ordered.indices[..., 0]
+        self.reliability = torch.full((R, C), torch.nan, dtype=torch.float64)
+        if n_maps > 1:
+            lead = ordered.values[..., 1] - ordered.values[..., 0]
+            self.reliability = lead.nan_to_num(nan=torch.nan, posinf=torch.nan)
+        # positions never fit, or whose best model has no weight (NNLS returns
+        # all zeros when no candidate overlaps the peaks), have no phase
         w_sum = w_phase.sum(dim=-1)
-        self.phase_index = w_phase.argmax(dim=-1)
         unindexed = torch.isnan(cost_best) | (w_sum <= 0)
         self.phase_index[unindexed] = -1
         self.reliability[unindexed] = torch.nan
         self.crystal_weights = w_phase / w_sum[..., None].clamp_min(1e-12)
         return self
+
+    def cost_gap(self, first: str, second: str) -> np.ndarray:
+        """How much better the first crystal explains each pattern than the second.
+
+        Parameters
+        ----------
+        first, second : str
+            Crystal names.
+
+        Returns
+        -------
+        np.ndarray
+            (R, C) `crystal_cost` of `second` minus that of `first`, positive
+            where `first` is better, NaN where either was not fit.
+        """
+        if self.crystal_cost is None:
+            raise ValueError("run fit() first.")
+        i, j = self.names.index(first), self.names.index(second)
+        return (self.crystal_cost[..., j] - self.crystal_cost[..., i]).numpy()
+
+    def unexplained(self, limit: float = 1.0) -> np.ndarray:
+        """Positions whose best fit is no better than no model at all.
+
+        A cost of 1 is the cost of predicting nothing, and the better of two
+        poor fits still wins, so a call at or above it should not be read as
+        that crystal.
+
+        Parameters
+        ----------
+        limit : float, default=1.0
+            Smallest `cost_best` counted as unexplained.
+
+        Returns
+        -------
+        np.ndarray
+            (R, C) boolean mask: a crystal won, with `cost_best` at or above
+            `limit`.
+        """
+        if self.cost_best is None:
+            raise ValueError("run fit() first.")
+        return (self.phase_index.numpy() >= 0) & (self.cost_best.numpy() >= limit)
+
+    def nearest_grain(
+        self, positions: np.ndarray, reference: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Whether positions continue the grain at the nearest reference position.
+
+        A position that no model explains may still be the crystal beside it.
+        The nearest reference position gives a crystal and the orientation
+        that won there, and every matched orientation of that crystal at the
+        position is compared with it. The test uses orientations only.
+
+        Parameters
+        ----------
+        positions : list of (int, int) | np.ndarray
+            Positions to test, a (row, col) list or an (R, C) boolean mask.
+        reference : list of (int, int) | np.ndarray
+            Positions to trust, in the same forms. Unindexed positions and
+            `positions` themselves are left out.
+
+        Returns
+        -------
+        angle : np.ndarray
+            (R, C) smallest misorientation in degrees, reduced by the matching
+            symmetry, NaN outside `positions`, without a reference, or where
+            that crystal has no match.
+        crystal : np.ndarray
+            (R, C) index of the crystal at the nearest reference position, -1
+            outside `positions` or without a reference.
+        """
+        if self.phase_weights is None:
+            raise ValueError("run fit() first.")
+        phase = self.phase_index.numpy()
+        angle = np.full(phase.shape, np.nan)
+        crystal = np.full(phase.shape, -1)
+        tested = position_mask(positions, phase.shape).numpy()
+        r, c = np.nonzero(tested)
+        trusted = position_mask(reference, phase.shape).numpy() & ~tested & (phase >= 0)
+        ref_r, ref_c = np.nonzero(trusted)
+        if len(r) == 0 or len(ref_r) == 0:
+            return angle, crystal
+        here = torch.from_numpy(np.column_stack((r, c))).to(torch.float32)
+        there = torch.from_numpy(np.column_stack((ref_r, ref_c))).to(torch.float32)
+        nearest = torch.cat([torch.cdist(x, there).argmin(dim=1) for x in here.split(4096)])
+        ref_r, ref_c = ref_r[nearest.numpy()], ref_c[nearest.numpy()]
+        # the orientation that won there: the heaviest candidate of the crystal
+        owner = torch.tensor([i for i, _ in self.candidates])
+        match = torch.tensor([m for _, m in self.candidates])
+        weights = self.phase_weights[ref_r, ref_c].clone()
+        weights[owner[None] != self.phase_index[ref_r, ref_c][:, None]] = -1.0
+        best = weights.argmax(dim=1)
+        ref_crystal, ref_match = owner[best].numpy(), match[best].numpy()
+        for i, om in enumerate(self.orientation_maps):
+            s = ref_crystal == i
+            if not s.any():
+                continue
+            target = om.quats[ref_r[s], ref_c[s], ref_match[s]].to(torch.float64)
+            miso = misorientation_angle_deg(
+                om.quats[r[s], c[s]].to(torch.float64),
+                target[:, None],
+                om.crystal.sym_quats_matching.to(torch.float64),
+            )
+            best_angle = miso.masked_fill(om.corr[r[s], c[s]] <= 0, torch.inf).min(dim=1).values
+            angle[r[s], c[s]] = best_angle.nan_to_num(posinf=torch.nan).numpy()
+            crystal[r[s], c[s]] = i
+        return angle, crystal
 
     def apply_dynamical(self, result: dict) -> "PhaseMap":
         """Take the phase decision from a dynamical refinement.
@@ -437,9 +578,10 @@ class PhaseMap(AutoSerialize):
         Returns
         -------
         PhaseMap
-            Self, with `phase_index`, `reliability` and `cost_best` updated
-            at the refined positions. With one crystal there is no
-            runner-up and the reliability is NaN, as in :meth:`fit`.
+            Self, with `phase_index`, `reliability`, `cost_best` and
+            `crystal_cost` updated at the refined positions, and `explained`
+            and `crystal_explained` cleared there. With one crystal there is no runner-up and the
+            reliability is NaN, as in :meth:`fit`.
         """
         cost = torch.nan_to_num(result["cost"], nan=torch.inf)
         n_maps = len(self.orientation_maps)
@@ -471,6 +613,14 @@ class PhaseMap(AutoSerialize):
         self.phase_index = torch.where(done, result["phase_index"], self.phase_index)
         self.reliability = torch.where(done, reliability, self.reliability)
         self.cost_best = torch.where(done, order[..., 0], self.cost_best)
+        if self.crystal_cost is None:
+            self.crystal_cost = torch.full_like(cost_phase, torch.nan)
+        refined = cost_phase.nan_to_num(posinf=torch.nan).to(self.crystal_cost.dtype)
+        self.crystal_cost = torch.where(done[..., None], refined, self.crystal_cost)
+        if self.explained is not None:  # measured for the kinematical orientations
+            self.explained = torch.where(done, torch.nan, self.explained)
+            stale = torch.where(done[..., None], torch.nan, self.crystal_explained)
+            self.crystal_explained = stale
         self.metadata["dynamical_applied"] = dict(result.get("metadata", {}))
         return self
 
@@ -534,6 +684,8 @@ class PhaseMap(AutoSerialize):
         reliability_range: tuple[float, float] | None = None,
         crop: tuple[slice, slice] | None = None,
         scalebar: dict | str | None = "auto",
+        unexplained: float | None = None,
+        unexplained_label: str = "unexplained",
         figax=None,
     ):
         """Dominant-phase map: color gives the crystal, brightness the evidence.
@@ -551,8 +703,8 @@ class PhaseMap(AutoSerialize):
             What the brightness means. "signal" fades each position by the
             measured diffracted intensity (see :meth:`signal_confidence`), so
             vacuum and amorphous support go black and the map shows where
-            crystals actually are. "reliability" uses the cost gap to the best
-            model without the winning crystal, which answers a different
+            crystals actually are. "reliability" uses the lead of the winning
+            crystal over the runner-up, which answers a different
             question -- which phase, given that there is one -- and carries no
             information about whether anything is there. "none" draws every
             indexed position at full color.
@@ -583,6 +735,11 @@ class PhaseMap(AutoSerialize):
             dict such as {"sampling": 30, "units": "A"} overrides it, and
             None draws no bar. The dict may also set "length", "loc",
             "width_px", "pad_px" and "color".
+        unexplained : float | None
+            Limit on `cost_best`: the positions of :meth:`unexplained` are
+            drawn in dark gray.
+        unexplained_label : str, default="unexplained"
+            Legend entry of those positions.
         figax : (fig, ax) | None
             Existing axes to draw into.
 
@@ -645,6 +802,8 @@ class PhaseMap(AutoSerialize):
             phase = _majority_filter(phase, int(majority_filter))
             alpha = alpha * (phase >= 0)
         rgb = phase_colors[np.where(phase >= 0, phase, 0)] * alpha[..., None]
+        if unexplained is not None:
+            rgb[self.unexplained(unexplained)] = UNEXPLAINED_COLOR
         if crop is not None:
             rgb = rgb[crop]
 
@@ -671,6 +830,11 @@ class PhaseMap(AutoSerialize):
             plt.Line2D([0], [0], marker="s", ls="", color=c, label=n)
             for c, n in zip(phase_colors, self.names)
         ]
+        if unexplained is not None:
+            gray = plt.Line2D(
+                [0], [0], marker="s", ls="", color=UNEXPLAINED_COLOR, label=unexplained_label
+            )
+            handles.append(gray)
         ax.legend(handles=handles, loc="upper left", fontsize=8)
         # brightness key: one strip per phase, black -> phase color, in one
         # frame, in the space show_2d gives a colorbar so that the panels match
@@ -692,3 +856,64 @@ class PhaseMap(AutoSerialize):
         cax.set_yticks([lo, hi])
         cax.set_ylabel(cbar_label, fontsize=9)
         return fig, ax
+
+    def plot_map(
+        self,
+        arrays,
+        crop: tuple[slice, slice] | None = None,
+        cmap="gray",
+        unexplained: float | None = None,
+        **kwargs,
+    ):
+        """Show maps on the black background of :meth:`plot_phase`.
+
+        Unindexed positions, vacuum among them, are black whatever the
+        colormap, so the edge of the crystal shows even on a map that is white
+        at its center.
+
+        Parameters
+        ----------
+        arrays : np.ndarray | sequence of np.ndarray
+            One (R, C) map, or several shown side by side.
+        crop : (slice, slice) | None
+            Region to show, as in :meth:`plot_phase`.
+        cmap : str | Colormap | sequence of these, default="gray"
+            One colormap, or one per map.
+        unexplained : float | None
+            Limit on `cost_best`: the positions of :meth:`unexplained` are left
+            out of the maps and drawn in the dark gray of :meth:`plot_phase`.
+        **kwargs
+            Passed to :func:`~quantem.core.visualization.show_2d`.
+
+        Returns
+        -------
+        tuple
+            ``(fig, axs)``, as from :func:`~quantem.core.visualization.show_2d`.
+        """
+        import matplotlib as mpl
+        from matplotlib.colors import Colormap
+
+        from quantem.core.visualization import show_2d
+
+        save = kwargs.pop("save", None)
+        panels = [arrays] if np.ndim(arrays) == 2 else list(arrays)
+        cmaps = [cmap] * len(panels) if isinstance(cmap, (str, Colormap)) else list(cmap)
+        cmaps = [mpl.colormaps[c] if isinstance(c, str) else c for c in cmaps]
+        window = (slice(None), slice(None)) if crop is None else crop
+        hidden = self.phase_index.numpy() < 0
+        lost = np.zeros_like(hidden)
+        if unexplained is not None:
+            lost = self.unexplained(unexplained)
+        fig, axs = show_2d(
+            [np.where(hidden | lost, np.nan, np.asarray(a, dtype=float))[window] for a in panels],
+            cmap=[c.with_extremes(bad="black") for c in cmaps],
+            **kwargs,
+        )
+        if lost.any():
+            overlay = np.zeros((*lost.shape, 4))
+            overlay[lost] = (*UNEXPLAINED_COLOR, 1.0)
+            for ax in np.ravel(axs):
+                ax.imshow(overlay[window], interpolation="nearest")
+        if save is not None:
+            fig.savefig(save, bbox_inches="tight", pad_inches=0, dpi=300)
+        return fig, axs

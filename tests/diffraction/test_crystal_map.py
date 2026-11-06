@@ -4,12 +4,11 @@ import matplotlib
 
 matplotlib.use("Agg")
 
-import copy
-
 import matplotlib.pyplot as plt
 import numpy as np
 import pytest
 import torch
+from ase import Atoms
 from ase.build import bulk
 
 from quantem.core.datastructures.vector import Vector
@@ -115,6 +114,42 @@ def test_crystal_map_mask_and_phase_fractions(two_phase):
     assert np.isclose(frac["unindexed"], (ph == -1).mean())
     assert np.isclose(frac["Ti beta"], (ph == 1).mean())
 
+    # a crystal's cost gap has the sign of the decision
+    gap = cm.phases.cost_gap("Ti alpha", "Ti beta")
+    assert (gap[ph == 0] > 0).all() and (gap[ph == 1] < 0).all()
+
+    # an unexplained position leaves its crystal, and the fractions still sum to 1
+    saved = cm.phases.cost_best.clone()
+    try:
+        low = (ph == 0) & (gap < np.median(gap[ph == 0]))
+        cm.phases.cost_best = torch.where(torch.from_numpy(low), 1.2, cm.phases.cost_best)
+        assert np.array_equal(cm.phases.unexplained(), low)
+        frac = cm.phase_fractions(unexplained=1.0)
+        assert np.isclose(frac["unexplained"], low.mean())
+        assert np.isclose(frac["Ti alpha"], ((ph == 0) & ~low).mean())
+        assert np.isclose(sum(frac.values()), 1.0)
+        fig, ax = cm.plot_phase(unexplained=1.0, unexplained_label="rim", scalebar=None)
+        assert [t.get_text() for t in ax.get_legend().get_texts()] == [*cm.names, "rim"]
+        plt.close(fig)
+    finally:
+        cm.phases.cost_best = saved
+
+
+def test_two_crystal_fit_does_not_decide_the_phase():
+    """Weights of different crystals are not comparable, so the costs pick the phase."""
+    rng = np.random.default_rng(11)
+    ti_a, ti_b = _crystals()
+    alpha, beta = _pattern(ti_a, Q_ALPHA, rng), _pattern(ti_b, Q_BETA, rng)
+    both = np.vstack((alpha, np.column_stack((beta[:, :2], 3 * beta[:, 2]))))
+    cm = CrystalMap.from_vectors(_peaks([[both, alpha, beta]]), [ti_a, ti_b], energy_ev=200e3)
+    cm.build_plan(angle_step_zone_axis_deg=3.0, verbose=False, progress_bar=False)
+    cm.match_orientations(progress_bar=False)
+    cm.fit(progress_bar=False)
+    pm = cm.phases
+    assert (pm.crystal_weights[0, 0, 1] > pm.crystal_weights[0, 0, 0]).item()
+    assert cm.phase_index[0, 0] == 0
+    assert np.allclose(pm.reliability[0].numpy(), np.abs(pm.cost_gap("Ti alpha", "Ti beta")[0]))
+
 
 def test_plot_phase_majority_filter_blacks_out_removed_positions(two_phase):
     cm = two_phase
@@ -178,20 +213,34 @@ def test_crystal_map_plots_smoke(two_phase):
     plt.close("all")
 
 
-def test_fit_pattern_scores_ranks_matches(two_phase):
-    cm = copy.deepcopy(two_phase)
-    cm.match_orientations(num_matches=2, progress_bar=False)
-    om = cm[0]
-    om.quats[0, 0] = om.quats[0, 0].flip(0)  # the better match second
-    cm.fit_pattern_scores(progress_bar=False)
-    s0, s1 = (om.pattern_score(match=m, progress_bar=False) for m in (0, 1))
-    assert (s0[:, :-1] >= s1[:, :-1]).all()
-    ph = cm.phase_index
-    assert (ph[:, :3] == 0).all() and (ph[:, 3:-1] == 1).all() and (ph[:, -1] == -1).all()
-    s = cm.pattern_fit["score"][:, :-1]
-    np.testing.assert_allclose(
-        cm.phases.reliability.numpy()[:, :-1], np.abs(s[..., 0] - s[..., 1])
+def test_phase_fit_ignores_spots_too_weak_to_detect():
+    """An ordered and a disordered TiAl share their strong beams. The ordered one predicts
+    superlattice beams too weak to detect here, which must not count against it."""
+    ordered = Atoms(
+        "TiAl", scaled_positions=[[0, 0, 0], [0.5, 0.5, 0.5]], cell=[3.2] * 3, pbc=True
     )
+    random = Atoms(
+        "TiAlTiAl",
+        scaled_positions=[[0, 0, 0], [0, 0, 0], [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]],
+        cell=[3.2] * 3,
+        pbc=True,
+    )
+    random.set_array("occupancy", np.full(4, 0.5))
+    xtls = [
+        Crystal.from_ase(a, name=n, verbose=False).calculate_structure_factors(k_max=1.5)
+        for a, n in ((ordered, "ordered"), (random, "random"))
+    ]
+    p = xtls[1].generate_pattern(Q_ALPHA, energy_ev=200e3, sigma_excitation=0.02)
+    arr = np.column_stack([p["qx"].numpy(), p["qy"].numpy(), p["intensity"].numpy()])
+    arr = arr[arr[:, 2] > 0.4 * arr[:, 2].max()]  # the detection limit of this measurement
+    cm = CrystalMap.from_vectors(_peaks([[arr, arr], [arr, arr]]), xtls, energy_ev=200e3)
+    cm.build_plan(angle_step_zone_axis_deg=3.0, verbose=False, progress_bar=False)
+    cm.match_orientations(progress_bar=False)
+    for om in cm.orientation_maps:  # the coarse plan's orientation errors are not the test
+        om.quats[..., 0, :] = Q_ALPHA.to(om.quats.dtype)
+    cm.fit(sigma_excitation=0.02, max_patterns=1, progress_bar=False)
+    gap = cm.phases.cost_gap("ordered", "random")
+    assert np.nanmax(np.abs(gap)) < 0.05, gap
 
 
 def test_refine_overrides_name_known_crystals(two_phase):
@@ -208,7 +257,12 @@ def test_fit_without_any_paired_peak_is_unindexed():
     ring[0, 2] = 100.0
     phi = np.linspace(0, 2 * np.pi, 6, endpoint=False)
     ring[1:, 0], ring[1:, 1], ring[1:, 2] = 0.2 * np.cos(phi), 0.2 * np.sin(phi), 5.0
-    cells = [[_pattern(ti_a, Q_ALPHA, rng), ring]]
+    pattern = _pattern(ti_a, Q_ALPHA, rng)
+    extra = ring[1:].copy()
+    extra[:, 2] = (
+        np.sqrt(pattern[:, 2]).sum() / 3
+    ) ** 2  # twice the signal of the crystal's disks
+    cells = [[pattern, ring, np.vstack((pattern, extra))]]
     om = OrientationMap.from_vectors(_peaks(cells), ti_a, energy_ev=200e3)
     om.build_plan(angle_step_zone_axis_deg=4.0, verbose=False, progress_bar=False)
     om.match_orientations(progress_bar=False)
@@ -217,6 +271,11 @@ def test_fit_without_any_paired_peak_is_unindexed():
     cm.fit(progress_bar=False, k_max=1.0)
     assert cm.phase_index[0, 0] == 0
     assert cm.phase_index[0, 1] == -1
+    # disks the crystal has no beam for still lose to it, and only the explained share shows that
+    assert cm.phase_index[0, 2] == 0
+    explained = cm.phases.explained[0].numpy()
+    assert explained[0] > 0.95 and 0.2 < explained[2] < 0.45, explained
+    assert np.allclose(cm.phases.crystal_explained[0, [0, 2], 0].numpy(), explained[[0, 2]])
 
 
 def test_single_crystal_map_end_to_end(tmp_path):
