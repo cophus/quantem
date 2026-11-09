@@ -1248,6 +1248,8 @@ class Crystal(AutoSerialize):
         excitation_model: str = "gaussian",
         thickness_A: float | None = None,
         foil_normal=None,
+        rod_width: float | None = None,
+        rod_sigma: float | None = None,
     ) -> dict[str, torch.Tensor]:
         """Kinematical diffraction pattern for one orientation.
 
@@ -1293,6 +1295,17 @@ class Crystal(AutoSerialize):
             projection of g. For a tilted flake, whose rods are long, the
             spots shift by up to s_g tan(tilt). None (default) takes the
             normal along the beam, the usual geometry.
+        rod_width : float | None
+            Width of the rods along `foil_normal`, 1/Angstroms, for a stack
+            that is only partly ordered along it: each reflection is a Gaussian
+            of this width around its lattice point (see
+            :func:`~quantem.diffraction.illumination.relrod_excitation`). Its
+            integrated intensity is kept. None (default) is the plate geometry
+            above. Takes the "gaussian" excitation model.
+        rod_sigma : float | None
+            Excitation width that places the spot along a finite rod,
+            1/Angstroms, so that it stays put when `sigma_excitation` changes.
+            None uses `sigma_excitation`.
 
         Returns
         -------
@@ -1307,8 +1320,9 @@ class Crystal(AutoSerialize):
         RuntimeError
             If :meth:`calculate_structure_factors` has not been run.
         ValueError
-            If `excitation_model` is not "gaussian" or "slab", or the slab
-            model is asked for without `thickness_A`.
+            If `excitation_model` is not "gaussian" or "slab", the slab model
+            is asked for without `thickness_A` or with `rod_width`, or
+            `rod_width` comes without `foil_normal`.
         """
         if self.g_vec is None:
             raise RuntimeError("Run calculate_structure_factors first.")
@@ -1316,9 +1330,12 @@ class Crystal(AutoSerialize):
             raise ValueError(
                 f"excitation_model must be one of {_EXCITATION_MODELS}, got {excitation_model!r}"
             )
+        if rod_width is not None and (foil_normal is None or excitation_model == "slab"):
+            raise ValueError("rod_width needs foil_normal and the gaussian excitation model")
         from quantem.diffraction.illumination import (
             averaged_gaussian_intensity_envelope,
             excitation_coefficients,
+            relrod_excitation,
             relrod_factor,
             slab_envelope,
         )
@@ -1362,6 +1379,8 @@ class Crystal(AutoSerialize):
                 precession_deg,
                 semiconv_mrad,
                 foil_normal_lab=None if n_lab is None else n_lab.numpy(),
+                rod_width=rod_width,
+                rod_sigma=rod_sigma,
             )
             c_t = torch.as_tensor(c, dtype=torch.float64)
             a_t = torch.as_tensor(a, dtype=torch.float64)
@@ -1376,8 +1395,19 @@ class Crystal(AutoSerialize):
             )
         qxy = g[keep, :2]
         if n_lab is not None:
-            # the spot is where the rod meets the sphere: g + t n, t = -c
-            qxy = qxy - c_t[keep, None] * n_lab[None, :2]
+            # the spot moves along the rod, to where it meets the sphere
+            beam = excitation_coefficients(g, energy_ev, precession_deg, semiconv_mrad)[0]
+            t = relrod_excitation(
+                beam,
+                g.numpy(),
+                n_lab.numpy(),
+                energy_ev,
+                precession_deg,
+                sigma_excitation,
+                rod_width,
+                rod_sigma,
+            )[2]
+            qxy = qxy + torch.as_tensor(t, dtype=qxy.dtype)[keep, None] * n_lab[None, :2]
         return {
             "qx": qxy[:, 0],
             "qy": qxy[:, 1],

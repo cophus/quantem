@@ -578,6 +578,60 @@ def test_generate_pattern_foil_normal():
     # and moves off the projection of g, which is where it sits by default
     assert float((spot[:, :2] - g_lab[:, :2]).abs().max()) > 1e-4
 
+    # a finite rod of no width is the usual geometry
+    sharp = xtl.generate_pattern(q, energy_ev=200e3)
+    none = xtl.generate_pattern(q, energy_ev=200e3, foil_normal=(0, 0, 0, 1), rod_width=0.0)
+    for key in ("qx", "qy", "intensity"):
+        assert torch.allclose(sharp[key], none[key], atol=1e-12)
+
+    # the closed form against the integral along each rod
+    width, sigma = 0.03, 0.02
+    p = xtl.generate_pattern(
+        q,
+        energy_ev=200e3,
+        sigma_excitation=sigma,
+        foil_normal=(0, 0, 0, 1),
+        rod_width=width,
+    )
+    g_lab = qrotate(q, p["hkl"].to(torch.float64) @ xtl.lat_recip).numpy()
+    t = np.linspace(-0.25, 0.25, 2001)
+    along = g_lab[:, None] + t[None, :, None] * n_lab.numpy()
+    s = excitation_coefficients(along.reshape(-1, 3), 200e3)[0].reshape(len(g_lab), len(t))
+    rod = np.exp(-0.5 * (t / width) ** 2) / (np.sqrt(2 * np.pi) * width)
+    weight = rod * np.exp(-0.5 * (s / sigma) ** 2) * (t[1] - t[0])
+    F2 = xtl.struct_factors_int[
+        (xtl.hkl[:, None] == p["hkl"][None]).all(dim=-1).to(torch.long).argmax(dim=0)
+    ].numpy()
+    bright = weight.sum(axis=1) > 0.2
+    assert bright.sum() > 5
+    np.testing.assert_allclose(
+        p["intensity"].numpy()[bright], (F2 * weight.sum(axis=1))[bright], rtol=0.03
+    )
+    centroid = g_lab[:, :2] + ((weight * t).sum(1) / weight.sum(1))[:, None] * n_lab[:2].numpy()
+    spots = np.stack([p["qx"].numpy(), p["qy"].numpy()], axis=1)
+    assert np.abs(spots - centroid)[bright].max() < 0.003
+
+    # one rod_sigma keeps the spots in place when the excitation width changes
+    wide = xtl.generate_pattern(
+        q,
+        energy_ev=200e3,
+        sigma_excitation=2 * sigma,
+        foil_normal=(0, 0, 0, 1),
+        rod_width=width,
+        rod_sigma=sigma,
+    )
+    both, here, there = np.intersect1d(
+        (p["hkl"] @ torch.tensor([10000, 100, 1])).numpy(),
+        (wide["hkl"] @ torch.tensor([10000, 100, 1])).numpy(),
+        return_indices=True,
+    )
+    assert len(both) > 5
+    assert torch.allclose(p["qx"][here], wide["qx"][there], atol=1e-12)
+    assert torch.allclose(p["qy"][here], wide["qy"][there], atol=1e-12)
+
+    with pytest.raises(ValueError, match="rod_width needs foil_normal"):
+        xtl.generate_pattern(q, rod_width=0.02)
+
 
 def test_wk_factor_without_thermal_motion():
     from quantem.diffraction.wk_scattering_factors import compute_WK_factor

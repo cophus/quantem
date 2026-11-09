@@ -165,6 +165,90 @@ def relrod_factor(g_lab, n_lab, energy_ev: float, precession_deg: float = 0.0):
     return np.where(tangent, 1e6, f)
 
 
+def _relrod_inverse(g_lab, n_lab, energy_ev: float, precession_deg: float = 0.0):
+    """1 / f of :func:`relrod_factor`, finite for a rod tangent to the sphere."""
+    k0 = 1.0 / electron_wavelength_angstrom(energy_ev)
+    r = k0 * np.sin(np.deg2rad(precession_deg))
+    K = float(np.sqrt(k0**2 - r**2))
+    if isinstance(g_lab, torch.Tensor):
+        n = torch.as_tensor(n_lab, dtype=g_lab.dtype, device=g_lab.device)
+        return (K * n[..., 2] - (g_lab * n).sum(-1)) / (K - g_lab[..., 2])
+    g = np.asarray(g_lab, dtype=float)
+    n = np.asarray(n_lab, dtype=float)
+    return (K * n[..., 2] - (g * n).sum(-1)) / (K - g[..., 2])
+
+
+def relrod_excitation(
+    s_g,
+    g_lab,
+    n_lab,
+    energy_ev: float,
+    precession_deg: float = 0.0,
+    sigma: float | None = None,
+    rod_width: float | None = None,
+    rod_sigma: float | None = None,
+):
+    """Excitation and spot of reflections spread into rods along n.
+
+    With no `rod_width` the excitation is the distance along the rod to the
+    sphere, s = f s_g, and the spot moves there, as for a 2D material. A finite
+    rod is a Gaussian of width w along n around each lattice point. Its product
+    with the excitation envelope of width sigma, in the distance t along the
+    rod, is again a Gaussian, with
+
+        S^2 = sigma^2 + (w / f)^2,   t = -(s_g / f) (w / S)^2,
+
+    so the reflection keeps its integrated intensity, is excited over the wider
+    S, and its spot sits at t, between the lattice point and where the rod
+    meets the sphere. At w = 0 this is the usual geometry. t uses the central
+    excitation only, so the illumination sweep does not move the spot. A rod
+    tangent to the sphere is well defined here, since only 1 / f enters.
+
+    The width of the envelope changes through a workflow, wide to tolerate
+    orientation errors in a library and narrow to compare with disks, and the
+    spot should not move with it, so `rod_sigma` fixes the width that places
+    the spot.
+
+    Parameters
+    ----------
+    s_g : torch.Tensor | np.ndarray
+        Excitation errors measured along the beam, 1/Angstroms.
+    g_lab, n_lab : torch.Tensor | np.ndarray
+        Lab-frame reciprocal vectors (..., 3) and unit rod direction.
+    energy_ev : float
+        Beam energy, eV.
+    precession_deg : float, default=0.0
+        Precession semi-angle, degrees.
+    sigma : float | None
+        Width of the excitation envelope, 1/Angstroms; needed with `rod_width`.
+    rod_width : float | None
+        Width w of a finite rod, 1/Angstroms. None gives the plate geometry
+        of :func:`relrod_factor`.
+    rod_sigma : float | None
+        Excitation width in t, 1/Angstroms; None uses `sigma`.
+
+    Returns
+    -------
+    s : torch.Tensor | np.ndarray
+        Excitation to use with an envelope of width sigma.
+    sweep : torch.Tensor | np.ndarray
+        Factor on the illumination sweeps a and b, and on any change of s_g.
+    t : torch.Tensor | np.ndarray
+        Distance of the spot along the rod from the lattice point.
+    weight : torch.Tensor | np.ndarray | float
+        Factor on the intensity.
+    """
+    if rod_width is None:
+        f = relrod_factor(g_lab, n_lab, energy_ev, precession_deg)
+        s = s_g * f
+        return s, f, -s, 1.0
+    inverse = _relrod_inverse(g_lab, n_lab, energy_ev, precession_deg)
+    spread = (rod_width * inverse) ** 2
+    scale = sigma / (sigma**2 + spread) ** 0.5
+    spot = sigma if rod_sigma is None else rod_sigma
+    return s_g * scale, scale, -s_g * inverse * rod_width**2 / (spot**2 + spread), scale
+
+
 def averaged_gaussian_intensity_envelope(
     g_lab,
     energy_ev: float,
@@ -172,12 +256,16 @@ def averaged_gaussian_intensity_envelope(
     precession_deg: float = 0.0,
     semiconv_mrad: float = 0.0,
     foil_normal_lab=None,
+    rod_width: float | None = None,
+    rod_sigma: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Illumination-averaged Gaussian envelope of every reflection.
 
     With `foil_normal_lab` the excitation is measured along the relrod
     instead of along the beam: c, a and b are the distances along the rod
-    (see :func:`relrod_factor`).
+    (see :func:`relrod_factor`). With `rod_width` too the rods are finite, and
+    c, a and b are scaled onto the envelope of width sigma (see
+    :func:`relrod_excitation`).
 
     Parameters
     ----------
@@ -193,24 +281,35 @@ def averaged_gaussian_intensity_envelope(
         Convergence semi-angle, mrad.
     foil_normal_lab : array-like, optional
         Lab-frame unit plate normal (3,).
+    rod_width, rod_sigma : float | None
+        Width of finite rods along the normal and the excitation width that
+        places their spots, 1/Angstroms; see :func:`relrod_excitation`.
 
     Returns
     -------
     envelope : np.ndarray
-        Averaged envelope (N,) in [0, 1].
+        Averaged envelope (N,) in [0, 1], times the rod weight.
     c, a, b : np.ndarray
         Central excitation error and ring and disk amplitudes (N,),
         1/Angstroms; a + b is the half-width of the swept range about c.
     """
     c, a, b = excitation_coefficients(g_lab, energy_ev, precession_deg, semiconv_mrad)
+    weight = 1.0
     if foil_normal_lab is not None:
         g_np = g_lab.detach().cpu().numpy() if isinstance(g_lab, torch.Tensor) else g_lab
-        f = relrod_factor(
-            np.asarray(g_np, dtype=float), foil_normal_lab, energy_ev, precession_deg
+        c, sweep, _, weight = relrod_excitation(
+            c,
+            np.asarray(g_np, dtype=float),
+            foil_normal_lab,
+            energy_ev,
+            precession_deg,
+            sigma,
+            rod_width,
+            rod_sigma,
         )
-        c, a, b = c * f, a * np.abs(f), b * np.abs(f)
+        a, b = a * np.abs(sweep), b * np.abs(sweep)
     if precession_deg <= 0 and semiconv_mrad <= 0:
-        return np.exp(-0.5 * (c / sigma) ** 2), c, a, b
+        return np.exp(-0.5 * (c / sigma) ** 2) * weight, c, a, b
     # A reflection farther from the Ewald sphere than the illumination sweeps
     # it, plus six envelope widths, is never excited (the envelope there is
     # below 1e-8). At k_max = 2 that is nearly all of them, and the quadrature
@@ -230,7 +329,7 @@ def averaged_gaussian_intensity_envelope(
             )
         else:
             env[live] = gaussian_envelope(c[live], a[live], b[live], sigma)
-    return env, c, a, b
+    return env * weight, c, a, b
 
 
 def ring_disk_quadrature(r: float, R: float, n_phi: int = 128, n_r: int = 8, n_psi: int = 32):

@@ -177,6 +177,7 @@ class PhaseMap(AutoSerialize):
         min_number_peaks: int | None = None,
         min_diffracted_peaks: int = 2,
         null_k_min: float = 0.05,
+        forms: list[tuple[str, ...]] | None = None,
         progress_bar: bool = True,
     ) -> "PhaseMap":
         """Score all candidate subsets at every probe position.
@@ -241,6 +242,12 @@ class PhaseMap(AutoSerialize):
             Scattering vector (1/Angstroms) above which a measured peak
             counts as diffracted. The default excludes the direct beam,
             which sits at the origin after `correct_peak_origins`.
+        forms : list of tuple of str, optional
+            Crystals that are forms of one structure, by name, such as an
+            ordered stack and the same stack with rods. Each position still
+            takes the crystal of lowest cost, and `reliability` is the lead
+            over the best crystal of another structure, so two forms of one
+            structure do not read as a tie. Crystals not listed stand alone.
         progress_bar : bool, default=True
             Show a progress bar over the positions.
 
@@ -268,13 +275,18 @@ class PhaseMap(AutoSerialize):
               crystal, whether it won or not, from all of its matched
               orientations, NaN where not fit.
             - `reliability`: `crystal_cost` of the runner-up minus that of the
-              winner, NaN where not fit or there is no runner-up.
+              winner, by structure when `forms` is given, NaN where not fit or
+              there is no runner-up.
             - `diffracted_intensity`, `num_diffracted`: measured intensity
               and number of peaks beyond `null_k_min`.
         """
         from scipy.optimize import nnls
 
         oms = self.orientation_maps
+        forms = [tuple(group) for group in forms or []]
+        listed = [name for group in forms for name in group]
+        if len(set(listed)) != len(listed) or set(listed) - set(self.names):
+            raise ValueError(f"forms must name each crystal once at most, got {forms}")
         plan_md = oms[0].metadata.get("plan")
         match_md = oms[0].metadata.get("match")
         pair_distance = inherit(pair_distance, "pair_distance", plan_md)
@@ -292,6 +304,7 @@ class PhaseMap(AutoSerialize):
             min_number_peaks=int(min_number_peaks),
             min_diffracted_peaks=int(min_diffracted_peaks),
             null_k_min=float(null_k_min),
+            forms=[list(group) for group in forms],
         )
         peaks = oms[0].peaks
         R, C = peaks.shape[0], peaks.shape[1]
@@ -344,7 +357,6 @@ class PhaseMap(AutoSerialize):
             weakest = float(raw[diffracted_peak].min()) if diffracted_peak.any() else 0.0
             im = im**power_intensity
             n_exp = im.shape[0]
-            int_total = float(im.sum())
 
             # per-candidate predicted intensity on each experimental peak,
             # and unpaired simulated intensity
@@ -359,20 +371,30 @@ class PhaseMap(AutoSerialize):
                     rx, ry, match=m, k_max=k_max, sigma_excitation=sigma_excitation
                 )
                 sq = torch.stack((sim["qx"], sim["qy"]), dim=1)
-                s_raw = sim["intensity"]
+                seen = torch.linalg.norm(sq, dim=1) > null_k_min
+                sq, s_raw = sq[seen], sim["intensity"][seen]
                 if sq.shape[0] == 0:
                     continue
                 si = s_raw**power_intensity
-                d = torch.cdist(sq, qxy)
+                metric = om.rod_metric(rx, ry, m, delta)
+                if metric is None:
+                    d = torch.cdist(sq, qxy)
+                else:
+                    d = torch.cdist(sq @ metric, qxy @ metric)
+                # a beam under the direct beam can be neither seen nor set the scale
+                d[:, ~diffracted_peak] = torch.inf
                 on_beam[:, f] = (d.min(dim=0).values < delta).numpy()
                 d_min, j_min = d.min(dim=1)
                 pair = d_min < delta
                 frac = (d_min[pair] / delta).clamp(0, 1)
-                np.add.at(
-                    pred[:, f],
-                    j_min[pair].numpy(),
-                    (si[pair] * (1 - frac)).numpy(),
-                )
+                # beams on one disk add before the power, as they do on the detector
+                on_disk = torch.zeros(n_exp, dtype=torch.float64)
+                on_disk.index_add_(0, j_min[pair], s_raw[pair].to(torch.float64))
+                landed = torch.zeros(n_exp, dtype=torch.float64)
+                landed.index_add_(0, j_min[pair], (s_raw[pair] * (1 - frac)).to(torch.float64))
+                share = landed / on_disk.clamp_min(1e-30)
+                powered = on_disk**power_intensity
+                pred[:, f] = (powered * share).numpy()
                 visible = torch.ones_like(si)
                 if bool(pair.any()):
                     disks = torch.unique(j_min[pair])
@@ -380,10 +402,12 @@ class PhaseMap(AutoSerialize):
                     x2 = (scale * s_raw / max(weakest, 1e-30)) ** 2
                     visible = x2 / (1 + x2)
                 unpaired_sim[f] = weight_unmatched_sim * (
-                    float((si[~pair] * visible[~pair]).sum()) + float((si[pair] * frac).sum())
+                    float((si[~pair] * visible[~pair]).sum())
+                    + float((powered * (1 - share))[on_disk > 0].sum())
                 )
 
             im_np = im.numpy()
+            int_total = float(im_np.sum())
             results = []
             for s in subsets:
                 cols = [f for f in s if pred[:, f].any() or unpaired_sim[f] > 0]
@@ -394,9 +418,10 @@ class PhaseMap(AutoSerialize):
                 model = B @ w
                 under = np.maximum(im_np - model, 0).sum()  # unexplained measured
                 over = np.maximum(model - im_np, 0).sum()  # overpredicted paired
-                cost = (under + weight_overprediction * over + (w * unpaired_sim[cols]).sum()) / (
-                    int_total + 1e-12
-                ) + complexity_penalty * (len(cols) - 1)
+                # a model with no weight predicts nothing, which costs exactly 1
+                cost = (
+                    under + weight_overprediction * over + (w * unpaired_sim[cols]).sum()
+                ) / max(int_total, 1e-12) + complexity_penalty * (len(cols) - 1)
                 results.append((cost, s, cols, w))
             if not results:
                 continue
@@ -436,8 +461,13 @@ class PhaseMap(AutoSerialize):
         ordered = crystal_cost.nan_to_num(nan=torch.inf).sort(dim=-1)
         self.phase_index = ordered.indices[..., 0]
         self.reliability = torch.full((R, C), torch.nan, dtype=torch.float64)
-        if n_maps > 1:
-            lead = ordered.values[..., 1] - ordered.values[..., 0]
+        alone = [(name,) for name in self.names if name not in listed]
+        structures = [[self.names.index(n) for n in group] for group in forms + alone]
+        if len(structures) > 1:
+            costs = crystal_cost.nan_to_num(nan=torch.inf)
+            best = torch.stack([costs[..., group].amin(-1) for group in structures], dim=-1)
+            best = best.sort(dim=-1).values
+            lead = best[..., 1] - best[..., 0]
             self.reliability = lead.nan_to_num(nan=torch.nan, posinf=torch.nan)
         # positions never fit, or whose best model has no weight (NNLS returns
         # all zeros when no candidate overlaps the peaks), have no phase
@@ -448,13 +478,14 @@ class PhaseMap(AutoSerialize):
         self.crystal_weights = w_phase / w_sum[..., None].clamp_min(1e-12)
         return self
 
-    def cost_gap(self, first: str, second: str) -> np.ndarray:
+    def cost_gap(self, first: str | tuple[str, ...], second: str | tuple[str, ...]) -> np.ndarray:
         """How much better the first crystal explains each pattern than the second.
 
         Parameters
         ----------
-        first, second : str
-            Crystal names.
+        first, second : str or tuple of str
+            Crystal names; a tuple takes the best of its crystals, as for the
+            forms of one structure.
 
         Returns
         -------
@@ -464,8 +495,14 @@ class PhaseMap(AutoSerialize):
         """
         if self.crystal_cost is None:
             raise ValueError("run fit() first.")
-        i, j = self.names.index(first), self.names.index(second)
-        return (self.crystal_cost[..., j] - self.crystal_cost[..., i]).numpy()
+
+        def best(names):
+            names = (names,) if isinstance(names, str) else names
+            costs = self.crystal_cost[..., [self.names.index(n) for n in names]].numpy()
+            costs = np.where(np.isnan(costs), np.inf, costs).min(axis=-1)
+            return np.where(np.isinf(costs), np.nan, costs)
+
+        return best(second) - best(first)
 
     def unexplained(self, limit: float = 1.0) -> np.ndarray:
         """Positions whose best fit is no better than no model at all.
@@ -482,12 +519,12 @@ class PhaseMap(AutoSerialize):
         Returns
         -------
         np.ndarray
-            (R, C) boolean mask: a crystal won, with `cost_best` at or above
-            `limit`.
+            (R, C) boolean mask: `cost_best` at or above `limit`, whether or
+            not any crystal took weight there.
         """
         if self.cost_best is None:
             raise ValueError("run fit() first.")
-        return (self.phase_index.numpy() >= 0) & (self.cost_best.numpy() >= limit)
+        return np.nan_to_num(self.cost_best.numpy(), nan=-np.inf) >= limit
 
     def nearest_grain(
         self, positions: np.ndarray, reference: np.ndarray

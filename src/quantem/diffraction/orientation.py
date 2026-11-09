@@ -359,6 +359,8 @@ class OrientationMap(AutoSerialize):
         precession_deg: float = 0.0,
         semiconv_mrad: float = 0.0,
         foil_normal=None,
+        rod_width: float | None = None,
+        rod_sigma: float = 0.01,
     ) -> "OrientationMap":
         """Create from detected Bragg peaks.
 
@@ -383,7 +385,19 @@ class OrientationMap(AutoSerialize):
             Ewald sphere (see :meth:`Crystal.generate_pattern`); the library,
             the refinement and every simulated pattern use it. None
             (default) is the usual geometry.
+        rod_width : float | None
+            Width of the rods along `foil_normal`, 1/Angstroms, for a stack
+            only partly ordered along it; None (default) is the plate geometry
+            above. See :meth:`Crystal.generate_pattern`. The dynamical
+            refinements do not use the rods.
+        rod_sigma : float, default=0.01
+            Excitation width that places the spots along finite rods and sets
+            the length of their streaks, 1/Angstroms. It is one value for the
+            whole map, so the library, the refinement, the strain and the phase
+            fit agree on where a spot is whatever excitation width each uses.
         """
+        if rod_width is not None and foil_normal is None:
+            raise ValueError("rod_width needs foil_normal")
         if crystal.g_vec is None:
             raise RuntimeError("Run crystal.calculate_structure_factors() first.")
         om = cls(peaks, crystal, energy_ev, _token=cls._token)
@@ -392,6 +406,8 @@ class OrientationMap(AutoSerialize):
         om.metadata["foil_normal"] = (
             None if foil_normal is None else [float(v) for v in np.ravel(foil_normal)]
         )
+        om.metadata["rod_width"] = None if rod_width is None else float(rod_width)
+        om.metadata["rod_sigma"] = float(rod_sigma)
         return om
 
     def _foil_normal_crystal(self) -> torch.Tensor | None:
@@ -810,16 +826,25 @@ class OrientationMap(AutoSerialize):
         spot_xy = gr[..., :2]
         n_c = self._foil_normal_crystal()
         f_rod = None
+        rod_weight = 1.0
         if n_c is not None:
             # plate geometry: excitation along the rod, spot where the rod
             # meets the sphere; the normal turns with the crystal, so the
             # template still rolls in gamma
-            from quantem.diffraction.illumination import relrod_factor
+            from quantem.diffraction.illumination import relrod_excitation
 
             n_lab = qrotate(zone_quats, n_c[None].expand(zone_quats.shape[0], 3))  # (Z, 3)
-            f_rod = relrod_factor(gr, n_lab[:, None, :], self.energy_ev, 0.0)
-            s_g = s_g * f_rod
-            spot_xy = spot_xy - s_g[..., None] * n_lab[:, None, :2]
+            s_g, f_rod, t, rod_weight = relrod_excitation(
+                s_g,
+                gr,
+                n_lab[:, None, :],
+                self.energy_ev,
+                0.0,
+                self.sigma_excitation,
+                self.metadata.get("rod_width"),
+                self.metadata.get("rod_sigma"),
+            )
+            spot_xy = spot_xy + t[..., None] * n_lab[:, None, :2]
         if prec > 0 or conv > 0:
             # excitation envelope averaged over the illumination
             # (quantem.diffraction.illumination); the peak weighting below
@@ -850,7 +875,7 @@ class OrientationMap(AutoSerialize):
         weight = (
             crystal.g_len**self.power_radial * crystal.struct_factors_int**self.power_intensity
         )
-        vals = amp * weight[None, :]  # (Z, N)
+        vals = amp * rod_weight * weight[None, :]  # (Z, N)
         qr = torch.hypot(spot_xy[..., 0], spot_xy[..., 1])
         qphi = torch.atan2(spot_xy[..., 1], spot_xy[..., 0])
 
@@ -1603,7 +1628,9 @@ class OrientationMap(AutoSerialize):
         prec_ill = float(self.metadata.get("precession_deg", 0.0) or 0.0)
         conv_ill = float(self.metadata.get("semiconv_mrad", 0.0) or 0.0)
         n_rod = self._foil_normal_crystal()
-        from quantem.diffraction.illumination import relrod_factor
+        rod_width = self.metadata.get("rod_width")
+        rod_sigma = self.metadata.get("rod_sigma")
+        from quantem.diffraction.illumination import relrod_excitation
 
         def envelope(S, g_rows, f_rows=None):
             # Laue-circle envelope of the paired reflections at shifted
@@ -1649,13 +1676,15 @@ class OrientationMap(AutoSerialize):
                 s_g = (2 * gz - lam * g2) / (2 - 2 * lam * gz)
                 spot = g[:, :2]
                 f_rod = torch.ones_like(s_g)
+                rod_weight = 1.0
                 if n_rod is not None:
                     # plate geometry: excitation along the rod, the spot
                     # where the rod meets the sphere
                     n_lab = qrotate(q, n_rod[None])[0]
-                    f_rod = relrod_factor(g, n_lab, self.energy_ev, 0.0)
-                    s_g = s_g * f_rod
-                    spot = spot - s_g[:, None] * n_lab[None, :2]
+                    s_g, f_rod, t, rod_weight = relrod_excitation(
+                        s_g, g, n_lab, self.energy_ev, 0.0, sigma_env, rod_width, rod_sigma
+                    )
+                    spot = spot + t[:, None] * n_lab[None, :2]
                 sel = torch.abs(s_g) < 2 * sigma
                 g_sel = g[sel]
                 if g_sel.shape[0] == 0:
@@ -1705,7 +1734,7 @@ class OrientationMap(AutoSerialize):
                     fr = f_rod[sel][pair]
                     a1 = gp[:, 1] * fr
                     a2 = -gp[:, 0] * fr
-                    f_p = f_all[sel][pair]
+                    f_p = (f_all * rod_weight)[sel][pair]
                     S = (
                         s0[:, None, None]
                         + tg[None, :, None] * a1[:, None, None]
@@ -2030,6 +2059,8 @@ class OrientationMap(AutoSerialize):
             precession_deg=pd,
             semiconv_mrad=sc,
             foil_normal=self.metadata.get("foil_normal"),
+            rod_width=self.metadata.get("rod_width"),
+            rod_sigma=self.metadata.get("rod_sigma"),
         )
         s_xy = torch.stack((sim["qx"], sim["qy"]), dim=1).to(torch.float64)
         s_i = sim["intensity"].to(torch.float64).clamp_min(0)
@@ -2091,7 +2122,9 @@ class OrientationMap(AutoSerialize):
         prec_ill = float(self.metadata.get("precession_deg", 0.0) or 0.0)
         conv_ill = float(self.metadata.get("semiconv_mrad", 0.0) or 0.0)
         n_rod = self._foil_normal_crystal()
-        from quantem.diffraction.illumination import relrod_factor
+        rod_width = self.metadata.get("rod_width")
+        rod_sigma = self.metadata.get("rod_sigma")
+        from quantem.diffraction.illumination import relrod_excitation
 
         def envelope(S, g_rows, f_rows=None):
             # Laue-circle envelope of the paired reflections at shifted
@@ -2166,13 +2199,22 @@ class OrientationMap(AutoSerialize):
                     s_g = (2 * gz - lam * g2) / (2 - 2 * lam * gz)
                     spot = g[..., :2]
                     f_rod = None
+                    rod_weight = None
                     if n_rod is not None:
                         # plate geometry: excitation along the rod, the spot
                         # where the rod meets the sphere
                         n_lab = torch.einsum("bij,j->bi", Rm, n_rod)  # (B, 3)
-                        f_rod = relrod_factor(g, n_lab[:, None, :], self.energy_ev, 0.0)
-                        s_g = s_g * f_rod
-                        spot = spot - s_g[..., None] * n_lab[:, None, :2]
+                        s_g, f_rod, t, rod_weight = relrod_excitation(
+                            s_g,
+                            g,
+                            n_lab[:, None, :],
+                            self.energy_ev,
+                            0.0,
+                            sigma_env,
+                            rod_width,
+                            rod_sigma,
+                        )
+                        spot = spot + t[..., None] * n_lab[:, None, :2]
                     sel = torch.abs(s_g) < 2 * sigma  # (B, G)
                     d = torch.cdist(spot, qe)  # (B, G, P)
                     d_min, j_min = d.min(dim=-1)  # (B, G)
@@ -2210,6 +2252,8 @@ class OrientationMap(AutoSerialize):
                         gyf = g[idx_b, idx_g, 1] * (1.0 if fr is None else fr)
                         gxf = g[idx_b, idx_g, 0] * (1.0 if fr is None else fr)
                         ff = f_all[idx_g]
+                        if rod_width is not None:
+                            ff = ff * rod_weight[idx_b, idx_g]
                         wf = w_g[idx_b, idx_g]
                         S = (
                             s0f[:, None, None]
@@ -2301,12 +2345,59 @@ class OrientationMap(AutoSerialize):
         kwargs.setdefault("precession_deg", self.metadata.get("precession_deg", 0.0))
         kwargs.setdefault("semiconv_mrad", self.metadata.get("semiconv_mrad", 0.0))
         kwargs.setdefault("foil_normal", self.metadata.get("foil_normal"))
+        kwargs.setdefault("rod_width", self.metadata.get("rod_width"))
+        kwargs.setdefault("rod_sigma", self.metadata.get("rod_sigma"))
         kwargs.setdefault("sigma_excitation", self.sigma_excitation)
         return self.crystal.generate_pattern(
             self.quats[rx, ry, match],
             energy_ev=self.energy_ev,
             **kwargs,
         )
+
+    def rod_metric(
+        self,
+        rx: int,
+        ry: int,
+        match: int,
+        pair_distance: float,
+        tol_excitation_mult: float = 3.0,
+    ) -> torch.Tensor | None:
+        """Metric for pairing simulated spots with disks along finite rods.
+
+        The sphere cuts a tilted rod in a streak, and a disk may sit anywhere
+        on it. Its half length follows from the widths: the rod and the
+        excitation envelope, cut at `tol_excitation_mult` as the excited
+        reflections are. Distance along the projected rod is shrunk so that
+        the pairing distance reaches the end of the streak.
+
+        Parameters
+        ----------
+        rx, ry : int
+            Scan row and column.
+        match : int
+            Match index.
+        pair_distance : float
+            Pairing distance across the rod, 1/Angstroms.
+        tol_excitation_mult : float, default=3.0
+            Length of the streak in widths.
+
+        Returns
+        -------
+        torch.Tensor | None
+            (2, 2) matrix to apply to both sets of (qx, qy) before measuring
+            distances, None without finite rods.
+        """
+        rod_width = self.metadata.get("rod_width")
+        if rod_width is None:
+            return None
+        q = self.quats[rx, ry, match].to(torch.float64)
+        n = qrotate(q, self._foil_normal_crystal()[None])[0]
+        n_xy = float(torch.hypot(n[0], n[1]))
+        window = self.metadata["rod_sigma"] / max(abs(float(n[2])), 0.02)  # along the rod
+        streak = tol_excitation_mult * rod_width * window / float(np.hypot(rod_width, window))
+        shrink = pair_distance / (pair_distance + streak * n_xy)
+        u = n[:2] / max(n_xy, 1e-9)
+        return torch.eye(2, dtype=torch.float64) - (1 - shrink) * torch.outer(u, u)
 
     def match_residual(
         self,
@@ -2422,6 +2513,8 @@ class OrientationMap(AutoSerialize):
             precession_deg=self.metadata.get("precession_deg", 0.0) or 0.0,
             semiconv_mrad=self.metadata.get("semiconv_mrad", 0.0) or 0.0,
             foil_normal=self.metadata.get("foil_normal"),
+            rod_width=self.metadata.get("rod_width"),
+            rod_sigma=self.metadata.get("rod_sigma") or 0.01,
         )
         # share this map's plan rather than rebuilding it
         for attr in (

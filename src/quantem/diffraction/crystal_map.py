@@ -139,6 +139,8 @@ class CrystalMap(AutoSerialize):
         semiconv_mrad: float = 0.0,
         k_max: float | None = None,
         foil_normal=None,
+        rod_width=None,
+        rod_sigma: float = 0.01,
     ) -> "CrystalMap":
         """Build one OrientationMap per crystal from a shared peak table.
 
@@ -165,6 +167,14 @@ class CrystalMap(AutoSerialize):
             spots of a tilted flake where the rods meet the Ewald sphere (see
             :meth:`OrientationMap.from_vectors`). None (default) is the usual
             geometry.
+        rod_width : float or dict, optional
+            Width of the rods along `foil_normal`, 1/Angstroms, for a stack
+            only partly ordered along it; a dict keyed by crystal name sets it
+            per crystal, though one width is the fair comparison. None
+            (default) is the plate geometry of `foil_normal`.
+        rod_sigma : float, default=0.01
+            Excitation width that places the spots along finite rods,
+            1/Angstroms; see :meth:`OrientationMap.from_vectors`.
 
         Raises
         ------
@@ -188,6 +198,8 @@ class CrystalMap(AutoSerialize):
                 foil_normal=(
                     foil_normal.get(xtl.name) if isinstance(foil_normal, dict) else foil_normal
                 ),
+                rod_width=rod_width.get(xtl.name) if isinstance(rod_width, dict) else rod_width,
+                rod_sigma=rod_sigma,
             )
             for xtl in xtls
         ]

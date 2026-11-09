@@ -12,7 +12,11 @@ from ase import Atoms
 from ase.build import bulk
 
 from quantem.core.datastructures.vector import Vector
-from quantem.core.utils.rotations import misorientation_angle_deg, quat_from_axis_angle
+from quantem.core.utils.rotations import (
+    misorientation_angle_deg,
+    qrotate,
+    quat_from_axis_angle,
+)
 from quantem.diffraction.crystal import Crystal
 from quantem.diffraction.crystal_map import CrystalMap
 from quantem.diffraction.orientation import OrientationMap
@@ -151,6 +155,27 @@ def test_two_crystal_fit_does_not_decide_the_phase():
     assert np.allclose(pm.reliability[0].numpy(), np.abs(pm.cost_gap("Ti alpha", "Ti beta")[0]))
 
 
+def test_forms_of_one_structure_are_not_a_tie():
+    rng = np.random.default_rng(4)
+    ti_a, ti_b = _crystals()
+    copy = Crystal.from_ase(
+        bulk("Ti", "hcp", a=2.9505, c=4.6855), name="Ti alpha rods", verbose=False
+    ).calculate_structure_factors(k_max=1.5)
+    cells = [[_pattern(ti_a, Q_ALPHA, rng), _pattern(ti_b, Q_BETA, rng)]]
+    cm = CrystalMap.from_vectors(_peaks(cells), [ti_a, ti_b, copy], energy_ev=200e3)
+    cm.build_plan(angle_step_zone_axis_deg=3.0, verbose=False, progress_bar=False)
+    cm.match_orientations(progress_bar=False)
+    alpha = ("Ti alpha", "Ti alpha rods")
+    cm.fit(max_patterns=1, progress_bar=False)
+    assert cm.phases.reliability[0, 0] < 1e-6  # the copy ties with the original
+    cm.fit(max_patterns=1, forms=[alpha], progress_bar=False)
+    gap = cm.phases.cost_gap(alpha, "Ti beta")
+    assert gap[0, 0] > 0.1 and gap[0, 1] < -0.1, gap
+    np.testing.assert_allclose(cm.phases.reliability[0].numpy(), np.abs(gap[0]))
+    with pytest.raises(ValueError, match="forms must name"):
+        cm.fit(forms=[alpha, ("Ti alpha",)], progress_bar=False)
+
+
 def test_plot_phase_majority_filter_blacks_out_removed_positions(two_phase):
     cm = two_phase
     pm = cm.phases
@@ -271,11 +296,69 @@ def test_fit_without_any_paired_peak_is_unindexed():
     cm.fit(progress_bar=False, k_max=1.0)
     assert cm.phase_index[0, 0] == 0
     assert cm.phase_index[0, 1] == -1
+    # predicting nothing costs exactly 1, so this position is also unexplained
+    assert cm.phases.cost_best[0, 1] == 1.0 and cm.phases.unexplained()[0, 1]
     # disks the crystal has no beam for still lose to it, and only the explained share shows that
     assert cm.phase_index[0, 2] == 0
     explained = cm.phases.explained[0].numpy()
     assert explained[0] > 0.95 and 0.2 < explained[2] < 0.45, explained
     assert np.allclose(cm.phases.crystal_explained[0, [0, 2], 0].numpy(), explained[[0, 2]])
+    # a disk with no beam costs its own intensity and nothing more, at any power
+    cm.fit(progress_bar=False, k_max=1.0, power_intensity=0.0)
+    kept = int((np.hypot(pattern[:, 0], pattern[:, 1]) <= 1.0).sum())
+    cost = cm.phases.cost_best[0].numpy()
+    assert cost[2] * (kept + len(extra)) - cost[0] * kept == pytest.approx(len(extra))
+
+
+def test_fit_pairs_disks_along_finite_rods():
+    # a tilted stack: disks anywhere on the streak of a rod pair with it, and off it they do not
+    ti_a, _ = _crystals()
+    axis = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64)
+    q = quat_from_axis_angle(axis, torch.tensor(np.deg2rad(55.0), dtype=torch.float64))
+    rods = dict(foil_normal=(0, 0, 0, 1), rod_width=0.03)
+    p = ti_a.generate_pattern(q, energy_ev=200e3, sigma_excitation=0.01, **rods)
+    arr = np.column_stack([p["qx"].numpy(), p["qy"].numpy(), p["intensity"].numpy()])
+    arr = arr[arr[:, 2] > 0.02 * arr[:, 2].max()]
+    assert len(arr) >= 8
+    n = qrotate(q, ti_a.direction_vector([0, 0, 0, 1])[None])[0].numpy()
+    u = n[:2] / np.hypot(n[0], n[1])
+    direct = np.array([[0.0, 0.0, 10 * arr[:, 2].max()]])
+    moves = (0.06 * u, 0.06 * np.array([-u[1], u[0]]))
+    cells = [[np.vstack((direct, arr + [*move, 0.0])) for move in moves]]
+    cm = CrystalMap.from_vectors(_peaks(cells), [ti_a], energy_ev=200e3, **rods)
+    cm.build_plan(angle_step_zone_axis_deg=4.0, verbose=False, progress_bar=False)
+    cm.match_orientations(progress_bar=False)
+    cm["Ti alpha"].quats[..., 0, :] = q.to(cm["Ti alpha"].quats.dtype)
+    fit = dict(pair_distance=0.04, sigma_excitation=0.01, max_patterns=1, progress_bar=False)
+    cm.fit(**fit)
+    along, across = cm.phases.explained[0].numpy()
+    assert along > 0.9 and across < 0.3, (along, across)
+    # without the rods the same disks are out of reach
+    cm["Ti alpha"].metadata["rod_width"] = None
+    cm["Ti alpha"].metadata["foil_normal"] = None
+    assert cm.fit(**fit).phases.explained[0, 0] < 0.5
+
+
+def test_fit_keeps_beams_off_the_direct_disk():
+    # a long cell has a beam inside the direct disk, which must not set the scale of the pattern
+    xtl = Crystal.from_ase(
+        Atoms("Au", cell=(3.0, 3.0, 30.0), pbc=True), name="long", verbose=False
+    ).calculate_structure_factors(k_max=1.0)
+    axis = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64)
+    q = quat_from_axis_angle(axis, torch.tensor(np.pi / 2, dtype=torch.float64))
+    p = xtl.generate_pattern(q, energy_ev=200e3, sigma_excitation=0.01, k_max=1.0)
+    arr = np.column_stack([p["qx"].numpy(), p["qy"].numpy(), p["intensity"].numpy()])
+    assert (np.hypot(arr[:, 0], arr[:, 1]) < 0.04).any()
+    keep = np.hypot(arr[:, 0], arr[:, 1]) > 0.05
+    disks = np.vstack(([[0.0, 0.0, 1e4 * arr[:, 2].max()]], arr[keep]))
+    om = OrientationMap.from_vectors(_peaks([[disks]]), xtl, energy_ev=200e3)
+    om.build_plan(angle_step_zone_axis_deg=10.0, verbose=False, progress_bar=False)
+    om.match_orientations(progress_bar=False)
+    om.quats[..., 0, :] = q.to(om.quats.dtype)
+    cm = CrystalMap.from_orientation_maps([om])
+    cm.fit(pair_distance=0.04, sigma_excitation=0.01, max_patterns=1, progress_bar=False)
+    weight = cm.phases.phase_weights[0, 0, 0]
+    assert abs(float(weight) - 1) < 0.1, weight
 
 
 def test_single_crystal_map_end_to_end(tmp_path):
