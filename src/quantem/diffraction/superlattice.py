@@ -1,680 +1,621 @@
 from __future__ import annotations
 
+import itertools
 from os import PathLike
 from typing import Any, Self
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.ndimage import gaussian_filter, maximum_filter
-from scipy.optimize import curve_fit
+from scipy.ndimage import gaussian_filter
+from scipy.optimize import least_squares
+from scipy.spatial import cKDTree
 
-from quantem.core.datastructures.dataset2d import Dataset2d
+from quantem.core.datastructures import Dataset2d, Dataset4dstem
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
+from quantem.diffraction.bragg_vectors import BraggVectors
+from quantem.diffraction.calibration import _ellipse_matrix
+from quantem.diffraction.orientation_visualization import phase_color_cycle
+
+# reciprocal length units converted to 1/Angstroms
+_RECIPROCAL_UNITS = {"1/a": 1.0, "a^-1": 1.0, "1/nm": 0.1, "nm^-1": 0.1, "1/pm": 100.0}
 
 
 class DiffractionMoire(AutoSerialize):
+    """Lattices and moire spots in a single diffraction pattern.
+
+    A pattern of two or more overlapping crystals, such as a twisted bilayer,
+    contains the Bragg spots of every lattice plus double diffraction spots at
+    sums of reflections from different lattices. This class detects the spots,
+    finds the pattern center from Friedel symmetry, discovers the reciprocal
+    lattice basis of each crystal, indexes every spot as an integer combination
+    ``q = center + sum_l (h_l g1_l + k_l g2_l)``, and refines the center and all
+    basis vectors together by weighted linear least squares over every indexed
+    spot. The double diffraction spots then constrain the relative geometry of
+    the lattices directly.
+
+    Use :meth:`from_file` or :meth:`from_data`, then :meth:`find_peaks` and
+    :meth:`find_lattices`. Positions are in pixels as ``(row, col)``; lengths
+    are also reported in 1/Angstroms when the pattern is calibrated. In-plane
+    angles follow the quantEM convention, from the row axis toward the column
+    axis.
+
+    Parameters
+    ----------
+    diffraction : Dataset2d
+        The diffraction pattern.
+    """
+
     _token = object()
 
-    def __init__(
-        self,
-        diffraction: Dataset2d,
-        _token: object | None = None,
-    ):
+    def __init__(self, diffraction: Dataset2d, _token: object | None = None):
         if _token is not self._token:
-            raise RuntimeError("Use DiffractionMoire.from_data() or .from_file() to instantiate this class.")
-        self._diffraction = diffraction
-        self.peaks = np.zeros((0, 2), dtype=float)
-
-    @classmethod
-    def from_file(
-        cls,
-        file_path: str | PathLike,
-        file_type: str | None = None,
-    ) -> Self:
-        diffraction = Dataset2d.from_file(str(file_path), file_type=file_type)
-        return cls.from_data(diffraction)
-
-    @classmethod
-    def from_data(
-        cls,
-        diffraction: Dataset2d | NDArray,
-        *,
-        name: str | None = None,
-        origin: NDArray | float | int | None = None,
-        sampling: NDArray | float | int | None = None,
-        units: list[str] | None = None,
-        signal_units: str = "arb. units",
-    ) -> Self:
-        if isinstance(diffraction, Dataset2d):
-            ds = diffraction
-            if name is not None:
-                ds.name = name
-        else:
-            arr = ensure_valid_array(diffraction, ndim=2)
-            ds = Dataset2d.from_array(
-                arr,
-                name=name if name is not None else "diffraction",
-                origin=origin if origin is not None else np.zeros(2),
-                sampling=sampling if sampling is not None else np.ones(2),
-                units=units if units is not None else ["pixels"] * 2,
-                signal_units=signal_units,
+            raise RuntimeError(
+                "Use DiffractionMoire.from_file() or .from_data() to instantiate this class."
             )
+        super().__init__()
+        self.diffraction = diffraction
+        self.peaks = np.zeros((0, 3))
+        self.center: NDArray | None = None
+        self.lattices: NDArray | None = None
+        self.indices: NDArray | None = None
+        self.indexed: NDArray | None = None
+        self.ellipse: NDArray | None = None
+        self.rms: float | None = None
+        self.metadata: dict[str, Any] = {}
 
-        return cls(
-            diffraction=ds,
-            _token=cls._token,
-        )
+    @classmethod
+    def from_file(cls, file_path: str | PathLike, file_type: str | None = None) -> Self:
+        """Read a diffraction pattern with :func:`~quantem.core.io.file_readers.read_2d`."""
+        from quantem.core.io.file_readers import read_2d
+
+        return cls.from_data(read_2d(file_path, file_type=file_type))
+
+    @classmethod
+    def from_data(cls, diffraction: Dataset2d | NDArray, sampling: float | None = None) -> Self:
+        """Wrap a diffraction pattern.
+
+        Parameters
+        ----------
+        diffraction : Dataset2d | np.ndarray
+            The pattern.
+        sampling : float, optional
+            Reciprocal pixel size in 1/Angstroms, for an array or to override
+            the calibration of a Dataset2d.
+        """
+        if not isinstance(diffraction, Dataset2d):
+            diffraction = Dataset2d.from_array(ensure_valid_array(diffraction, ndim=2))
+        if sampling is not None:
+            diffraction.sampling = np.full(2, float(sampling))
+            diffraction.units = ["1/A", "1/A"]
+        return cls(diffraction=diffraction, _token=cls._token)
 
     @property
-    def diffraction(self) -> Dataset2d:
-        return self._diffraction
+    def pixel_size(self) -> float | None:
+        """Reciprocal pixel size in 1/Angstroms, None when uncalibrated."""
+        unit = str(self.diffraction.units[0]).replace(" ", "").lower().replace("å", "a")
+        scale = _RECIPROCAL_UNITS.get(unit)
+        return None if scale is None else float(self.diffraction.sampling[0]) * scale
 
     def find_peaks(
         self,
-        *,
-        threshold: float | None = None,
-        min_distance_px: float | None = None,
-        max_peaks: int | None = None,
-        sigma: float = 0.0,
-        mask_diffraction: NDArray | None = None,
-        refine_subpixel: bool = True,
-        refine_radius_px: int = 4,
-        refine_maxfev: int = 500,
-        plot_result: bool = True,
-        plot_radius_min_px: float = 2.0,
-        plot_radius_max_px: float = 10.0,
-        plot_radius_power: float = 0.5,
-        plot_edgecolor: str = "r",
-        plot_linewidth: float = 1.0,
-        plot_alpha: float = 0.5,
-        plot_labels: bool = False,
-        plot_label_color: Any = (0, 0.9, 1.0),
-        plot_label_size: float = 6.0,
-        plot_label_alpha: float = 0.9,
-        plot_label_offset_px: tuple[float, float] = (0.0, -12.0),
-        plot_label_bbox: bool = True,
-        plot_label_bbox_facecolor: Any = (0.0, 0.0, 0.0, 0.35),
-        plot_label_bbox_edgecolor: Any = "none",
-        plot_label_bbox_pad: float = 0.15,
-        plot_label_top_k: int | None = None,
-        return_peaks: bool = False,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        im = np.asarray(self.diffraction.array)
-        if im.ndim != 2:
-            raise ValueError("DiffractionMoire.find_peaks requires a 2D diffraction array.")
+        min_abs_intensity: float = 10.0,
+        radius: float = 1.5,
+        min_spacing: float = 6.0,
+        edge_boundary: int = 8,
+        background_sigma: float | None = 8.0,
+        max_num_peaks: int = 2000,
+        plot: bool = True,
+    ) -> Self:
+        """Detect the diffraction spots with :meth:`BraggVectors.detect_disks`.
 
-        im_s = gaussian_filter(im, sigma=float(sigma)) if float(sigma) > 0 else im
+        Parameters
+        ----------
+        min_abs_intensity : float, default=10.0
+            Drop spots below this template correlation intensity.
+        radius : float, default=1.5
+            Radius of the synthetic spot template in pixels.
+        min_spacing : float, default=6.0
+            Minimum distance between spots in pixels.
+        edge_boundary : int, default=8
+            Border width in pixels in which spots are ignored.
+        background_sigma : float, optional
+            Width in pixels of the Gaussian background subtracted before
+            detection, which removes the diffuse halo around the direct beam.
+        max_num_peaks : int, default=2000
+            Largest number of spots kept.
+        plot : bool, default=True
+            Show the detected spots.
+        """
+        array = np.asarray(self.diffraction.array, dtype=np.float32)
+        bv = BraggVectors.from_dataset(Dataset4dstem.from_array(array[None, None]), device="cpu")
+        bv.make_template_synthetic(radius=radius)
+        peaks = bv.detect_disks(
+            positions=[(0, 0)],
+            min_abs_intensity=min_abs_intensity,
+            min_spacing=min_spacing,
+            edge_boundary=edge_boundary,
+            background_sigma=background_sigma,
+            subpixel="parabolic",
+            max_num_peaks=max_num_peaks,
+            progressbar=False,
+        )
+        self.peaks = np.asarray(peaks[0].numpy(), dtype=float).reshape(-1, 3)
+        self.center = self.lattices = self.indices = self.indexed = self.rms = None
+        self.ellipse = None
+        if plot:
+            self.plot()
+        return self
 
-        if threshold is None:
-            mu = float(np.nanmean(im_s))
-            sig = float(np.nanstd(im_s))
-            threshold = mu + 5.0 * sig
-
-        if min_distance_px is None or float(min_distance_px) <= 0:
-            win = 3
-            r2_min = None
-        else:
-            win = int(np.ceil(float(min_distance_px)) * 2 + 1)
-            win = max(3, win)
-            r2_min = float(min_distance_px) ** 2
-
-        mx = maximum_filter(im_s, size=win, mode="nearest")
-        cand = (im_s == mx) & (im_s >= float(threshold))
-
-        if mask_diffraction is not None:
-            m = np.asarray(mask_diffraction).astype(bool)
-            if m.shape != im.shape:
-                raise ValueError("mask_diffraction must have the same shape as the diffraction array.")
-            cand &= m
-
-        peaks_rc_int = np.argwhere(cand)
-        if peaks_rc_int.size == 0:
-            self.peaks = np.zeros((0, 2), dtype=float)
-            out = {
-                "peaks": self.peaks,
-                "I": np.zeros((0,), dtype=float),
-                "peaks_refined": None,
-                "I_refined": None,
-                "gaussian_fit_params": None,
-                "gaussian_fit_success": None,
-                "threshold": float(threshold),
-                "sigma": float(sigma),
-                "min_distance_px": None if min_distance_px is None else float(min_distance_px),
-            }
-            if plot_result:
-                fig, ax = show_2d(im_s, **kwargs)
-                ax0 = ax.flat[0] if hasattr(ax, "flat") else ax
-                ax0.figure.canvas.draw_idle()
-            if return_peaks:
-                return out
-            return out
-
-        peak_I = im[peaks_rc_int[:, 0], peaks_rc_int[:, 1]].astype(float, copy=False)
-        order = np.argsort(-peak_I)
-        peaks_rc_int = peaks_rc_int[order]
-        peak_I = peak_I[order]
-
-        if r2_min is not None and peaks_rc_int.shape[0] > 1:
-            del_mask = np.zeros((peaks_rc_int.shape[0],), dtype=bool)
-            row = peaks_rc_int[:, 0].astype(float, copy=False)
-            col = peaks_rc_int[:, 1].astype(float, copy=False)
-            for i in range(peaks_rc_int.shape[0] - 1):
-                if del_mask[i]:
-                    continue
-                dr = row[i] - row[(i + 1) :]
-                dc = col[i] - col[(i + 1) :]
-                d2 = dr * dr + dc * dc
-                j = np.flatnonzero(d2 < r2_min)
-                if j.size:
-                    del_mask[(i + 1) + j] = True
-            keep = ~del_mask
-            peaks_rc_int = peaks_rc_int[keep]
-            peak_I = peak_I[keep]
-
-        if max_peaks is not None and peaks_rc_int.shape[0] > int(max_peaks):
-            peaks_rc_int = peaks_rc_int[: int(max_peaks)]
-            peak_I = peak_I[: int(max_peaks)]
-
-        peaks_rc = peaks_rc_int.astype(float, copy=False)
-        self.peaks = peaks_rc
-
-        out: dict[str, Any] = {
-            "peaks": peaks_rc,
-            "I": peak_I,
-            "peaks_refined": None,
-            "I_refined": None,
-            "gaussian_fit_params": None,
-            "gaussian_fit_success": None,
-            "threshold": float(threshold),
-            "sigma": float(sigma),
-            "min_distance_px": None if min_distance_px is None else float(min_distance_px),
-        }
-
-        if refine_subpixel and peaks_rc.shape[0] > 0:
-            r = int(refine_radius_px)
-            if r < 1:
-                raise ValueError("refine_radius_px must be >= 1.")
-
-            def _gauss2d(coords: NDArray, A: float, row0: float, col0: float, s: float, c: float) -> NDArray:
-                rr, cc = coords
-                return A * np.exp(-((rr - row0) ** 2 + (cc - col0) ** 2) / (2.0 * s * s)) + c
-
-            peaks_rc_ref = peaks_rc.copy()
-            I_ref = peak_I.copy()
-            fit_params = np.full((peaks_rc.shape[0], 5), np.nan, dtype=float)
-            fit_success = np.zeros((peaks_rc.shape[0],), dtype=bool)
-
-            for k in range(peaks_rc.shape[0]):
-                row0_i = float(peaks_rc[k, 0])
-                col0_i = float(peaks_rc[k, 1])
-                row_i = int(np.round(row0_i))
-                col_i = int(np.round(col0_i))
-
-                r0 = max(0, row_i - r)
-                r1 = min(im_s.shape[0], row_i + r + 1)
-                c0 = max(0, col_i - r)
-                c1 = min(im_s.shape[1], col_i + r + 1)
-                if (r1 - r0) < 3 or (c1 - c0) < 3:
-                    continue
-
-                patch = im_s[r0:r1, c0:c1].astype(float, copy=False)
-                rr, cc = np.mgrid[r0:r1, c0:c1]
-                xdata = np.vstack([rr.ravel(), cc.ravel()])
-                ydata = patch.ravel()
-
-                c_init = float(np.median(ydata))
-                A_init = float(np.max(ydata) - c_init)
-                if not np.isfinite(A_init) or A_init <= 0:
-                    continue
-                s_init = max(0.75, float(r) / 2.0)
-
-                row_min = float(r0)
-                row_max = float(r1 - 1)
-                col_min = float(c0)
-                col_max = float(c1 - 1)
-
-                p0 = (A_init, row0_i, col0_i, s_init, c_init)
-                lb = (0.0, row_min, col_min, 0.5, float(np.min(ydata) - abs(A_init)))
-                ub = (
-                    float(np.inf),
-                    row_max,
-                    col_max,
-                    float(max(0.75, 2.0 * r)),
-                    float(np.max(ydata) + abs(A_init)),
-                )
-
-                try:
-                    popt, _ = curve_fit(
-                        _gauss2d,
-                        xdata,
-                        ydata,
-                        p0=p0,
-                        bounds=(lb, ub),
-                        maxfev=int(refine_maxfev),
-                    )
-                except Exception:
-                    continue
-
-                A_fit, row_fit, col_fit, s_fit, c_fit = (
-                    float(popt[0]),
-                    float(popt[1]),
-                    float(popt[2]),
-                    float(popt[3]),
-                    float(popt[4]),
-                )
-                if not (np.isfinite(row_fit) and np.isfinite(col_fit) and np.isfinite(s_fit) and s_fit > 0):
-                    continue
-
-                peaks_rc_ref[k, 0] = row_fit
-                peaks_rc_ref[k, 1] = col_fit
-                I_ref[k] = max(A_fit + c_fit, float(im[row_i, col_i]))
-                fit_params[k, :] = np.array([A_fit, row_fit, col_fit, s_fit, c_fit], dtype=float)
-                fit_success[k] = True
-
-            order_ref = np.argsort(-I_ref)
-            peaks_rc_ref = peaks_rc_ref[order_ref]
-            I_ref = I_ref[order_ref]
-            fit_params = fit_params[order_ref]
-            fit_success = fit_success[order_ref]
-
-            out["peaks_refined"] = peaks_rc_ref
-            out["I_refined"] = I_ref
-            out["gaussian_fit_params"] = fit_params
-            out["gaussian_fit_success"] = fit_success
-            out["refine_radius_px"] = int(refine_radius_px)
-
-            self.peaks = peaks_rc_ref
-            out["peaks"] = peaks_rc_ref
-            out["I"] = I_ref
-
-        if plot_result:
-            from matplotlib.patches import Circle
-
-            fig, ax = show_2d(im_s, **kwargs)
-            ax0 = ax.flat[0] if hasattr(ax, "flat") else ax
-
-            peaks_plot = np.asarray(out["peaks"], dtype=float)
-            I_plot = np.asarray(out["I"], dtype=float)
-
-            if peaks_plot.size:
-                I_min = float(np.nanmin(I_plot)) if I_plot.size else 0.0
-                I_max = float(np.nanmax(I_plot)) if I_plot.size else 1.0
-                denom = I_max - I_min
-                if not np.isfinite(denom) or denom <= 0:
-                    t = np.ones_like(I_plot, dtype=float)
-                else:
-                    t = np.clip((I_plot - I_min) / denom, 0.0, 1.0)
-
-                t = np.power(t, float(plot_radius_power))
-                radii = float(plot_radius_min_px) + (float(plot_radius_max_px) - float(plot_radius_min_px)) * t
-
-                for (row, col), rad in zip(peaks_plot, radii):
-                    ax0.add_patch(
-                        Circle(
-                            (col, row),
-                            radius=float(rad),
-                            facecolor="none",
-                            edgecolor=plot_edgecolor,
-                            linewidth=float(plot_linewidth),
-                            alpha=float(plot_alpha),
-                        )
-                    )
-
-                if plot_labels:
-                    dcol, drow = float(plot_label_offset_px[0]), float(plot_label_offset_px[1])
-                    bbox_kw = None
-                    if plot_label_bbox:
-                        bbox_kw = dict(
-                            boxstyle=f"round,pad={float(plot_label_bbox_pad)}",
-                            facecolor=plot_label_bbox_facecolor,
-                            edgecolor=plot_label_bbox_edgecolor,
-                        )
-
-                    nlab = peaks_plot.shape[0]
-                    if plot_label_top_k is not None:
-                        nlab = min(nlab, int(plot_label_top_k))
-
-                    for idx in range(nlab):
-                        row, col = float(peaks_plot[idx, 0]), float(peaks_plot[idx, 1])
-                        ax0.text(
-                            float(col + dcol),
-                            float(row + drow),
-                            str(idx),
-                            color=plot_label_color,
-                            fontsize=float(plot_label_size),
-                            alpha=float(plot_label_alpha),
-                            ha="center",
-                            va="center",
-                            bbox=bbox_kw,
-                        )
-
-            ax0.figure.canvas.draw_idle()
-
-        if return_peaks:
-            return out
-
-    def lattice_vectors(
+    def find_lattices(
         self,
-        ind_origin=None,
-        ind_u1=None,
-        ind_v1=None,
-        ind_u2=None,
-        ind_v2=None,
-        max_tile=None,
-        moire_draw: bool = False,
-        moire_exclude_radius_px: float = 2.0,
-        moire_parent_maxlen_px: float | None = None,
-        moire_round_decimals: int = 3,
-        return_peaks: bool = False,
-        **kwargs,
-    ) -> dict[str, Any]:
-        if not hasattr(self, "peaks"):
-            raise RuntimeError("No peaks found. Run .find_peaks() first.")
-        peaks = np.asarray(self.peaks, dtype=float)
-        if peaks.ndim != 2 or peaks.shape[1] != 2:
-            raise RuntimeError("self.peaks must have shape (N, 2) with columns [row, col].")
-        if peaks.shape[0] == 0:
-            raise RuntimeError("No peaks available in self.peaks.")
+        num_lattices: int = 2,
+        tol: float = 3.0,
+        num_candidates: int = 40,
+        min_radius: float = 20.0,
+        plot: bool = True,
+    ) -> Self:
+        """Find the center and the basis of every lattice, then refine them.
 
-        im = np.asarray(self.diffraction.array)
-        if im.ndim != 2:
-            raise ValueError("DiffractionMoire.lattice_vectors requires a 2D diffraction array.")
-        nrow, ncol = int(im.shape[0]), int(im.shape[1])
+        The center is the weighted mode of the midpoints of all pairs of the
+        strongest spots, since every Friedel pair ``+g, -g`` shares its
+        midpoint. Each lattice basis is then picked from pairs of the strongest
+        unassigned spots, by the intensity of the spots it explains within
+        `tol`, minus the fraction a lattice of the same cell area would explain
+        by chance; this penalty keeps a short moire vector from winning by
+        explaining every spot. The spots on a chosen lattice are removed before
+        the next one is picked. Finally :meth:`refine` indexes and fits
+        everything.
 
-        def _as_int(x, name: str) -> int:
-            if x is None:
-                raise ValueError(f"{name} must be provided (int index into self.peaks).")
-            xi = int(x)
-            if xi < 0 or xi >= peaks.shape[0]:
-                raise IndexError(f"{name}={xi} out of range for self.peaks with N={peaks.shape[0]}.")
-            return xi
-
-        def _pair_ok(a, b) -> bool:
-            return (a is not None) and (b is not None)
-
-        def _pair_half(a, b) -> bool:
-            return (a is None) ^ (b is None)
-
-        if _pair_half(ind_u1, ind_v1):
-            raise ValueError("Provide both ind_u1 and ind_v1, or neither.")
-        if _pair_half(ind_u2, ind_v2):
-            raise ValueError("Provide both ind_u2 and ind_v2, or neither.")
-
-        have_lattice1 = _pair_ok(ind_u1, ind_v1)
-        have_lattice2 = _pair_ok(ind_u2, ind_v2)
-        if not (have_lattice1 or have_lattice2):
-            raise ValueError("Provide lattice indices for at least one lattice (u/v).")
-
-        ind_origin_i = _as_int(ind_origin, "ind_origin")
-        r0 = peaks[ind_origin_i].astype(float, copy=False)
-
-        if have_lattice1:
-            ind_u1_i = _as_int(ind_u1, "ind_u1")
-            ind_v1_i = _as_int(ind_v1, "ind_v1")
-            u1 = peaks[ind_u1_i].astype(float, copy=False) - r0
-            v1 = peaks[ind_v1_i].astype(float, copy=False) - r0
-            if np.linalg.norm(u1) == 0 or np.linalg.norm(v1) == 0:
-                raise ValueError("Lattice 1 vectors u1/v1 must be non-zero (origin and vector peaks must differ).")
-        else:
-            ind_u1_i = None
-            ind_v1_i = None
-            u1 = None
-            v1 = None
-
-        if have_lattice2:
-            ind_u2_i = _as_int(ind_u2, "ind_u2")
-            ind_v2_i = _as_int(ind_v2, "ind_v2")
-            u2 = peaks[ind_u2_i].astype(float, copy=False) - r0
-            v2 = peaks[ind_v2_i].astype(float, copy=False) - r0
-            if np.linalg.norm(u2) == 0 or np.linalg.norm(v2) == 0:
-                raise ValueError("Lattice 2 vectors u2/v2 must be non-zero (origin and vector peaks must differ).")
-        else:
-            ind_u2_i = None
-            ind_v2_i = None
-            u2 = None
-            v2 = None
-
-        if moire_draw and not (have_lattice1 and have_lattice2):
-            raise ValueError("moire_draw=True requires both lattices (u1/v1 and u2/v2).")
-
-        def _default_max_tile(u: NDArray, v: NDArray) -> int:
-            du = float(np.linalg.norm(u))
-            dv = float(np.linalg.norm(v))
-            dmin = min(du, dv) if (du > 0 and dv > 0) else max(du, dv)
-            if not np.isfinite(dmin) or dmin <= 0:
-                return 10
-            diag = float(np.hypot(nrow, ncol))
-            mt = int(np.ceil(diag / dmin)) + 2
-            return int(np.clip(mt, 3, 200))
-
-        if max_tile is None:
-            mt_list: list[int] = []
-            if have_lattice1:
-                mt_list.append(_default_max_tile(u1, v1))
-            if have_lattice2:
-                mt_list.append(_default_max_tile(u2, v2))
-            max_tile_use = max(mt_list) if mt_list else 10
-        else:
-            max_tile_use = int(max_tile)
-            if max_tile_use < 0:
-                raise ValueError("max_tile must be >= 0.")
-
-        def _tile_points_bounded(r0: NDArray, u: NDArray, v: NDArray, mt: int) -> NDArray:
-            if mt == 0:
-                return r0[None, :].copy()
-            a = np.arange(-mt, mt + 1, dtype=float)
-            b = np.arange(-mt, mt + 1, dtype=float)
-            aa, bb = np.meshgrid(a, b, indexing="ij")
-            pts = r0[None, None, :] + aa[..., None] * u[None, None, :] + bb[..., None] * v[None, None, :]
-            pts = pts.reshape(-1, 2)
-            keep = (
-                (pts[:, 0] >= 0.0)
-                & (pts[:, 0] <= (nrow - 1))
-                & (pts[:, 1] >= 0.0)
-                & (pts[:, 1] <= (ncol - 1))
+        Parameters
+        ----------
+        num_lattices : int, default=2
+            Number of crystal lattices.
+        tol : float, default=3.0
+            Largest distance in pixels between a spot and a lattice node.
+        num_candidates : int, default=40
+            Number of strongest unassigned spots tried as basis vectors.
+        min_radius : float, default=20.0
+            Spots closer than this to the center (pixels) are not used as basis
+            vectors.
+        plot : bool, default=True
+            Show the indexed spots and the basis vectors.
+        """
+        if self.peaks.shape[0] < 3:
+            raise RuntimeError("Run find_peaks() first.")
+        q, inten = self.peaks[:, :2], self.peaks[:, 2]
+        center = _friedel_center(q, inten, self.diffraction.shape, tol)
+        v = q - center
+        weight = np.clip(inten, 0.0, None)
+        free = np.hypot(v[:, 0], v[:, 1]) > min_radius
+        lattices = []
+        for _ in range(int(num_lattices)):
+            idx = np.flatnonzero(free)
+            idx = idx[np.argsort(-inten[idx])][: int(num_candidates)]
+            a, b = np.triu_indices(idx.size, 1)
+            g1, g2 = v[idx[a]], v[idx[b]]
+            cos = np.sum(g1 * g2, axis=1) / (
+                np.hypot(g1[:, 0], g1[:, 1]) * np.hypot(g2[:, 0], g2[:, 1])
             )
-            return pts[keep]
+            keep = np.abs(cos) < np.cos(np.deg2rad(30.0))
+            if not keep.any():
+                raise RuntimeError(f"Found only {len(lattices)} lattices.")
+            bases = np.stack([g1[keep], g2[keep]], axis=1)
+            score, _ = _lattice_score(v[free], weight[free], bases, tol)
+            basis = _reduce_basis(bases[int(np.argmax(score))])
+            lattices.append(basis)
+            _, on = _lattice_score(v, weight, basis[None], tol)
+            free &= ~on[0]
+        self.metadata["find_lattices"] = dict(
+            num_lattices=int(num_lattices),
+            tol=float(tol),
+            num_candidates=int(num_candidates),
+            min_radius=float(min_radius),
+        )
+        return self.refine(center=center, lattices=np.stack(lattices), tol=tol, plot=plot)
 
-        pts1 = _tile_points_bounded(r0, u1, v1, max_tile_use) if have_lattice1 else None
-        pts2 = _tile_points_bounded(r0, u2, v2, max_tile_use) if have_lattice2 else None
+    def refine(
+        self,
+        center: NDArray | None = None,
+        lattices: NDArray | None = None,
+        max_terms: int = 2,
+        tol: float = 3.0,
+        num_iterations: int = 3,
+        ellipse: bool = False,
+        plot: bool = True,
+    ) -> Self:
+        """Index every spot and refine the center and the lattice bases.
 
-        pts_moire = None
-        moire_info: dict[str, Any] | None = None
+        The predicted spots are all integer combinations of the reflections of
+        up to `max_terms` different lattices within the detected area: the
+        reflections of each lattice for ``max_terms=1``, plus the double
+        diffraction spots ``g_a + g_b`` for ``max_terms=2``. Each spot is
+        assigned to the lowest order prediction within `tol` (orders count
+        ``sum |h| + |k|``), and ``q = center + sum_l (h_l g1_l + k_l g2_l)`` is
+        then fit by least squares weighted by the square root of the spot
+        intensity, as in :meth:`BraggVectors.fit_lattice`. Spots with more than
+        one distinct prediction within `tol` are indexed but left out of the
+        fit, since overlapping spots merge into one peak between the
+        predictions; near commensurate twists many double diffraction spots
+        fall close to others. Indexing and fitting
+        alternate `num_iterations` times.
 
-        if moire_draw:
-            maxlen = float(moire_parent_maxlen_px) if moire_parent_maxlen_px is not None else float(0.5 * np.hypot(nrow, ncol))
-            if not np.isfinite(maxlen) or maxlen <= 0:
-                raise ValueError("moire_parent_maxlen_px must be a positive finite number.")
+        With `ellipse`, every layer is taken as the same crystal lattice rotated
+        about the beam, as in a twisted homobilayer, and a shared elliptic
+        distortion of the pattern is refined with the lattice, the rotation of
+        each layer and the center, by nonlinear least squares. The distortion is
+        stored in :attr:`ellipse` as ``[e11, e12]``, the correction matrix
+        ``[[1 + e11, e12], [e12, 1 - e11]]`` of the quantEM calibration
+        (:func:`~quantem.diffraction.calibration.calibrate_ellipse`), and
+        :meth:`summary` reports the corrected lattices. Layers with different
+        lattices leave the distortion inseparable from their shapes.
 
-            def _disp_set(u: NDArray, v: NDArray, maxlen: float) -> tuple[NDArray, NDArray]:
-                dmin = float(min(np.linalg.norm(u), np.linalg.norm(v)))
-                if not np.isfinite(dmin) or dmin <= 0:
-                    raise ValueError("Invalid lattice vectors for moire generation.")
-                mt = int(np.ceil(maxlen / dmin)) + 1
-                mt = int(np.clip(mt, 1, 200))
-                a = np.arange(-mt, mt + 1, dtype=float)
-                b = np.arange(-mt, mt + 1, dtype=float)
-                aa, bb = np.meshgrid(a, b, indexing="ij")
-                aa = aa.ravel()
-                bb = bb.ravel()
-                disp = aa[:, None] * u[None, :] + bb[:, None] * v[None, :]
-                dn = np.sqrt(np.sum(disp**2, axis=1))
-                keep = dn <= maxlen + 1e-9
-                aa = aa[keep]
-                bb = bb[keep]
-                disp = disp[keep]
-                return disp, np.stack([aa, bb], axis=1)
+        Parameters
+        ----------
+        center : np.ndarray, optional
+            Starting ``(row, col)`` center in pixels; defaults to the current one.
+        lattices : np.ndarray, optional
+            Starting ``(num_lattices, 2, 2)`` bases ``[g1, g2]`` in pixels, each
+            vector as ``(row, col)``; defaults to the current ones.
+        max_terms : int, default=2
+            Largest number of lattices combined in one predicted spot.
+        tol : float, default=3.0
+            Largest distance in pixels between a spot and its prediction.
+        num_iterations : int, default=3
+            Number of index and fit cycles.
+        ellipse : bool, default=False
+            Refine a shared elliptic distortion, with one lattice for all layers.
+        plot : bool, default=True
+            Show the indexed spots and the basis vectors.
+        """
+        center = self.center if center is None else np.asarray(center, dtype=float)
+        lattices = self.lattices if lattices is None else np.asarray(lattices, dtype=float)
+        if center is None or lattices is None:
+            raise RuntimeError("Run find_lattices() first, or pass center and lattices.")
+        q, inten = self.peaks[:, :2], self.peaks[:, 2]
+        num = lattices.shape[0]
+        e = np.zeros(2)
+        if ellipse:
+            # layer l is R(theta_l) applied to the basis of layer 0, all seen
+            # through the inverse of the correction matrix
+            lattices = np.stack(
+                [lattices[0]] + [_closest_basis(g, lattices[0]) for g in lattices[1:]]
+            )
+            theta = [_polar(lattices[0], g)[0] for g in lattices[1:]]
+            params = np.concatenate([center, e, lattices[0].ravel(), theta])
+        for _ in range(int(num_iterations)):
+            indices, indexed, overlap = _index_spots(q - center, lattices, tol, max_terms)
+            fit = indexed & ~overlap
+            if fit.sum() < 2 + 2 * num:
+                raise RuntimeError("Too few spots indexed to fit the lattices.")
+            w = np.sqrt(np.clip(inten[fit], 0.0, None))[:, None]
+            if ellipse:
+                hk, target = indices[fit], q[fit]
 
-            disp1, ab1 = _disp_set(u1, v1, maxlen)
-            disp2, ab2 = _disp_set(u2, v2, maxlen)
+                def residual(p):
+                    c, g, _ = _ellipse_model(p, num)
+                    return ((c + hk @ g.reshape(-1, 2) - target) * w).ravel()
 
-            if disp1.size and disp2.size:
-                n1 = int(disp1.shape[0])
-                n2 = int(disp2.shape[0])
-                if n1 * n2 > 2_000_000:
-                    raise ValueError(
-                        f"Moire candidate count too large (N1*N2={n1*n2}). "
-                        "Reduce moire_parent_maxlen_px to limit the search space."
-                    )
+                params = least_squares(residual, params).x
+                center, lattices, e = _ellipse_model(params, num)
+            else:
+                design = np.concatenate([np.ones((fit.sum(), 1)), indices[fit]], axis=1)
+                beta = np.linalg.lstsq(design * w, q[fit] * w, rcond=None)[0]
+                center = beta[0]
+                lattices = beta[1:].reshape(num, 2, 2)
+        resid = q[fit] - center - indices[fit] @ lattices.reshape(-1, 2)
+        self.center, self.lattices = center, lattices
+        self.ellipse = e if ellipse else None
+        self.indices, self.indexed = indices, indexed
+        self.rms = float(np.sqrt(np.average(np.sum(resid**2, axis=1), weights=w[:, 0] ** 2)))
+        self.metadata["refine"] = dict(
+            max_terms=int(max_terms), tol=float(tol), ellipse=bool(ellipse)
+        )
+        if plot:
+            self.plot()
+        return self
 
-                pts = r0[None, None, :] + disp1[:, None, :] + disp2[None, :, :]
-                pts = pts.reshape(-1, 2)
+    @property
+    def spot_terms(self) -> NDArray:
+        """Number of lattices contributing to each spot (0 for the center)."""
+        num = self.lattices.shape[0]
+        return np.any(self.indices.reshape(-1, num, 2) != 0, axis=2).sum(axis=1)
 
-                keep_combo = ~(
-                    ((ab1[:, 0] == 0) & (ab1[:, 1] == 0))[:, None]
-                    | ((ab2[:, 0] == 0) & (ab2[:, 1] == 0))[None, :]
-                ).ravel()
-                pts = pts[keep_combo]
+    def summary(self) -> dict[str, Any]:
+        """Lattice spacings, relative rotations and moire periods.
 
-                keep_bounds = (
-                    (pts[:, 0] >= 0.0)
-                    & (pts[:, 0] <= (nrow - 1))
-                    & (pts[:, 1] >= 0.0)
-                    & (pts[:, 1] <= (ncol - 1))
-                )
-                pts = pts[keep_bounds]
+        For each pair of lattices ``(a, b)``, the basis of ``b`` is replaced by
+        the integer change of basis closest to the basis of ``a``, and the
+        transform ``T`` with ``g_b = T g_a`` is split into a rotation and a
+        symmetric stretch (polar decomposition). The rotation is the twist from
+        ``a`` to ``b`` in the quantEM in-plane convention, the stretch
+        eigenvalues minus one are the lattice mismatch, and the moire reciprocal
+        vectors are ``g_b - g_a``. Spot positions cannot tell a twist ``t``
+        from its symmetry equivalents, such as ``t + 60`` degrees for a
+        hexagonal lattice, so the smallest one is reported. After
+        ``refine(ellipse=True)`` every quantity is computed from the lattices
+        with the elliptic distortion removed, and the mismatch is zero by
+        construction.
 
-                if pts.size:
-                    pts = np.unique(np.round(pts, int(moire_round_decimals)), axis=0)
-
-                    r_excl = float(moire_exclude_radius_px)
-                    if r_excl > 0:
-                        parent_pts = np.vstack((r0[None, :] + disp1, r0[None, :] + disp2))
-                        parent_keep = (
-                            (parent_pts[:, 0] >= 0.0)
-                            & (parent_pts[:, 0] <= (nrow - 1))
-                            & (parent_pts[:, 1] >= 0.0)
-                            & (parent_pts[:, 1] <= (ncol - 1))
-                        )
-                        parent_pts = parent_pts[parent_keep]
-                        if parent_pts.size:
-                            try:
-                                from scipy.spatial import cKDTree
-
-                                tree = cKDTree(parent_pts)
-                                d, _ = tree.query(pts, k=1, workers=-1)
-                                pts = pts[d >= r_excl]
-                            except Exception:
-                                r2 = r_excl * r_excl
-                                keep = np.ones(pts.shape[0], dtype=bool)
-                                for i in range(pts.shape[0]):
-                                    d2 = np.sum((parent_pts - pts[i]) ** 2, axis=1)
-                                    if np.any(d2 < r2):
-                                        keep[i] = False
-                                pts = pts[keep]
-
-                    pts_moire = pts if pts.size else None
-
-            moire_info = {
-                "moire_parent_maxlen_px": maxlen,
-                "moire_exclude_radius_px": float(moire_exclude_radius_px),
-                "moire_round_decimals": int(moire_round_decimals),
-                "moire_n_disp1": int(disp1.shape[0]),
-                "moire_n_disp2": int(disp2.shape[0]),
-            }
-
-        data: dict[str, Any] = {
-            "origin_index": ind_origin_i,
-            "origin_rc": r0.copy(),
-            "max_tile": max_tile_use,
-            "lattice1_points_rc": pts1,
-            "lattice2_points_rc": pts2,
-            "moire_points_rc": pts_moire,
-            "moire_info": moire_info,
+        Returns
+        -------
+        dict
+            ``lattices``: per lattice ``k`` (the lengths of ``g1``, ``g2``),
+            ``d = 1 / k`` and the ``g1``-``g2`` angle; ``pairs``: per pair of
+            lattices the twist (degrees), mismatch, and moire ``k`` and period;
+            ``ellipse``: ``[e11, e12]`` or None. Lengths are in 1/Angstroms and
+            Angstroms when the pattern is calibrated, otherwise in pixels.
+        """
+        if self.lattices is None:
+            raise RuntimeError("Run find_lattices() first.")
+        scale = self.pixel_size or 1.0
+        out: dict[str, Any] = {
+            "units": "1/A" if self.pixel_size else "px",
+            "ellipse": self.ellipse,
         }
+        lattices = self.lattices
+        if self.ellipse is not None:
+            lattices = lattices @ _ellipse_matrix(self.ellipse).T
+        out["lattices"] = []
+        for g in lattices:
+            length = np.hypot(g[:, 0], g[:, 1])
+            angle = np.degrees(np.arccos(np.dot(g[0], g[1]) / np.prod(length)))
+            out["lattices"].append(
+                dict(k=length * scale, d=1.0 / (length * scale), angle_deg=angle)
+            )
+        out["pairs"] = []
+        for a, b in itertools.combinations(range(lattices.shape[0]), 2):
+            ga = lattices[a]
+            gb = _closest_basis(lattices[b], ga)
+            twist, stretch = _polar(ga, gb)
+            k_moire = np.hypot(*(gb - ga).T) * scale
+            out["pairs"].append(
+                dict(
+                    lattices=(a, b),
+                    twist_deg=float(np.degrees(twist)),
+                    mismatch=stretch - 1.0,
+                    k_moire=k_moire,
+                    period_moire=1.0 / k_moire,
+                )
+            )
+        return out
 
-        if have_lattice1:
-            data.update(
-                {
-                    "u1_index": ind_u1_i,
-                    "v1_index": ind_v1_i,
-                    "u1_rc": u1.copy(),
-                    "v1_rc": v1.copy(),
-                }
+    def plot(
+        self,
+        sigma: float = 2.0,
+        power: float = 0.3,
+        ring_radius: float = 20.0,
+        axsize: tuple[float, float] = (8, 8),
+    ):
+        """Pattern with the detected spots, or with the indexed spots and bases.
+
+        Markers are thin rings drawn outside the spots, so the spots stay
+        visible. Before :meth:`find_lattices` every detected spot is ringed in
+        red. After it, spots of a single lattice are ringed in that lattice's
+        color, double diffraction spots in white, unindexed spots in gray, and
+        the basis vectors are drawn as arrows from the center that stop at the
+        ring.
+
+        Parameters
+        ----------
+        sigma : float, default=2.0
+            Gaussian smoothing of the displayed pattern in pixels, which keeps
+            spots a few pixels wide visible when a large pattern is shown small.
+        power : float, default=0.3
+            Display power of the intensity.
+        ring_radius : float, default=20.0
+            Radius of the marker rings in pixels.
+        axsize : tuple, default=(8, 8)
+            Figure size in inches.
+
+        Returns
+        -------
+        fig, ax
+        """
+        from matplotlib.collections import PatchCollection
+        from matplotlib.patches import Circle
+
+        image = np.clip(np.asarray(self.diffraction.array, dtype=float), 0.0, None)
+        if sigma > 0:
+            image = gaussian_filter(image, sigma)
+        fig, ax = show_2d(
+            image,
+            norm={"power": power, "lower_quantile": 0.5, "upper_quantile": 0.9995},
+            axsize=axsize,
+        )
+        q = self.peaks
+
+        def rings(mask, color, lw=1.0):
+            circles = [Circle((c, r), ring_radius) for r, c in q[mask, :2]]
+            ax.add_collection(
+                PatchCollection(circles, facecolor="none", edgecolor=color, linewidth=lw),
+                autolim=False,
             )
 
-        if have_lattice2:
-            data.update(
-                {
-                    "u2_index": ind_u2_i,
-                    "v2_index": ind_v2_i,
-                    "u2_rc": u2.copy(),
-                    "v2_rc": v2.copy(),
-                }
+        if self.lattices is None:
+            rings(np.ones(q.shape[0], dtype=bool), "r")
+            ax.set_title(f"{q.shape[0]} spots")
+            return fig, ax
+        colors = phase_color_cycle(self.lattices.shape[0])
+        terms = self.spot_terms
+        rings(~self.indexed, "0.5", lw=0.8)
+        rings(self.indexed & (terms >= 2), "w", lw=0.8)
+        for i, basis in enumerate(self.lattices):
+            m = self.indexed & (terms == 1) & np.any(self.indices[:, 2 * i : 2 * i + 2] != 0, 1)
+            rings(m, colors[i], lw=1.5)
+            for g in basis:
+                tip = self.center + g * (1.0 - ring_radius / np.hypot(*g))
+                ax.annotate(
+                    "",
+                    xy=(tip[1], tip[0]),
+                    xytext=(self.center[1], self.center[0]),
+                    arrowprops=dict(arrowstyle="-|>", color=colors[i], lw=1.5),
+                )
+        ax.set_title(f"{self.indexed.sum()} of {q.shape[0]} spots indexed, rms {self.rms:.2f} px")
+        return fig, ax
+
+    def __repr__(self) -> str:
+        lines = [f"DiffractionMoire, {self.peaks.shape[0]} spots"]
+        if self.lattices is None:
+            return "\n".join(lines)
+        res = self.summary()
+        k_unit = res["units"]
+        d_unit = "A" if k_unit == "1/A" else "1/px"
+        lines.append(
+            f"  center ({self.center[0]:.2f}, {self.center[1]:.2f}) px, "
+            f"{self.indexed.sum()} spots indexed, rms {self.rms:.2f} px"
+        )
+        if self.ellipse is not None:
+            e11, e12 = self.ellipse
+            lines.append(
+                f"  ellipse        e11 {e11:.2e}, e12 {e12:.2e} "
+                f"({200 * np.hypot(e11, e12):.2f}% ellipticity), corrected below"
             )
-
-        self.lattice_vectors_data = data
-
-        fig, ax = show_2d(im, **kwargs)
-        ax0 = ax.flat[0] if hasattr(ax, "flat") else ax
-
-        c1 = (1.0, 0.0, 0.0)
-        c2 = (0.0, 0.8, 1.0)
-        cm = (0.8, 0.0, 1.0)
-        c0 = (0.0, 1.0, 0.0)
-
-        lw_vec = 1.0
-        lw_pts = 1.0
-
-        ax0.scatter([r0[1]], [r0[0]], s=90, marker="x", c=[c0], linewidths=lw_vec, zorder=8)
-
-        def _draw_vec(vec: NDArray, color):
-            p = r0 + vec
-            ax0.plot([r0[1], p[1]], [r0[0], p[0]], color=color, linewidth=lw_vec, zorder=7)
-            ax0.scatter([p[1]], [p[0]], s=45, marker="o", facecolors="none", edgecolors=[color], linewidths=lw_vec, zorder=8)
-
-        if have_lattice1:
-            _draw_vec(u1, c1)
-            _draw_vec(v1, c1)
-
-        if have_lattice2:
-            _draw_vec(u2, c2)
-            _draw_vec(v2, c2)
-
-        if pts1 is not None and pts1.size:
-            ax0.scatter(
-                pts1[:, 1],
-                pts1[:, 0],
-                s=22,
-                marker="o",
-                facecolors="none",
-                edgecolors=[c1],
-                linewidths=lw_pts,
-                alpha=0.8,
-                zorder=5,
+        for i, lat in enumerate(res["lattices"]):
+            k, d = lat["k"], lat["d"]
+            lines.append(
+                f"  lattice {i}      |g| {k[0]:.4f}, {k[1]:.4f} {k_unit}, "
+                f"d {d[0]:.4f}, {d[1]:.4f} {d_unit}, angle {lat['angle_deg']:.2f} deg"
             )
-
-        if pts2 is not None and pts2.size:
-            ax0.scatter(
-                pts2[:, 1],
-                pts2[:, 0],
-                s=22,
-                marker="o",
-                facecolors="none",
-                edgecolors=[c2],
-                linewidths=lw_pts,
-                alpha=0.8,
-                zorder=5,
+        for p in res["pairs"]:
+            mis, per = 100 * p["mismatch"], p["period_moire"]
+            lines.append(
+                f"  lattices {p['lattices'][0]}-{p['lattices'][1]}  twist {p['twist_deg']:.2f} deg, "
+                f"mismatch {mis[0]:.2f}%, {mis[1]:.2f}%, moire period {per[0]:.3f}, "
+                f"{per[1]:.3f} {d_unit}"
             )
+        return "\n".join(lines)
 
-        if pts_moire is not None and pts_moire.size:
-            ax0.scatter(
-                pts_moire[:, 1],
-                pts_moire[:, 0],
-                s=14,
-                marker="o",
-                facecolors="none",
-                edgecolors=[cm],
-                linewidths=lw_pts,
-                alpha=0.9,
-                zorder=5,
-            )
 
-        ax0.figure.canvas.draw_idle()
+def _friedel_center(q: NDArray, inten: NDArray, shape, tol: float, num: int = 150) -> NDArray:
+    """Weighted mode of the midpoints of all pairs of the strongest spots."""
+    order = np.argsort(-inten)[:num]
+    p, w = q[order], np.sqrt(np.clip(inten[order], 0.0, None))
+    i, j = np.triu_indices(p.shape[0], 1)
+    mid, wij = 0.5 * (p[i] + p[j]), w[i] * w[j]
+    H, _, _ = np.histogram2d(
+        mid[:, 0], mid[:, 1], bins=shape, range=[[0, shape[0]], [0, shape[1]]], weights=wij
+    )
+    r, c = np.unravel_index(np.argmax(gaussian_filter(H, 1.5)), H.shape)
+    center = np.array([r + 0.5, c + 0.5])
+    for _ in range(3):
+        near = np.hypot(*(mid - center).T) < tol
+        center = np.average(mid[near], axis=0, weights=wij[near])
+    return center
 
-        if return_peaks:
-            return {"data": data, "fig": fig, "ax": ax0}
-        return {}
+
+def _lattice_score(v: NDArray, weight: NDArray, bases: NDArray, tol: float):
+    """Chance-corrected weighted fraction of spots within `tol` of each lattice.
+
+    Returns the score of each of the ``(C, 2, 2)`` bases and the ``(C, N)``
+    mask of the spots on it. A lattice with cell area ``A`` lands within `tol`
+    of a random spot with probability ``pi tol**2 / A``, which is subtracted.
+    """
+    B = np.swapaxes(bases, 1, 2)  # columns g1, g2
+    det = np.linalg.det(B)
+    ok = np.abs(det) > 1e-6
+    f = np.einsum("cij,nj->cni", np.linalg.inv(np.where(ok[:, None, None], B, np.eye(2))), v)
+    d = np.einsum("cij,cnj->cni", B, f - np.round(f))
+    on = np.hypot(d[..., 0], d[..., 1]) < tol
+    chance = np.minimum(1.0, np.pi * tol**2 / np.maximum(np.abs(det), 1e-6))
+    score = np.sum(weight * (on - chance[:, None]), axis=1) / weight.sum()
+    return np.where(ok, score, -np.inf), on
+
+
+def _reduce_basis(basis: NDArray) -> NDArray:
+    """Shortest right-handed basis of the same lattice (Lagrange-Gauss reduction)."""
+    g1, g2 = basis
+    while True:
+        if g1 @ g1 > g2 @ g2:
+            g1, g2 = g2, g1
+        m = np.round((g1 @ g2) / (g1 @ g1))
+        if m == 0:
+            break
+        g2 = g2 - m * g1
+    if g1 @ g2 < 0:
+        g2 = -g2
+    if g1[0] * g2[1] - g1[1] * g2[0] < 0:
+        g1, g2 = g2, g1
+    return np.stack([g1, g2])
+
+
+def _polar(ga: NDArray, gb: NDArray) -> tuple[float, NDArray]:
+    """Rotation angle (radians) and sorted stretches of ``T`` with ``g_b = T g_a``."""
+    T = np.linalg.solve(ga, gb).T  # vectors as columns
+    U, s, Vt = np.linalg.svd(T)
+    R = U @ Vt
+    return float(np.arctan2(R[1, 0], R[0, 0])), np.sort(s)
+
+
+def _ellipse_model(params: NDArray, num: int):
+    """Center, measured lattice bases and ellipse from the ellipse fit parameters.
+
+    ``params`` holds the center, ``[e11, e12]``, the corrected basis of layer 0
+    and the rotation of every other layer from row toward column (radians).
+    """
+    center, e, g0, theta = params[:2], params[2:4], params[4:8].reshape(2, 2), params[8:]
+    distort = np.linalg.inv(_ellipse_matrix(e))
+    lattices = [g0]
+    for t in theta:
+        rot = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
+        lattices.append(g0 @ rot.T)
+    return center, np.stack(lattices) @ distort.T, e
+
+
+def _closest_basis(basis: NDArray, reference: NDArray) -> NDArray:
+    """The basis of the same lattice (unimodular, same handedness) closest to `reference`."""
+    best, best_err = basis, np.inf
+    for u in itertools.product((-1, 0, 1), repeat=4):
+        U = np.array(u, dtype=float).reshape(2, 2)
+        if round(np.linalg.det(U)) == 1:
+            err = np.sum((U @ basis - reference) ** 2)
+            if err < best_err:
+                best, best_err = U @ basis, err
+    return best
+
+
+def _index_spots(v: NDArray, lattices: NDArray, tol: float, max_terms: int):
+    """Lowest order integer combination within `tol` of each spot.
+
+    Returns the ``(N, 2 * num_lattices)`` indices, the mask of indexed spots,
+    and the mask of spots with more than one distinct prediction within `tol`.
+    """
+    num = lattices.shape[0]
+    k_max = float(np.hypot(v[:, 0], v[:, 1]).max()) + tol
+    reflections = []
+    for g in lattices:
+        n = int(np.ceil(k_max / np.hypot(g[:, 0], g[:, 1]).min())) + 1
+        hk = np.stack(np.meshgrid(np.arange(-n, n + 1), np.arange(-n, n + 1)), -1).reshape(-1, 2)
+        hk = hk[np.any(hk != 0, axis=1)]
+        pos = hk @ g
+        keep = np.hypot(pos[:, 0], pos[:, 1]) <= k_max
+        reflections.append((hk[keep], pos[keep]))
+    idx_all = [np.zeros((1, 2 * num), dtype=int)]
+    pos_all = [np.zeros((1, 2))]
+    for terms in range(1, int(max_terms) + 1):
+        for combo in itertools.combinations(range(num), terms):
+            grids = np.meshgrid(*[np.arange(reflections[i][0].shape[0]) for i in combo])
+            sel = [gr.ravel() for gr in grids]
+            pos = sum(reflections[i][1][s] for i, s in zip(combo, sel))
+            idx = np.zeros((pos.shape[0], 2 * num), dtype=int)
+            for i, s in zip(combo, sel):
+                idx[:, 2 * i : 2 * i + 2] = reflections[i][0][s]
+            keep = np.hypot(pos[:, 0], pos[:, 1]) <= k_max
+            idx_all.append(idx[keep])
+            pos_all.append(pos[keep])
+    idx = np.concatenate(idx_all)
+    pos = np.concatenate(pos_all)
+    order = np.abs(idx).sum(axis=1)
+    indices = np.zeros((v.shape[0], 2 * num), dtype=int)
+    indexed = np.zeros(v.shape[0], dtype=bool)
+    overlap = np.zeros(v.shape[0], dtype=bool)
+    for n, hits in enumerate(cKDTree(pos).query_ball_point(v, tol)):
+        if hits:
+            hits = np.asarray(hits)
+            dist = np.hypot(*(pos[hits] - v[n]).T)
+            best = hits[np.lexsort((dist, order[hits]))[0]]
+            indices[n], indexed[n] = idx[best], True
+            # distinct predictions within tol (combinations at the same position count once)
+            overlap[n] = np.any(np.hypot(*(pos[hits] - pos[best]).T) > 0.5)
+    return indices, indexed, overlap
