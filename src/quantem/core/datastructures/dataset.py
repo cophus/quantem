@@ -1,9 +1,10 @@
-import os
 import numbers
+import os
 from pathlib import Path
 from typing import Any, Literal, Optional, Self, Union, overload
 
 import numpy as np
+import torch
 from numpy.typing import DTypeLike, NDArray
 
 from quantem.core.io.serialize import AutoSerialize
@@ -23,7 +24,7 @@ class Dataset(AutoSerialize):
     Attributes (Properties):
         array (NDArray): The underlying n-dimensional NumPy array data.
         name (str): A descriptive name for the dataset.
-        origin (NDArray): The origin coordinates for each dimension (1D array).
+        origin (NDArray): The origin coordinates for each dimension (1D array) in calibrated units.
         sampling (NDArray): The sampling rate/spacing for each dimension (1D array).
         units (list[str]): Units for each dimension.
         signal_units (str): Units for the array values.
@@ -38,22 +39,38 @@ class Dataset(AutoSerialize):
 
     def __init__(
         self,
-        array: Any,  # Input can be array-like
-        name: str,
-        origin: NDArray | tuple | list | float | int,
-        sampling: NDArray | tuple | list | float | int,
-        units: list[str] | tuple | list,
+        array: NDArray | None = None,
+        tensor: torch.Tensor | None = None,
+        name: str = "",
+        origin: NDArray | tuple | list | float | int | None = None,
+        sampling: NDArray | tuple | list | float | int | None = None,
+        units: list[str] | tuple | list | None = None,
         signal_units: str = "arb. units",
         metadata: Optional[dict] = None,
         _token: object | None = None,
     ):
         if _token is not self._token:
-            raise RuntimeError("Use Dataset.from_array() to instantiate this class.")
+            raise RuntimeError(
+                "Use Dataset.from_array() or Dataset.from_tensor() to instantiate this class."
+            )
         super().__init__()
-        arr = ensure_valid_array(array)
-        if not isinstance(arr, np.ndarray):
-            raise TypeError("Dataset requires a NumPy array (CuPy is not supported on this branch).")
-        self._array = arr
+        # Dual-slot storage: exactly one of (_array, _tensor) is set.
+        # TODO: remove dual-init guards once torch transition is complete.
+        if array is None and tensor is None:
+            raise ValueError("Provide either `array` (numpy) or `tensor` (torch).")
+        if array is not None and tensor is not None:
+            raise ValueError("Provide only one of `array` or `tensor`, not both.")
+        if array is not None:
+            arr = ensure_valid_array(array)
+            if not isinstance(arr, np.ndarray):
+                raise TypeError(f"Dataset.array must be numpy.ndarray, got {type(arr).__name__}.")
+            self._array = arr
+            self._tensor = None
+        else:
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"Dataset.tensor must be torch.Tensor, got {type(tensor).__name__}.")
+            self._array = None
+            self._tensor = tensor
         self.name = name
         self.origin = origin
         self.sampling = sampling
@@ -82,7 +99,7 @@ class Dataset(AutoSerialize):
         name: str | None
             The name of the Dataset.
         origin: NDArray | tuple | list | float | int | None
-            The origin of the Dataset.
+            The origin of the Dataset in calibrated units.
         sampling: NDArray | tuple | list | float | int | None
             The sampling of the Dataset.
         units: list[str] | tuple | list | None
@@ -97,7 +114,9 @@ class Dataset(AutoSerialize):
         """
         validated_array = ensure_valid_array(array)
         if not isinstance(validated_array, np.ndarray):
-            raise TypeError("Dataset requires a NumPy array (CuPy is not supported on this branch).")
+            raise TypeError(
+                "Dataset requires a NumPy array (CuPy is not supported on this branch)."
+            )
         _ndim = validated_array.ndim
 
         # Set defaults if None
@@ -118,17 +137,31 @@ class Dataset(AutoSerialize):
 
     # --- Properties ---
     @property
-    def array(self) -> NDArray:
-        """The underlying n-dimensional NumPy array data."""
-        return self._array
+    def array(self) -> NDArray | None:
+        """The underlying n-dimensional NumPy array data.
+
+        Returns ``None`` for tensor-backed datasets. Use ``.tensor`` for the
+        torch tensor, or ``.numpy()`` to materialize a numpy copy explicitly.
+        """
+        return getattr(self, "_array", None)
 
     @array.setter
     def array(self, value: NDArray) -> None:
-        arr = ensure_valid_array(value, ndim=self.ndim)  # want to allow changing dtype
+        arr = ensure_valid_array(value, ndim=self.ndim)
         if not isinstance(arr, np.ndarray):
-            raise TypeError("Dataset requires a NumPy array (CuPy is not supported on this branch).")
+            raise TypeError(f"Dataset.array must be numpy.ndarray, got {type(arr).__name__}.")
         self._array = arr
-        # self._array = ensure_valid_array(value, dtype=self.dtype, ndim=self.ndim)
+
+    @property
+    def tensor(self) -> torch.Tensor:
+        """Torch tensor backing the data. AttributeError if numpy-backed."""
+        # getattr handles AutoSerialize-restored instances (no __init__ run).
+        tensor = getattr(self, "_tensor", None)
+        if tensor is None:
+            raise AttributeError(
+                f"Dataset '{self.name}' is numpy-backed; use Dataset.from_tensor() at construction."
+            )
+        return tensor
 
     @property
     def metadata(self) -> dict:
@@ -185,26 +218,62 @@ class Dataset(AutoSerialize):
     # --- Derived Properties ---
     @property
     def shape(self) -> tuple[int, ...]:
-        return self.array.shape
+        # Direct slot access (never triggers .array derive, which would force
+        # a full GPU->CPU copy on tensor-backed datasets). getattr handles
+        # AutoSerialize-restored instances (no __init__ run).
+        array = getattr(self, "_array", None)
+        return tuple((array if array is not None else self._tensor).shape)
 
     @property
     def ndim(self) -> int:
-        return self.array.ndim
+        array = getattr(self, "_array", None)
+        return (array if array is not None else self._tensor).ndim
 
     @property
-    def dtype(self) -> DTypeLike:
-        return self.array.dtype
+    def dtype(self) -> DTypeLike | torch.dtype:
+        array = getattr(self, "_array", None)
+        return (array if array is not None else self._tensor).dtype
 
     @property
     def device(self) -> str:
+        """Device string for the underlying storage. numpy 2.x ndarray and torch.Tensor
+        both expose ``.device`` (array-API convention), so this is uniform.
         """
-        Outputting a string is likely temporary -- once we have our use cases we can
-        figure out a more permanent device solution that enables easier translation between
-        numpy <-> torch <-> numpy, etc.
+        array = getattr(self, "_array", None)
+        return str((array if array is not None else self._tensor).device)
 
-        For NumPy-only datasets, this is always "cpu".
+    def numpy(self) -> NDArray:
+        """Return the data as a numpy array (mirrors ``torch.Tensor.numpy()``).
+
+        For numpy-backed datasets, returns ``self.array`` directly. For
+        tensor-backed datasets, materializes a read-only CPU copy via
+        ``.detach().cpu().numpy()``. ``flags.writeable=False`` so accidental
+        in-place writes raise instead of silently being lost (the copy is not
+        the tensor).
         """
-        return "cpu"
+        array = getattr(self, "_array", None)
+        if array is not None:
+            return array
+        arr = self._tensor.detach().cpu().numpy()
+        arr.flags.writeable = False
+        return arr
+
+    def to(self, device) -> Self:
+        """Move the underlying tensor to ``device``. Raises if numpy-backed.
+
+        ``device`` is normalized via :func:`quantem.core.config.validate_device`
+        so values like ``"cuda"``, ``0``, ``"cuda:0"``, ``torch.device("cuda:0")``
+        all resolve to the same canonical device.
+        """
+        from quantem.core import config
+        tensor = getattr(self, "_tensor", None)
+        if tensor is None:
+            raise AttributeError(
+                f"Cannot .to({device!r}) on numpy-backed Dataset '{self.name}'."
+            )
+        dev, _ = config.validate_device(device)
+        self._tensor = tensor.to(dev)
+        return self
 
     # --- Summaries ---
     def __repr__(self) -> str:
@@ -350,8 +419,9 @@ class Dataset(AutoSerialize):
     @overload
     def pad(
         self,
-        pad_width: int | tuple[int, int] | tuple[tuple[int, int], ...] | None,
-        output_shape: tuple[int, ...] | None,
+        pad_width: int | tuple[int, int] | tuple[tuple[int, int], ...] | None = None,
+        output_shape: tuple[int, ...] | None = None,
+        *,
         modify_in_place: Literal[True],
         **kwargs: Any,
     ) -> None: ...
@@ -363,7 +433,7 @@ class Dataset(AutoSerialize):
         output_shape: tuple[int, ...] | None = None,
         modify_in_place: Literal[False] = False,
         **kwargs: Any,
-    ) -> "Dataset": ...
+    ) -> Self: ...
 
     def pad(
         self,
@@ -371,7 +441,7 @@ class Dataset(AutoSerialize):
         output_shape: tuple[int, ...] | None = None,
         modify_in_place: bool = False,
         **kwargs: Any,
-    ) -> "Dataset | None":
+    ) -> Self | None:
         """
         Pads Dataset data array using numpy.pad.
         Metadata (origin, sampling) is not modified.
@@ -426,7 +496,8 @@ class Dataset(AutoSerialize):
     def crop(
         self,
         crop_widths: tuple[tuple[int, int], ...],
-        axes: tuple | None,
+        axes: tuple | None = None,
+        *,
         modify_in_place: Literal[True],
     ) -> None: ...
 
@@ -444,27 +515,56 @@ class Dataset(AutoSerialize):
         axes: tuple | None = None,
         modify_in_place: bool = False,
     ) -> Self | None:
-        """
-        Crops Dataset
+        """Select a sub-region of the dataset along specified axes
+
+        Each ``crop_widths`` entry is a ``(start, stop)`` pair defining
+        which elements to keep. A ``stop`` of ``0`` keeps everything from
+        ``start`` to the end.
 
         Parameters
         ----------
-        crop_widths:tuple
-            Min and max for cropping each axis specified as a tuple
-        axes:
-            Axes over which to crop. If None specified, all are cropped.
-        modify_in_place: bool
-            If True, modifies dataset
+        crop_widths : tuple[tuple[int, int], ...]
+            ``(start, stop)`` indices for each axis specified in ``axes``.
+        axes : tuple | None
+            Axes to crop. If None, all axes are cropped.
+        modify_in_place : bool
+            If True, modifies this dataset in-place and frees the original
+            array. If False, returns a new dataset.
 
         Returns
+        -------
+        Dataset | None
+            Cropped dataset if ``modify_in_place`` is False, otherwise None.
+
+        Examples
         --------
-        Dataset (cropped) only if modify_in_place is False
+        Crop real-space to a 128x128 region:
+
+        >>> dset_cropped = dset.crop(
+        ...     crop_widths=((64, 192), (64, 192)),
+        ...     axes=(0, 1),
+        ... )
+
+        Crop k-space to keep the first 180 pixels:
+
+        >>> dset_preview = dset.crop(
+        ...     crop_widths=((0, 180), (0, 180)),
+        ...     axes=(2, 3),
+        ... )
+
+        Crop k-space in-place to free memory:
+
+        >>> dset.crop(
+        ...     crop_widths=((4, 92), (4, 92)),
+        ...     axes=(2, 3),
+        ...     modify_in_place=True,
+        ... )
         """
         if axes is None:
             if len(crop_widths) != self.ndim:
                 raise ValueError("crop_widths must match number of dimensions when axes is None.")
             axes = tuple(range(self.ndim))
-        elif np.isscalar(axes):
+        elif isinstance(axes, int | float):
             axes = (int(axes),)
             crop_widths = (crop_widths[0],)  # Take first crop_width for single axis
         else:
@@ -474,29 +574,36 @@ class Dataset(AutoSerialize):
             raise ValueError("Length of crop_widths must match length of axes.")
 
         full_slices = []
+        new_origin = self.origin.astype(float).copy()
         crop_dict = dict(zip(axes, crop_widths))
-        for axis, _ in enumerate(self.shape):
+        for axis, axis_size in enumerate(self.shape):
             if axis in crop_dict:
                 before, after = crop_dict[axis]
                 start = before
                 stop = after if after != 0 else None
-                full_slices.append(slice(start, stop))
+                axis_slice = slice(start, stop)
+                normalized_start, _, _ = axis_slice.indices(axis_size)
+                full_slices.append(axis_slice)
+                new_origin[axis] = new_origin[axis] + normalized_start * self.sampling[axis]
             else:
                 full_slices.append(slice(None))
 
         if modify_in_place is False:
             dataset = self.copy()
             dataset.array = dataset.array[tuple(full_slices)]
+            dataset.origin = new_origin
             return dataset
 
         self.array = self.array[tuple(full_slices)]
+        self.origin = new_origin
         return None
 
     @overload
     def bin(
         self,
         bin_factors,
-        axes,
+        axes=None,
+        *,
         modify_in_place: Literal[True],
         reducer: str = "sum",
     ) -> None: ...
@@ -517,20 +624,31 @@ class Dataset(AutoSerialize):
         modify_in_place: bool = False,
         reducer: str = "sum",
     ) -> Self | None:
-        """
-        Bin the Dataset by integer factors along selected axes using block reduction.
+        """Reduce the dataset resolution by grouping pixels into blocks
+
+        Useful for reducing diffraction pattern size to speed up
+        reconstruction or lower memory usage. Sampling metadata is
+        updated automatically.
 
         Parameters
         ----------
         bin_factors : int | tuple[int, ...]
-            Bin factors per specified axis (positive integers).
+            A single integer bins all axes by the same factor. A tuple
+            specifies a different factor per axis, e.g. ``(1, 1, 2, 2)``
+            to bin only the last two axes by 2x.
         axes : int | tuple[int, ...] | None
             Axes to bin. If None, all axes are binned.
         modify_in_place : bool
-            If True, modifies this dataset; otherwise returns a new Dataset.
-        reducer : {"sum","mean"}
-            Reduction applied within each block. "sum" (default) preserves counts;
-            "mean" averages over each block (block volume = product of factors).
+            If True, modifies this dataset in-place. If False, returns
+            a new dataset.
+        reducer : {"sum", "mean"}
+            Reduction applied within each block. "sum" (default) preserves
+            counts; "mean" averages over each block.
+
+        Returns
+        -------
+        Dataset | None
+            Binned dataset if ``modify_in_place`` is False, otherwise None.
 
         Notes
         -----
@@ -538,6 +656,19 @@ class Dataset(AutoSerialize):
         - Sampling is multiplied by the factor on each binned axis.
         - Origin is shifted to the center of the first block:
             origin_new = origin_old + 0.5 * (factor - 1) * sampling_old
+
+        Examples
+        --------
+        Bin diffraction space by 2x to reduce memory:
+
+        >>> dset.bin(
+        ...     bin_factors=(1, 1, 2, 2),
+        ...     modify_in_place=True,
+        ... )
+
+        Bin all axes by 2x and return a new dataset:
+
+        >>> dset_binned = dset.bin(bin_factors=2)
         """
         reducer_norm = str(reducer).lower()
         if reducer_norm not in ("sum", "mean"):
@@ -545,7 +676,7 @@ class Dataset(AutoSerialize):
 
         if axes is None:
             axes = tuple(range(self.ndim))
-        elif np.isscalar(axes):
+        elif isinstance(axes, int | float):
             axes = (int(axes),)
         else:
             axes = tuple(int(ax) for ax in axes)
@@ -660,7 +791,7 @@ class Dataset(AutoSerialize):
         """
         if axes is None:
             axes = tuple(range(self.ndim))
-        elif np.isscalar(axes):
+        elif isinstance(axes, int | float):
             axes = (int(axes),)
         else:
             axes = tuple(int(a0) for a0 in axes)
@@ -670,14 +801,17 @@ class Dataset(AutoSerialize):
 
         # Resolve out_shape & factors
         if factors is not None:
-            if np.isscalar(factors):
+            if isinstance(factors, int | float):
                 factors = (float(factors),) * len(axes)
             else:
                 factors = tuple(float(f) for f in factors)
                 if len(factors) != len(axes):
                     raise ValueError("factors length must match number of axes.")
-            out_shape = tuple(max(1, int(round(self.shape[a1] * f))) for a1, f in zip(axes, factors))
+            out_shape = tuple(
+                max(1, int(round(self.shape[a1] * f))) for a1, f in zip(axes, factors)
+            )
         else:
+            assert out_shape is not None  # Guaranteed by check above
             if len(out_shape) != len(axes):
                 raise ValueError("out_shape length must match number of axes.")
             out_shape = tuple(int(nl) for nl in out_shape)
@@ -804,20 +938,25 @@ class Dataset(AutoSerialize):
 
         # Compute which dimensions are kept
         kept_axes = [i for i, idx in enumerate(index) if not isinstance(idx, (int, np.integer))]
+        kept_axis_to_index = {axis: j for j, axis in enumerate(kept_axes)}
 
         # Slice/reduce metadata accordingly
-        new_origin = np.asarray(self.origin)[kept_axes] if np.ndim(self.origin) > 0 else self.origin
+        origin_array = np.asarray(self.origin, dtype=float)
+        sampling_array = np.asarray(self.sampling, dtype=float)
+        new_origin = origin_array[kept_axes].copy() if np.ndim(self.origin) > 0 else self.origin
         new_sampling = (
-            np.asarray(self.sampling)[kept_axes] if np.ndim(self.sampling) > 0 else self.sampling
+            sampling_array[kept_axes].copy() if np.ndim(self.sampling) > 0 else self.sampling
         )
         new_units = [self.units[i] for i in kept_axes] if len(self.units) > 0 else self.units
 
-        # Adjust sampling for slice steps (e.g. [::2] doubles spacing)
+        # Adjust origin/sampling for sliced axes.
         for i, idx in enumerate(index):
-            if isinstance(idx, slice) and idx.step not in (None, 1):
-                if i in kept_axes:
-                    j = kept_axes.index(i)
-                    new_sampling[j] *= idx.step
+            if isinstance(idx, slice) and i in kept_axis_to_index:
+                j = kept_axis_to_index[i]
+                normalized_start, _, normalized_step = idx.indices(self.shape[i])
+                new_origin[j] = new_origin[j] + normalized_start * sampling_array[i]
+                if normalized_step != 1:
+                    new_sampling[j] *= normalized_step
 
         out_ndim = array_view.ndim
 

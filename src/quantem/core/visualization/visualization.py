@@ -1,11 +1,14 @@
+# from __future__ import annotations
+
 import os
 import warnings
 from collections.abc import Sequence
-from typing import Any, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, Union, cast
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 from matplotlib import colors
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from numpy.typing import NDArray
@@ -17,36 +20,61 @@ from quantem.core.visualization.custom_normalizations import (
     NormalizationConfig,
     _resolve_normalization,
 )
+from quantem.core.visualization.show_params import ShowParams
 from quantem.core.visualization.visualization_utils import (
     ScalebarConfig,
+    _fill_scalebar_calibration,
     _resolve_scalebar,
     add_arg_cbar_to_ax,
     add_cbar_to_ax,
     add_scalebar_to_ax,
     array_to_rgba,
-    list_of_arrays_to_rgba,
+    combine_arrays_to_rgba,
 )
+
+if TYPE_CHECKING:
+    from quantem.core.datastructures import Dataset2d
+
+ArrayLike: TypeAlias = Union[NDArray, torch.Tensor, "Dataset2d"]  # union required here
+
+# --- show_2d / grid broadcast inputs ---
+# There might be a cleaner way to do this, but better to have it here than in the functions
+NormInputCell: TypeAlias = NormalizationConfig | ShowParams.Norm | dict | str
+Show2dNormInput: TypeAlias = (
+    NormInputCell | None | Sequence[NormInputCell] | Sequence[Sequence[NormInputCell]]
+)
+
+ScalebarInputCell: TypeAlias = ScalebarConfig | ShowParams.Scalebar | dict | bool | None
+Show2dScalebarInput: TypeAlias = (
+    ScalebarConfig
+    | ShowParams.Scalebar
+    | dict
+    | bool
+    | None
+    | Sequence[ScalebarInputCell]
+    | Sequence[Sequence[ScalebarInputCell]]
+)
+
+CmapType: TypeAlias = str | colors.Colormap
 
 
 def _show_2d_array(
     array: NDArray,
     *,
-    norm: Optional[Union[NormalizationConfig, dict, str]] = None,
-    scalebar: Optional[Union[ScalebarConfig, dict, bool]] = None,
-    cmap: Union[str, colors.Colormap] = "gray",
+    norm: NormInputCell | None = None,
+    scalebar: ScalebarInputCell = None,
+    cmap: str | colors.Colormap = "gray",
     chroma_boost: float = 1.0,
     cbar: bool = False,
-    title: Optional[str] = None,
-    figax: Optional[tuple[Any, Any]] = None,
+    title: str | None = None,
+    figax: tuple[Any, Any] | None = None,
     figsize: tuple[int, int] = (8, 8),
     show_ticks: bool = False,
     **kwargs: Any,
 ) -> tuple[Any, Any]:
-    """Display a 2D array as an image with optional colorbar and scalebar.
+    """Render a single 2D array (real or complex) with optional colorbar/scalebar.
 
-    This function visualizes a 2D array, handling both real and complex data.
-    For complex data, it displays amplitude and phase information using a
-    perceptually-uniform color representation.
+    Complex data uses amplitude + phase in a perceptually uniform RGB encoding.
 
     Parameters
     ----------
@@ -122,10 +150,10 @@ def _show_2d_array(
 
     ax.imshow(rgba, interpolation=config.get("viz.interpolation"))
 
-    if show_ticks:
-        ax.set(title=title)
-    else:
-        ax.set(xticks=[], yticks=[], title=title)
+    if title is not None:
+        ax.set_title(title, fontsize=kwargs.get("title_fontsize", 12))
+    if not show_ticks:
+        ax.set(xticks=[], yticks=[])
 
     if cbar:
         divider = make_axes_locatable(ax)
@@ -135,10 +163,10 @@ def _show_2d_array(
         cb_abs = add_cbar_to_ax(fig, ax_cb_abs, norm_obj, cmap_obj)
 
         if is_complex:
-            ax_cb_angle = divider.append_axes("right", size="5%", pad="10%")
+            ax_cb_angle = divider.append_axes("right", size="5%", pad="15%")
             add_arg_cbar_to_ax(fig, ax_cb_angle, chroma_boost=chroma_boost)
             cb_abs.set_label("abs", rotation=0, ha="center", va="bottom")
-            cb_abs.ax.yaxis.set_label_coords(0.5, -0.05)
+            cb_abs.ax.yaxis.set_label_coords(0.5, -0.07)
 
     if scalebar_config is not None:
         add_scalebar_to_ax(
@@ -151,6 +179,14 @@ def _show_2d_array(
             scalebar_config.pad_px,
             scalebar_config.color,
             scalebar_config.loc,
+            scalebar_config.fontsize,
+            scalebar_config.bold,
+            box=scalebar_config.box,
+            box_color=scalebar_config.box_color,
+            box_alpha=scalebar_config.box_alpha,
+            outline_color=scalebar_config.outline_color,
+            outline_width=scalebar_config.outline_width,
+            display_units=scalebar_config.display_units,
         )
 
     for spine in ax.spines.values():  # fixes asymmetry of bbox for some reason
@@ -163,18 +199,17 @@ def _show_2d_array(
 def _show_2d_combined(
     list_of_arrays: Sequence[NDArray],
     *,
-    norm: Optional[Union[NormalizationConfig, dict, str]] = None,
-    scalebar: Optional[Union[ScalebarConfig, dict, bool]] = None,
-    cmap: Union[str, colors.Colormap] = "gray",
+    norm: NormInputCell | None = None,
+    scalebar: ScalebarInputCell = None,
     chroma_boost: float = 1.0,
     cbar: bool = False,
-    figax: Optional[tuple[Any, Any]] = None,
+    figax: tuple[Any, Any] | None = None,
     figsize: tuple[int, int] = (8, 8),
-    title: Optional[str] = None,
+    title: str | None = None,
     show_ticks: bool = False,
     **kwargs: Any,
 ) -> tuple[Any, Any]:
-    """Display multiple 2D arrays as a single combined image.
+    """Fuse multiple 2D arrays into one RGB panel (``show_2d(..., combine_images=True)``).
 
     This function takes a list of 2D arrays and creates a single visualization
     where each array is assigned a unique color, and their amplitudes determine
@@ -225,7 +260,7 @@ def _show_2d_combined(
         lower_quantile=norm_config.lower_quantile,
         upper_quantile=norm_config.upper_quantile,
         vmin=norm_config.vmin,
-        vmax=norm_config.vmin,
+        vmax=norm_config.vmax,
         vcenter=norm_config.vcenter,
         half_range=norm_config.half_range,
         power=norm_config.power,
@@ -235,7 +270,7 @@ def _show_2d_combined(
 
     # Convert Sequence to list for list_of_arrays_to_rgba
     list_of_arrays_list = list(list_of_arrays)
-    rgba = list_of_arrays_to_rgba(
+    rgba = combine_arrays_to_rgba(
         list_of_arrays_list,
         norm=norm_obj,
         chroma_boost=chroma_boost,
@@ -248,10 +283,10 @@ def _show_2d_combined(
 
     ax.imshow(rgba, interpolation=config.get("viz.interpolation"))
 
-    if show_ticks:
-        ax.set(title=title)
-    else:
-        ax.set(xticks=[], yticks=[], title=title)
+    if title is not None:
+        ax.set_title(title, fontsize=kwargs.get("title_fontsize", 12))
+    if not show_ticks:
+        ax.set(xticks=[], yticks=[])
 
     if cbar:
         raise NotImplementedError()
@@ -267,13 +302,41 @@ def _show_2d_combined(
             scalebar_config.pad_px,
             scalebar_config.color,
             scalebar_config.loc,
+            scalebar_config.fontsize,
+            scalebar_config.bold,
+            box=scalebar_config.box,
+            box_color=scalebar_config.box_color,
+            box_alpha=scalebar_config.box_alpha,
+            outline_color=scalebar_config.outline_color,
+            outline_width=scalebar_config.outline_width,
+            display_units=scalebar_config.display_units,
         )
 
     return fig, ax
 
 
+def _dataset_calibration_grid(arrays: Any) -> list[list[tuple[float, str] | None]]:
+    """Return (sampling, units) for each Dataset2d in the input grid, None for plain arrays.
+
+    Mirrors the grid layout of ``_normalize_show_input_to_grid`` so entries line up
+    with the panels, and must be called before ``to_cpu`` strips the datasets.
+    """
+    from quantem.core.datastructures import Dataset2d
+
+    def calib(obj: Any) -> tuple[float, str] | None:
+        if isinstance(obj, Dataset2d):
+            return float(obj.sampling[-1]), str(obj.units[-1])
+        return None
+
+    if not isinstance(arrays, (list, tuple)) or len(arrays) == 0:
+        return [[calib(arrays)]]
+    if not isinstance(arrays[0], (list, tuple)):
+        return [[calib(a) for a in arrays]]
+    return [[calib(a) for a in row] for row in arrays]
+
+
 def _normalize_show_input_to_grid(
-    arrays: Any,  # Union[NDArray, Sequence[NDArray], Sequence[Sequence[NDArray]]],
+    arrays: Any,  # NDArray | Sequence[NDArray] | Sequence[Sequence[NDArray]]
 ) -> list[list[NDArray]]:
     """Convert various input formats to a consistent grid format for visualization.
 
@@ -389,9 +452,9 @@ def _norm_show_args(
 
 def _normalize_show_args_to_grid(
     shape: tuple[int, int],
-    norm: NormalizationConfig | dict | str | Sequence[dict | str] | None = None,
-    scalebar: ScalebarConfig | dict | bool | Sequence[bool | dict | None] | None = None,
-    cmap: str | colors.Colormap | Sequence[str] | Sequence[Sequence[str]] = "gray",
+    norm: Show2dNormInput = None,
+    scalebar: Show2dScalebarInput = None,
+    cmap: CmapType | Sequence[CmapType] | Sequence[Sequence[CmapType]] = "gray",
     cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
     title: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
     chroma_boost: float | Sequence[float] = 1.0,
@@ -425,11 +488,11 @@ def _normalize_show_args_to_grid(
 
 
 def show_2d(
-    arrays: Union[NDArray, Sequence[NDArray], Sequence[Sequence[NDArray]]],
+    arrays: ArrayLike | Sequence[ArrayLike] | Sequence[Sequence[ArrayLike]],
     *,
-    norm: NormalizationConfig | dict | str | Sequence[dict | str] | None = None,
-    scalebar: ScalebarConfig | dict | bool | Sequence[bool | dict | None] | None = None,
-    cmap: str | colors.Colormap | Sequence[str] | Sequence[Sequence[str]] = "gray",
+    norm: Show2dNormInput = None,
+    scalebar: Show2dScalebarInput = None,
+    cmap: CmapType | Sequence[CmapType] | Sequence[Sequence[CmapType]] = "gray",
     cbar: bool | Sequence[bool] | Sequence[Sequence[bool]] = False,
     title: str | Sequence[str] | Sequence[Sequence[str]] | None = None,
     figax: tuple[Any, Any] | None = None,
@@ -439,12 +502,8 @@ def show_2d(
 ) -> tuple[Any, Any]:
     """Display one or more 2D arrays in a grid layout.
 
-    This is the main visualization function that can display a single array,
-    a list of arrays, or a grid of arrays. It supports both individual and
-    combined visualization modes.
-
-    The display arguments, i.e. everything except figax and axsize, can be given as single values
-    or as sequences that will be broadcasted to the grid shape defined by the input arrays.
+    ``norm``, ``scalebar``, ``cmap``, ``cbar``, and ``title`` may be scalars or nested
+    sequences broadcast to the panel grid.
 
     Parameters
     ----------
@@ -454,12 +513,15 @@ def show_2d(
     norm : NormalizationConfig or dict or str, optional
         Configuration for normalizing the data before visualization. This can be a string,
         dictionary, or a NormalizationConfig object. Strings for preset normalization types
-        include: "linear_auto" (quantile), "linear_minmax", "linear_centered", "log_auto",
-        "log_minmax", "power_squared", "power_sqrt", "asinh_centered"
+        include: ``"linear_auto"`` (quantile), ``"log_auto"``, ``"power_sqrt"``.
+        Dict form example: ``{"power": 0.5}``.
     scalebar : ScalebarConfig or dict or bool, optional
         Configuration for adding a scale bar to the plot.
+        Dict form example: ``{"sampling": 0.5, "units": "Å"}`` or
+        ``{"sampling": 0.02, "units": "1/Å"}``.
     cmap : str or Colormap, default="gray"
         Colormap to use for real data or amplitude of complex data.
+        Common choices: ``"gray"``, ``"viridis"``, ``"turbo"``, ``"inferno"``, ``"magma"``.
     cbar : bool, default=False
         Whether to add a colorbar to the plot.
     title : str, optional
@@ -507,7 +569,38 @@ def show_2d(
     ValueError
         If combine_images is True but arrays contains multiple rows, or if
         figax is provided but the axes shape doesn't match the grid shape.
+
+    Examples
+    --------
+    Typed normalization and scale bar (same information as str/dict forms):
+
+    >>> import numpy as np
+    >>> from quantem.core.visualization import show_2d, ShowParams
+    >>> img = np.random.rand(128, 128)
+    >>> fig, ax = show_2d(
+    ...     img,
+    ...     norm=ShowParams.Norm.log_auto(),
+    ...     scalebar=ShowParams.Scalebar(sampling=0.5, units="Å"),
+    ...     cbar=True,
+    ... )
+
+    Preset strings and dicts:
+
+    >>> fig, axs = show_2d(
+    ...     [np.random.rand(64, 64) ** 3 for _ in range(3)],
+    ...     norm="log_auto",
+    ...     cmap="turbo",
+    ...     title=["a", "b", "c"],
+    ...     scalebar={"sampling": 0.02, "units": "1/Å"},
+    ... )
+
+    Multi-row grid with titles:
+
+    >>> rows = [[np.random.rand(48, 48) for _ in range(3)] for _ in range(2)]
+    >>> labels = [["BF", "ADF", "ABF"], ["HAADF", "DPC", "SSB"]]
+    >>> fig, axs = show_2d(rows, title=labels, cmap="gray", scalebar={"sampling": 0.5, "units": "Å"})
     """
+    calibrations = _dataset_calibration_grid(arrays)
     arrays = to_cpu(arrays)
     grid = _normalize_show_input_to_grid(arrays)
     nrows = len(grid)
@@ -516,7 +609,24 @@ def show_2d(
     if kwargs.pop("combine_images", False):
         if nrows > 1:
             raise ValueError()
-        fig, axs = _show_2d_combined(grid[0], figax=figax, **kwargs)  # TODO pass args here
+        if isinstance(norm, Sequence):  # flatten norm
+            norm = norm[0] if not isinstance(norm[0], Sequence) else norm[0][0]
+        if isinstance(scalebar, Sequence):  # flatten scalebar
+            scalebar = scalebar[0] if not isinstance(scalebar[0], Sequence) else scalebar[0][0]
+        if calibrations[0][0] is not None:
+            scalebar = _fill_scalebar_calibration(scalebar, *calibrations[0][0])
+        if isinstance(title, Sequence) and not isinstance(title, str):  # flatten title
+            title = title[0] if isinstance(title[0], str) else title[0][0]
+
+        fig, axs = _show_2d_combined(
+            grid[0],
+            norm=norm,
+            scalebar=scalebar,
+            figax=figax,
+            title=title,
+            figsize=kwargs.pop("figsize", axsize),
+            **kwargs,
+        )
     else:
         normalized_args = _normalize_show_args_to_grid(
             shape=(nrows, ncols),
@@ -544,6 +654,15 @@ def show_2d(
         for i, row in enumerate(grid):
             for j, array in enumerate(row):
                 figax_local = (fig, axs[i][j])
+                calibration = (
+                    calibrations[i][j]
+                    if i < len(calibrations) and j < len(calibrations[i])
+                    else None
+                )
+                if calibration is not None:
+                    normalized_args[i][j]["scalebar"] = _fill_scalebar_calibration(
+                        normalized_args[i][j]["scalebar"], *calibration
+                    )
                 _show_2d_array(
                     array,
                     figax=figax_local,

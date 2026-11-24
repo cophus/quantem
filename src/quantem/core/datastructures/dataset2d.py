@@ -4,7 +4,6 @@ import numpy as np
 from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset import Dataset
-from quantem.core.utils.utils import to_numpy
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
@@ -40,7 +39,7 @@ class Dataset2d(Dataset):
         name : str
             A descriptive name for the dataset
         origin : NDArray | tuple | list | float | int
-            The origin coordinates for each dimension
+            The origin coordinates for each dimension in calibrated units
         sampling : NDArray | tuple | list | float | int
             The sampling rate/spacing for each dimension
         units : list[str] | tuple | list
@@ -102,9 +101,9 @@ class Dataset2d(Dataset):
         name : str | None, optional
             A descriptive name for the dataset. If None, defaults to "2D dataset"
         origin : NDArray | tuple | list | float | int | None, optional
-            The origin coordinates for each dimension. If None, defaults to zeros
+            The origin coordinates for each dimension in calibrated units. If None, defaults to zeros
         sampling : NDArray | tuple | list | float | int | None, optional
-            The sampling rate/spacing for each dimension. If None, defaults to ones
+            The sampling rate/spacing for each dimension in calibrated units. If None, defaults to ones
         units : list[str] | tuple | list | None, optional
             Units for each dimension. If None, defaults to ["pixels"] * 4
         signal_units : str, optional
@@ -159,21 +158,17 @@ class Dataset2d(Dataset):
 
         Parameters
         ----------
-        scalebar: ScalebarConfig or bool
-            If True, displays scalebar
+        scalebar: ScalebarConfig, ShowParams.Scalebar, dict or bool
+            If True, displays a scalebar. Sampling and units are taken from the
+            dataset unless set explicitly, so e.g. ``{"outline_color": "black"}``
+            still gives a calibrated scalebar.
         title: str
             Title of Dataset
         **kwargs: dict
             Keyword arguments for show_2d
         """
 
-        if scalebar is True:
-            scalebar = ScalebarConfig(
-                sampling=self.sampling[-1],
-                units=self.units[-1],
-            )
-
         if title is None:
             title = self.name
 
-        return show_2d(to_numpy(self.array), scalebar=scalebar, title=title, **kwargs)
+        return show_2d(self, scalebar=scalebar, title=title, **kwargs)

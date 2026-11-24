@@ -68,113 +68,42 @@ class TestDataset4dstemInitialization:
 class TestDataset4dstemGetItem:
     """Test Dataset4dstem __getitem__ method."""
 
-    def test_getitem_2d(self, sample_dataset4dstem):
-        """Test __getitem__ method to get a 2D slice (single diffraction pattern)."""
-        # Get a 2D slice (single diffraction pattern)
+    def test_getitem(self, sample_dataset4dstem):
+        """A single diffraction pattern and a line of diffraction patterns."""
         dp = sample_dataset4dstem[0, 0]
         assert dp.ndim == 2
         assert dp.shape == (10, 10)
-
-        # Check that the data is correct
         assert np.array_equal(dp.array, sample_dataset4dstem.array[0, 0])
 
-    def test_getitem_3d(self, sample_dataset4dstem):
-        """Test __getitem__ method to get a 3D slice (line of diffraction patterns)."""
-        # Get a 3D slice (line of diffraction patterns)
         line = sample_dataset4dstem[0, :]
         assert line.ndim == 3
         assert line.shape == (5, 10, 10)
-
-        # Check that the data is correct
         assert np.array_equal(line.array, sample_dataset4dstem.array[0, :])
 
 
 class TestDataset4dstemDpMethods:
     """Test Dataset4dstem diffraction pattern methods."""
 
-    def test_dp_mean_property(self, sample_dataset4dstem):
-        """Test dp_mean property."""
-        # Initially, dp_mean should not be attached
-        assert not hasattr(sample_dataset4dstem, "_dp_mean")
+    def test_dp_reductions_and_attach(self, sample_dataset4dstem):
+        """dp_* computes without attaching; get_dp_*(attach=True) caches what dp_* then returns."""
+        array = sample_dataset4dstem.array
+        for name, reference in [("mean", np.mean), ("max", np.max), ("median", np.median)]:
+            attr = f"_dp_{name}"
+            expected = reference(array, axis=(0, 1))
 
-        # Accessing dp_mean should trigger calculation but not attach
-        dp_mean = sample_dataset4dstem.dp_mean
-        assert not hasattr(sample_dataset4dstem, "_dp_mean")
-        assert dp_mean.ndim == 2
-        assert dp_mean.shape == (10, 10)
+            dp = getattr(sample_dataset4dstem, f"dp_{name}")
+            assert not hasattr(sample_dataset4dstem, attr), name
+            assert np.allclose(dp.array, expected), name
+            assert np.allclose(dp.sampling, [0.1, 0.1]), name
+            assert getattr(sample_dataset4dstem, f"dp_{name}") is not dp, name
 
-        # Accessing again should recalculate
-        dp_mean2 = sample_dataset4dstem.dp_mean
-        assert dp_mean2 is not dp_mean  # Should be a new calculation each time
+            get = getattr(sample_dataset4dstem, f"get_dp_{name}")
+            assert np.allclose(get(attach=False).array, expected), name
+            assert not hasattr(sample_dataset4dstem, attr), name
 
-    def test_get_dp_mean(self, sample_dataset4dstem):
-        """Test get_dp_mean method."""
-        # Get dp_mean without attaching
-        dp_mean = sample_dataset4dstem.get_dp_mean(attach=False)
-        assert not hasattr(sample_dataset4dstem, "_dp_mean")
-        assert dp_mean.ndim == 2
-        assert dp_mean.shape == (10, 10)
-
-        # Get dp_mean with attaching
-        dp_mean2 = sample_dataset4dstem.get_dp_mean(attach=True)
-        assert hasattr(sample_dataset4dstem, "_dp_mean")
-        assert dp_mean2 is sample_dataset4dstem._dp_mean
-
-    def test_dp_max_property(self, sample_dataset4dstem):
-        """Test dp_max property."""
-        # Initially, dp_max should not be attached
-        assert not hasattr(sample_dataset4dstem, "_dp_max")
-
-        # Accessing dp_max should trigger calculation but not attach
-        dp_max = sample_dataset4dstem.dp_max
-        assert not hasattr(sample_dataset4dstem, "_dp_max")
-        assert dp_max.ndim == 2
-        assert dp_max.shape == (10, 10)
-
-        # Accessing again should recalculate
-        dp_max2 = sample_dataset4dstem.dp_max
-        assert dp_max2 is not dp_max  # Should be a new calculation each time
-
-    def test_get_dp_max(self, sample_dataset4dstem):
-        """Test get_dp_max method."""
-        # Get dp_max without attaching
-        dp_max = sample_dataset4dstem.get_dp_max(attach=False)
-        assert not hasattr(sample_dataset4dstem, "_dp_max")
-        assert dp_max.ndim == 2
-        assert dp_max.shape == (10, 10)
-
-        # Get dp_max with attaching
-        dp_max2 = sample_dataset4dstem.get_dp_max(attach=True)
-        assert hasattr(sample_dataset4dstem, "_dp_max")
-        assert dp_max2 is sample_dataset4dstem._dp_max
-
-    def test_dp_median_property(self, sample_dataset4dstem):
-        """Test dp_median property."""
-        # Initially, dp_median should not be attached
-        assert not hasattr(sample_dataset4dstem, "_dp_median")
-
-        # Accessing dp_median should trigger calculation but not attach
-        dp_median = sample_dataset4dstem.dp_median
-        assert not hasattr(sample_dataset4dstem, "_dp_median")
-        assert dp_median.ndim == 2
-        assert dp_median.shape == (10, 10)
-
-        # Accessing again should recalculate
-        dp_median2 = sample_dataset4dstem.dp_median
-        assert dp_median2 is not dp_median  # Should be a new calculation each time
-
-    def test_get_dp_median(self, sample_dataset4dstem):
-        """Test get_dp_median method."""
-        # Get dp_median without attaching
-        dp_median = sample_dataset4dstem.get_dp_median(attach=False)
-        assert not hasattr(sample_dataset4dstem, "_dp_median")
-        assert dp_median.ndim == 2
-        assert dp_median.shape == (10, 10)
-
-        # Get dp_median with attaching
-        dp_median2 = sample_dataset4dstem.get_dp_median(attach=True)
-        assert hasattr(sample_dataset4dstem, "_dp_median")
-        assert dp_median2 is sample_dataset4dstem._dp_median
+            attached = get(attach=True)
+            assert getattr(sample_dataset4dstem, attr) is attached, name
+            assert getattr(sample_dataset4dstem, f"dp_{name}") is attached, name
 
     def test_get_virtual_image(self, sample_dataset4dstem):
         """Test get_virtual_image method."""
@@ -186,8 +115,10 @@ class TestDataset4dstemDpMethods:
         virtual_image = sample_dataset4dstem.get_virtual_image(
             mask=mask, name="test_virtual_image", attach=False
         )
-        assert virtual_image.ndim == 2
         assert virtual_image.shape == (5, 5)
+        assert np.allclose(
+            virtual_image.array, sample_dataset4dstem.array[:, :, 4:6, 4:6].sum(axis=(-2, -1))
+        )
         assert "test_virtual_image" not in sample_dataset4dstem.virtual_images
 
         # Get virtual image with attaching
@@ -198,22 +129,40 @@ class TestDataset4dstemDpMethods:
         assert virtual_image2 is sample_dataset4dstem.virtual_images["test_virtual_image"]
 
 
-class TestDataset4dstemShow:
-    """Test Dataset4dstem show method."""
+class TestProbePositions:
+    """`probe_positions` hands the implicit raster grid to consumers that need it explicitly."""
 
-    def test_show(self, sample_dataset4dstem, monkeypatch):
-        """Test show method."""
+    @staticmethod
+    def _dataset(**kwargs):
+        return Dataset4dstem.from_array(
+            np.zeros((3, 4, 5, 5)),
+            name="scan",
+            **kwargs,
+        )
 
-        # Mock the show_2d function to avoid actual plotting
-        def mock_show_2d(*args, **kwargs):
-            return None
+    def test_origin_and_sampling_set_the_grid(self):
+        dataset = self._dataset(
+            sampling=(2.0, 3.0, 0.1, 0.1),
+            origin=(1.0, -4.0, 0.0, 0.0),
+            units=["A", "A", "A^-1", "A^-1"],
+        )
+        positions = dataset.probe_positions()
 
-        # Apply the mock
-        monkeypatch.setattr("quantem.core.visualization.visualization.show_2d", mock_show_2d)
+        assert positions.shape == (12, 2)
+        assert list(positions.units) == ["A", "A"]
+        assert np.allclose(positions.array[0], [1.0, -4.0])
+        # row-major, so reshaping recovers the scan grid
+        assert np.allclose(positions.array.reshape(3, 4, 2)[2, 3], [1.0 + 2 * 2.0, -4.0 + 3 * 3.0])
 
-        # Call show method
-        result = sample_dataset4dstem.show()
+    def test_ordering_matches_a_reshape_of_the_patterns(self):
+        dataset = self._dataset(sampling=(2.0, 3.0, 0.1, 0.1), units=["A", "A", "A^-1", "A^-1"])
+        rows, cols = dataset.shape[:2]
+        expected = np.stack(
+            np.meshgrid(np.arange(rows) * 2.0, np.arange(cols) * 3.0, indexing="ij"), axis=-1
+        ).reshape(-1, 2)
+        assert np.allclose(dataset.probe_positions().array, expected)
 
-        # Check that the method returns a tuple of (fig, axs)
-        assert isinstance(result, tuple)
-        assert len(result) == 2
+    def test_rejects_mismatched_scan_units(self):
+        dataset = self._dataset(sampling=(2.0, 3.0, 0.1, 0.1), units=["A", "nm", "A^-1", "A^-1"])
+        with pytest.raises(ValueError, match="must share a unit"):
+            dataset.probe_positions()
