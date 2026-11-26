@@ -36,11 +36,11 @@ def test_twisted_bilayer():
     image += np.random.default_rng(0).normal(0.0, 0.3, shape)
 
     dm = DiffractionMoire.from_data(image, sampling=sampling)
-    dm.find_peaks(min_abs_intensity=2.0, plot=False).find_lattices(plot=False)
+    dm.find_peaks(min_abs_intensity=2.0, plot=False).find_lattices(tol=3.0, plot=False)
 
     # without the ellipse the distortion shows up as a lattice mismatch
     assert np.abs(dm.summary()["pairs"][0]["mismatch"]).max() > 2e-3
-    dm.refine(ellipse=True, plot=False)
+    dm.refine(ellipse=True, tol=3.0, plot=False)
     assert np.allclose(dm.ellipse, e_true, atol=2e-4), dm.ellipse
     assert np.allclose(dm.center, center, atol=0.05), dm.center
     res = dm.summary()

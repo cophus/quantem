@@ -6,7 +6,7 @@ from typing import Any, Self
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, maximum_filter
 from scipy.optimize import least_squares
 from scipy.spatial import cKDTree
 
@@ -151,16 +151,17 @@ class DiffractionMoire(AutoSerialize):
     def find_lattices(
         self,
         num_lattices: int = 2,
-        tol: float = 3.0,
+        tol: float = 5.0,
         num_candidates: int = 40,
         min_radius: float = 20.0,
         plot: bool = True,
     ) -> Self:
         """Find the center and the basis of every lattice, then refine them.
 
-        The center is the weighted mode of the midpoints of all pairs of the
-        strongest spots, since every Friedel pair ``+g, -g`` shares its
-        midpoint. Each lattice basis is then picked from pairs of the strongest
+        The center is found from Friedel symmetry: every pair ``+g, -g``
+        shares its midpoint, so the midpoints of all pairs of strong spots pile
+        up at the center, and the candidate piles are ranked by the intensity
+        of the spots with an inversion partner. Each lattice basis is then picked from pairs of the strongest
         unassigned spots, by the intensity of the spots it explains within
         `tol`, minus the fraction a lattice of the same cell area would explain
         by chance; this penalty keeps a short moire vector from winning by
@@ -172,7 +173,7 @@ class DiffractionMoire(AutoSerialize):
         ----------
         num_lattices : int, default=2
             Number of crystal lattices.
-        tol : float, default=3.0
+        tol : float, default=5.0
             Largest distance in pixels between a spot and a lattice node.
         num_candidates : int, default=40
             Number of strongest unassigned spots tried as basis vectors.
@@ -220,7 +221,7 @@ class DiffractionMoire(AutoSerialize):
         center: NDArray | None = None,
         lattices: NDArray | None = None,
         max_terms: int = 2,
-        tol: float = 3.0,
+        tol: float = 5.0,
         num_iterations: int = 3,
         ellipse: bool = False,
         plot: bool = True,
@@ -260,7 +261,7 @@ class DiffractionMoire(AutoSerialize):
             vector as ``(row, col)``; defaults to the current ones.
         max_terms : int, default=2
             Largest number of lattices combined in one predicted spot.
-        tol : float, default=3.0
+        tol : float, default=5.0
             Largest distance in pixels between a spot and its prediction.
         num_iterations : int, default=3
             Number of index and fit cycles.
@@ -288,7 +289,10 @@ class DiffractionMoire(AutoSerialize):
             indices, indexed, overlap = _index_spots(q - center, lattices, tol, max_terms)
             fit = indexed & ~overlap
             if fit.sum() < 2 + 2 * num:
-                raise RuntimeError("Too few spots indexed to fit the lattices.")
+                raise RuntimeError(
+                    "Too few spots indexed to fit the lattices; for closely spaced spots, "
+                    "lower tol so that fewer predictions overlap."
+                )
             w = np.sqrt(np.clip(inten[fit], 0.0, None))[:, None]
             if ellipse:
                 hk, target = indices[fit], q[fit]
@@ -488,20 +492,48 @@ class DiffractionMoire(AutoSerialize):
         return "\n".join(lines)
 
 
-def _friedel_center(q: NDArray, inten: NDArray, shape, tol: float, num: int = 150) -> NDArray:
-    """Weighted mode of the midpoints of all pairs of the strongest spots."""
+def _friedel_center(
+    q: NDArray, inten: NDArray, shape, tol: float, num: int = 150, num_candidates: int = 20
+) -> NDArray:
+    """Pattern center from Friedel symmetry.
+
+    Every pair ``+g, -g`` shares its midpoint, so the midpoints of all pairs of
+    the `num` strongest spots pile up at the center. They also pile up at half
+    lattice vectors, and inversion through those maps every integer
+    combination of the lattices onto another one, so positions alone barely
+    separate them from the center. Friedel mates also share their intensity:
+    each of the `num_candidates` largest piles is scored by
+    ``sum sqrt(min(I, I'))`` over the spots whose inversion lands within `tol`
+    of a spot of intensity ``I'``. The best candidate is then refined as the
+    weighted mean midpoint of its Friedel pairs.
+    """
     order = np.argsort(-inten)[:num]
-    p, w = q[order], np.sqrt(np.clip(inten[order], 0.0, None))
+    p = q[order]
     i, j = np.triu_indices(p.shape[0], 1)
-    mid, wij = 0.5 * (p[i] + p[j]), w[i] * w[j]
+    mid = 0.5 * (p[i] + p[j])
     H, _, _ = np.histogram2d(
-        mid[:, 0], mid[:, 1], bins=shape, range=[[0, shape[0]], [0, shape[1]]], weights=wij
+        mid[:, 0], mid[:, 1], bins=shape, range=[[0, shape[0]], [0, shape[1]]]
     )
-    r, c = np.unravel_index(np.argmax(gaussian_filter(H, 1.5)), H.shape)
-    center = np.array([r + 0.5, c + 0.5])
+    H = gaussian_filter(H, 1.0)
+    peaks = np.argwhere((H == maximum_filter(H, size=2 * int(np.ceil(tol)) + 1)) & (H > 0))
+    peaks = peaks[np.argsort(-H[peaks[:, 0], peaks[:, 1]])][:num_candidates] + 0.5
+
+    tree = cKDTree(q)
+    inten = np.clip(inten, 0.0, None)
+
+    def friedel_pairs(center):
+        dist, partner = tree.query(2.0 * center - q)
+        keep = (dist < tol) & (partner != np.arange(q.shape[0]))
+        return keep, partner, np.sqrt(np.minimum(inten, inten[partner]))
+
+    def support(center):
+        keep, _, w = friedel_pairs(center)
+        return w[keep].sum()
+
+    center = peaks[int(np.argmax([support(c) for c in peaks]))]
     for _ in range(3):
-        near = np.hypot(*(mid - center).T) < tol
-        center = np.average(mid[near], axis=0, weights=wij[near])
+        keep, partner, w = friedel_pairs(center)
+        center = np.average(0.5 * (q[keep] + q[partner[keep]]), axis=0, weights=w[keep])
     return center
 
 
