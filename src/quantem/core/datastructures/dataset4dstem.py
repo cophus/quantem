@@ -1039,6 +1039,7 @@ class Dataset4dstem(Dataset4d):
         sigma: float = 0.3,
         sigma_q: float = 3.0,
         edge: int = 12,
+        max_memory_gb: float = 2.0,
         progress_bar: bool = True,
     ) -> "Dataset4dstem":
         """Average every pattern with its scan neighbours, weighted by how similar they are.
@@ -1053,6 +1054,10 @@ class Dataset4dstem(Dataset4d):
         weight 1 for itself. Neighbours across a grain boundary differ by
         far more than sigma and drop out, so boundaries stay sharp.
 
+        The scan is filtered in blocks of rows, each with `radius` rows of
+        neighbours on either side, so apart from the float32 output the
+        memory stays near `max_memory_gb` whatever the size of the scan.
+
         Parameters
         ----------
         radius : int, default=4
@@ -1065,20 +1070,23 @@ class Dataset4dstem(Dataset4d):
             Blur in pixels of the patterns compared.
         edge : int, default=12
             Detector-edge pixels left out of the comparison.
+        max_memory_gb : float, default=2.0
+            Working memory (GB) for each block of scan rows. At least one
+            row and its neighbours are always used.
         progress_bar : bool, default=True
-            Show a progress bar over the neighbour offsets.
+            Show a progress bar over the blocks of rows.
 
         Returns
         -------
         Dataset4dstem
-            The filtered dataset with the same calibration. Its metadata
-            "correlative_filter" records the parameters.
+            The filtered dataset (float32) with the same calibration. Its
+            metadata "correlative_filter" records the parameters.
         """
         import torch.nn.functional as F
         from tqdm import tqdm
 
         R, C, Qx, Qy = self.shape
-        data = torch.as_tensor(np.asarray(self.array), dtype=torch.float32)
+        array = self.array
         # comparison patterns: blurred, |q|^2 weighted, every second pixel
         n = int(np.ceil(3 * sigma_q))
         g = torch.exp(-0.5 * (torch.arange(-n, n + 1, dtype=torch.float32) / sigma_q) ** 2)
@@ -1089,47 +1097,67 @@ class Dataset4dstem(Dataset4d):
         if edge > 0:
             w[:edge], w[-edge:], w[:, :edge], w[:, -edge:] = 0, 0, 0, 0
         w = w[::2, ::2]
-        feat = torch.empty((R, C, w.numel()), dtype=torch.float32)
-        for r0 in range(0, R, 8):
-            x = data[r0 : r0 + 8].reshape(-1, 1, Qx, Qy)
-            x = F.conv2d(F.pad(x, (n, n, 0, 0), mode="reflect"), g.view(1, 1, 1, -1))
-            x = F.conv2d(F.pad(x, (0, 0, n, n), mode="reflect"), g.view(1, 1, -1, 1))
-            x = x[:, 0, ::2, ::2]
-            x = (x - (x * w).sum(dim=(1, 2), keepdim=True) / w.sum()) * w
-            norm = torch.linalg.norm(x.reshape(x.shape[0], -1), dim=1)
-            feat[r0 : r0 + 8] = (
-                x.reshape(x.shape[0], -1) / norm.clamp_min(1e-12)[:, None]
-            ).reshape(-1, C, w.numel())
 
-        def correlation(dr, dc):
-            # correlation of every position with its neighbour at (dr, dc)
-            a = (slice(max(0, -dr), R - max(0, dr)), slice(max(0, -dc), C - max(0, dc)))
-            b = (slice(max(0, dr), R - max(0, -dr)), slice(max(0, dc), C - max(0, -dc)))
-            corr = torch.cat(
-                [
-                    (feat[a][i : i + 8] * feat[b][i : i + 8]).sum(dim=-1)
-                    for i in range(0, a[0].stop - a[0].start, 8)
-                ]
-            )
-            return a, b, corr
+        def rows_of(r0, r1):
+            """Scan rows r0 to r1 of the patterns as float32 (a view if already float32)."""
+            return torch.as_tensor(np.asarray(array[r0:r1]), dtype=torch.float32)
+
+        # half of the memory for the blur, whose conv2d needs about 30 times the
+        # size of its patterns (it unfolds the 2n + 1 taps), and half for a block
+        budget = 0.5 * max_memory_gb * 1e9
+        per_chunk = max(1, int(budget / (32 * 4 * Qx * Qy)))
+
+        def features(r0, r1):
+            """Normalized comparison patterns (rows, C, pixels) of scan rows r0 to r1."""
+            patterns = rows_of(r0, r1).reshape(-1, 1, Qx, Qy)
+            out = torch.empty((patterns.shape[0], w.numel()), dtype=torch.float32)
+            for i in range(0, patterns.shape[0], per_chunk):
+                x = patterns[i : i + per_chunk]
+                x = F.conv2d(F.pad(x, (n, n, 0, 0), mode="reflect"), g.view(1, 1, 1, -1))
+                x = F.conv2d(F.pad(x, (0, 0, n, n), mode="reflect"), g.view(1, 1, -1, 1))
+                x = x[:, 0, ::2, ::2]
+                x = (x - (x * w).sum(dim=(1, 2), keepdim=True) / w.sum()) * w
+                x = x.reshape(x.shape[0], -1)
+                out[i : i + per_chunk] = x / torch.linalg.norm(x, dim=1).clamp_min(1e-12)[:, None]
+            return out.reshape(r1 - r0, C, -1)
 
         rr, cc = np.meshgrid(
             np.arange(-radius, radius + 1), np.arange(-radius, radius + 1), indexing="ij"
         )
         keep = (rr**2 + cc**2 <= (radius + 0.5) ** 2) & ((rr != 0) | (cc != 0))
-        out = data.clone()
-        weight_sum = torch.ones((R, C), dtype=torch.float32)
-        for dr, dc in tqdm(
-            list(zip(rr[keep], cc[keep])), desc="correlative filter", disable=not progress_bar
-        ):
-            a, b, corr = correlation(int(dr), int(dc))
-            wgt = torch.exp(-(2 - 2 * corr) / (2 * sigma**2))
-            out[a].addcmul_(wgt[..., None, None], data[b])
-            weight_sum[a] += wgt
-        out /= weight_sum[..., None, None]
+        offsets = [(int(dr), int(dc)) for dr, dc in zip(rr[keep], cc[keep])]
+
+        # a block holds its rows of patterns with the neighbouring rows, the running sum,
+        # the normalized sum, and the comparison patterns: about 3 blocks of patterns
+        row_bytes = 4 * C * Qx * Qy
+        rows = max(1, int((budget / row_bytes - 2 * radius) / 3))
+        out = np.empty((R, C, Qx, Qy), dtype=np.float32)
+        feat, f0, f1 = None, 0, 0  # comparison patterns of scan rows f0 to f1
+        for r0 in tqdm(range(0, R, rows), desc="correlative filter", disable=not progress_bar):
+            r1 = min(R, r0 + rows)
+            h0, h1 = max(0, r0 - radius), min(R, r1 + radius)
+            kept = feat[h0 - f0 :] if feat is not None and f1 > h0 else None
+            start = f1 if kept is not None else h0
+            new = features(start, h1) if h1 > start else None
+            feat = kept if new is None else (new if kept is None else torch.cat([kept, new]))
+            f0, f1 = h0, h1
+            data = rows_of(h0, h1)
+            total = data[r0 - h0 : r1 - h0].clone()  # weight 1 for itself
+            weight_sum = torch.ones((r1 - r0, C), dtype=torch.float32)
+            for dr, dc in offsets:
+                t0, t1 = max(r0, -dr), min(r1, R - dr)  # rows whose neighbour is in the scan
+                if t1 <= t0:
+                    continue
+                c0, c1 = max(0, -dc), min(C, C - dc)
+                near = (slice(t0 + dr - h0, t1 + dr - h0), slice(c0 + dc, c1 + dc))
+                corr = (feat[t0 - h0 : t1 - h0, c0:c1] * feat[near]).sum(dim=-1)
+                wgt = torch.exp(-(2 - 2 * corr) / (2 * sigma**2))
+                total[t0 - r0 : t1 - r0, c0:c1].addcmul_(wgt[..., None, None], data[near])
+                weight_sum[t0 - r0 : t1 - r0, c0:c1] += wgt
+            out[r0:r1] = (total / weight_sum[..., None, None]).numpy()
 
         filtered = Dataset4dstem.from_array(
-            out.numpy(),
+            out,
             name=self.name,
             origin=self.origin,
             sampling=self.sampling,

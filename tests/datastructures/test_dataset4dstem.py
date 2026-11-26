@@ -185,3 +185,8 @@ def test_correlative_filter_averages_within_a_grain_only():
     # the column next to the boundary keeps its own grain: almost none of the other spot leaks in
     leak = (filtered.array[:, 3] * spots[1]).sum(axis=(-2, -1)) / (spots[1] ** 2).sum()
     assert np.abs(leak).max() < 0.05
+    # with almost no memory, one scan row and one pattern at a time give the same result
+    blocks = dataset.correlative_filter(
+        radius=2, sigma_q=1.0, edge=2, max_memory_gb=1e-9, progress_bar=False
+    )
+    assert np.allclose(blocks.array, filtered.array, rtol=1e-5, atol=1e-6)
